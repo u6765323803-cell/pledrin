@@ -60,5 +60,6 @@ jobs:
         if: steps.sources.outputs.present == 'true'
         with:
           target: contracts/
-          slither-args: --exclude-dependencies --fail-high
+          slither-config: contracts/slither.config.json
+          slither-args: --fail-high
           fail-on: high

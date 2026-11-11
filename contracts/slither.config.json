@@ -1,0 +1,10 @@
+{
+  "filter_paths": "lib/|test/",
+  "exclude_dependencies": true,
+  "exclude_informational": false,
+  "exclude_low": false,
+  "exclude_medium": false,
+  "exclude_high": false,
+  "disable_color": true,
+  "legacy_ast": false
+}

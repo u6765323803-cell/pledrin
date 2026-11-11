@@ -59,9 +59,11 @@ interface ICreatorVesting {
     error InvalidSchedule();
     /// @notice The schedule's clock has already started.
     error AlreadyStarted();
-    /// @notice The schedule has been voided by expiry.
+    /// @notice The schedule has been voided by expiry, so no release will ever succeed.
     error ScheduleVoided();
-    /// @notice There is nothing releasable at this time.
+    /// @notice The schedule has paid out its whole allocation, so nothing is left to release.
+    error ScheduleFullyReleased();
+    /// @notice Nothing is releasable at this block time on a schedule that can still release.
     error NothingToRelease();
     /// @notice The launch token did not deliver the allocation.
     error TokenTransferFailed();
@@ -87,6 +89,9 @@ interface ICreatorVesting {
     function void() external;
 
     /// @notice Releases everything vested so far to the launch's recorded creator.
+    /// @dev Reverts `ScheduleVoided` on a voided schedule, `ScheduleFullyReleased` on one
+    /// that has paid its allocation in full, and `NothingToRelease` when a schedule that
+    /// can still release has nothing vested at this block time.
     /// @param launch The launch whose schedule to release.
     /// @return amount Base units transferred.
     function release(address launch) external returns (uint256 amount);

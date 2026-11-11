@@ -87,9 +87,18 @@ contract CreatorVesting is ICreatorVesting, ReentrancyGuardTransient {
     }
 
     /// @inheritdoc ICreatorVesting
+    /// @dev Both terminal conditions are rejected before the releasable amount is computed,
+    /// so neither is reported with the word used for a schedule that has simply not vested
+    /// yet: a voided schedule's allocation is gone for good, and a fully released one has
+    /// already paid it out. `NothingToRelease` is therefore left covering only conditions a
+    /// later call can clear — the schedule has not started, it is inside its cliff, or no
+    /// further base unit has accrued since the last release.
     function release(address launch) external nonReentrant returns (uint256 amount) {
         Schedule storage schedule = _schedules[launch];
-        if (schedule.allocation == 0) revert NoSchedule();
+        uint128 allocation = schedule.allocation;
+        if (allocation == 0) revert NoSchedule();
+        if (schedule.voided) revert ScheduleVoided();
+        if (schedule.released == allocation) revert ScheduleFullyReleased();
 
         amount = _releasable(schedule);
         if (amount == 0) revert NothingToRelease();

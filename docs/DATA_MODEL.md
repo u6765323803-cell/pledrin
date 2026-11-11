@@ -1382,10 +1382,20 @@ one.** Every entity in section 3 is either assigned from an event field or is a
 running aggregate over events, so a correct rollback restores every row exactly.
 The requirements: handlers must be idempotent; aggregates must be reconstructible
 by replaying the canonical logs from the launch's creation; and no row may
-depend on data outside the log set (IDX-12). The confirmation depth or finality
-tag to trust on this chain is decision 19 and is configuration until it is
-answered — `docs/CHAIN_FACTS.md` records that this is an Arbitrum Nitro chain
-but records nothing about its finality, and this document will not guess.
+depend on data outside the log set (IDX-12).
+
+**The indexer follows `latest`. There is no confirmation depth and no finality
+tag**, and the three requirements above are why it needs none: they hold
+whatever the head does. `docs/CHAIN_FACTS.md`, under "Block time and finality
+tags", holds the measurement this follows from and is the only place those
+figures live. Both tags are served, and both are minutes rather than seconds
+behind the head, which is unusable for a curve whose whole lifetime may be
+hours — so no depth is both safe and usable, and decision 19 of
+`docs/OPEN_DECISIONS.md` records why none was chosen. The cost this keeps is
+that the API serves rows a rollback can remove. APP-13 does not cover it: its
+notice says that data is behind the head, never that data is ahead of finality.
+Nothing in these requirements supports a claim that the indexer is reorg-proof,
+only that a correct rollback restores every row.
 
 **IDX-15. Fee buckets need every remover, or they overstate forever.** Section
 4.6 lists them. The visible symptom is a claim button whose transaction reverts
@@ -1619,14 +1629,16 @@ Stated here so that no page implies a completeness the data does not have.
 ## 10. Open decisions this document raises
 
 Recorded in `docs/OPEN_DECISIONS.md` as entries 16 to 21, each with options and
-a recommendation. All six block Phase 2 rather than Phase 1, and the first two
-block it at the start rather than at the end.
+a recommendation. They block Phase 2 rather than Phase 1, and the first two
+block it at the start rather than at the end. Decision 19 has since been
+resolved by measurement, and its row states the answer rather than the
+question.
 
 | # | Question |
 |---|---|
 | 16 | Post-graduation price history, and the Uniswap v4 `PoolManager` ABI that is not in `contracts/abi/` |
 | 17 | The encoding of `LaunchMetadata.metadata`, which the protocol does not interpret and both halves must agree on |
 | 18 | Whether the indexer indexes `Timelock` and exposes a governance query |
-| 19 | The confirmation depth or finality tag to trust on this chain, which `docs/CHAIN_FACTS.md` does not record |
+| 19 | **Resolved**: the indexer follows `latest` with no confirmation depth, because the measurement now in `docs/CHAIN_FACTS.md` shows that no depth is both safe and usable (IDX-14) |
 | 20 | Whether ERC-20 `Transfer` is indexed for every launch token, which is what `holderCount` and `marketCapWei` cost |
 | 21 | The API transport, which must be chosen once before either half starts |

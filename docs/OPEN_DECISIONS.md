@@ -1184,15 +1184,109 @@ never a displayed field (`docs/DATA_MODEL.md` IDX-8).
 
 ## 19. The confirmation depth the indexer should trust
 
-**Blocks Phase 2 before mainnet, not before building**, and it needs a
-measurement rather than an opinion.
+**RESOLVED 2026-11-11 by measurement: the indexer follows `latest`, and there is
+no confirmation depth.** The entry asked which depth to trust. The answer is that
+the question has no good answer on this chain, because no depth is both safe and
+usable. What the question was standing in for is a requirement, and
+`docs/DATA_MODEL.md` section 7 already states it: every row a pure function of
+the canonical log set, no handler storing the result of an `eth_call`, every
+handler idempotent (IDX-9, IDX-12, IDX-14). Those were written as correctness
+requirements before the measurement existed, and what the measurement shows is
+that they are the whole answer. IDX-14's deference to this entry is gone.
 
-`docs/CHAIN_FACTS.md` records that this is an Arbitrum Nitro chain, records how
-`block.number` relates to `arbBlockNumber()`, and records nothing about
-finality: not the reorg depth, not whether the RPC serves the `safe` and
-`finalized` block tags, not the observed lag of either. `docs/DATA_MODEL.md`
-IDX-14 therefore states the correctness requirements and leaves the depth as
-configuration, deliberately, rather than guessing a number.
+The figures are in `docs/CHAIN_FACTS.md` under "Block time and finality tags",
+with the commands that produced them. They are deliberately not repeated here,
+so that there is one place for them to go stale.
+
+This entry no longer blocks anything. It was raised as blocking Phase 2 before
+mainnet on the ground that it needed a measurement rather than an opinion, and
+that was right: the depth could not be stated without one, and it turns out it
+could not be stated with one either.
+
+**Which argument the measurement settled.** Both rejections in the trade-offs
+below were predictions. The measurement converted one into a fact and destroyed
+the other.
+
+Option B was rejected as "probably unusable" because "the lag can be minutes to
+hours". That prediction holds, at the low end of its own range. Both tags are
+served, so B is available rather than impossible, and both are minutes rather
+than seconds behind the head — `finalized` by roughly twenty. A trading
+interface for a curve whose whole lifetime may be hours cannot show a price that
+old. B is therefore unusable as a fact and not as a guess.
+
+Option C was rejected as "a compromise whose N is a guess until somebody
+measures". The measurement did not supply N. It removed the parameter. Safety
+against replacement of the head is not a continuous function of depth here: the
+only depths with a safety property behind them are the two tags, and between
+zero and the nearer of them there is no intermediate safety to buy. The
+scenarios that replace a single-sequencer chain's head act at the level of the
+sequencer's feed and of batch posting, so they are not bounded by a small depth,
+and a few hundred blocks of lag would cost tens of seconds of staleness in
+exchange for protection against nothing in particular. C's N was not merely
+unmeasured, it was a parameter with no safety semantics, and this entry's own
+recommendation of "a conservative default" presupposed a continuum that does not
+exist.
+
+Option A therefore survives, and not because it is safe. It survives because the
+handlers carry the safety and the tags cannot carry the freshness.
+
+One structural point, which is why no operational tuning rescues B. The two tags
+are about one Ethereum epoch apart, which is what an L1-derived finality tag
+looks like on a Nitro chain. If that is the mechanism, the lag of `safe` is
+inherited from L1 finality rather than chosen by whoever operates this chain,
+and no batch-posting change brings either tag within seconds of the head. The
+distance is structural, not a configuration accident waiting to be optimised
+away.
+
+**What the measurement did not answer, and why this resolution does not need
+it.** The recommendation below asked for three facts. Two are now recorded: that
+both tags are served, and the observed lag of each. The third — whether a reorg
+of the unsafe head has ever been observed on this chain — is not, and two `cast`
+calls cannot produce it. It needs sustained observation of the head, or a
+statement from whoever runs the sequencer, and neither exists here. That missing
+fact is a reason the depth was unavailable rather than a hole in this
+resolution: reorg-safe handlers are required whether head replacement is
+frequent or has never once happened, while choosing a depth would have required
+knowing which.
+
+**The prohibition stands, on a new basis.** The recommendation below says that
+until the measurement exists, nobody may describe the indexer as reorg-proof.
+The condition is discharged and the prohibition is not, because no lag
+measurement could have licensed that claim in the first place. The exposure is
+in the handlers, and the handlers are not written. Once they are, and once each
+has been tested against IDX-9, IDX-12 and IDX-14, the available claim is the
+narrower one those items support: reorg-safe by construction, meaning a correct
+rollback restores every row exactly. Not that a reorg has no effect on what a
+reader was shown.
+
+**The cost this resolution keeps.** Option A's cost in the trade-offs below is
+not removed by reorg-safe handlers. The API serves rows that a rollback can
+remove, and `docs/DATA_MODEL.md` APP-13 does not cover it: its notice says that
+data is behind the head, never that data is ahead of finality. Idempotent
+handlers make the database right again after a rollback; they do not make a
+reader un-see a trade that was rolled back. This is accepted for the first
+release, because the alternative is a twenty-minute-old interface. Whether
+`IndexerStatus` should carry the distance to `finalized`, so that a page can
+mark the range that is still revocable, is not decided here. It would cost one
+field and one live read, and it is the only cheap mitigation in sight.
+
+**Two caveats on the measurement itself.** The lags are what one endpoint
+reported at one moment, not a safety property of the chain. A sequencer change
+or a batch-posting change moves them, and the figures in `docs/CHAIN_FACTS.md`
+are an observation with a date on it rather than a bound. And nothing in the
+protocol depends on them: no contract reads a block tag, and `docs/SPEC.md` has
+no finality assumption to revise. They bind the read side only, which is why
+this resolution lives in `docs/CHAIN_FACTS.md` and `docs/DATA_MODEL.md` and
+changes nothing in the specification.
+
+When this entry was raised, `docs/CHAIN_FACTS.md` recorded that this is an
+Arbitrum Nitro chain and recorded how `block.number` relates to
+`arbBlockNumber()`, but recorded nothing about finality: not the reorg depth,
+not whether the RPC serves the `safe` and `finalized` block tags, not the
+observed lag of either. `docs/DATA_MODEL.md` IDX-14 therefore stated the
+correctness requirements and left the depth as configuration, deliberately,
+rather than guessing a number. That gap is what the measurement closed, and
+IDX-14 now states the choice instead of deferring to this entry.
 
 ### Question
 

@@ -49,6 +49,43 @@ that bind our contracts:
 - `gasleft()` and the 63/64 rule behave differently from L1. Do not build
   logic that depends on precise gas accounting.
 
+## Block time and finality tags — measured, mainnet
+
+```
+cast block latest    --rpc-url https://rpc.mainnet.chain.robinhood.com --field number
+# 111735270
+cast block safe      --rpc-url https://rpc.mainnet.chain.robinhood.com --field number
+# 111727515
+cast block finalized --rpc-url https://rpc.mainnet.chain.robinhood.com --field number
+# 111723654
+```
+
+Both `safe` and `finalized` are served. Converted to wall-clock time from the
+timestamps of the same three blocks, with the block time measured over a
+10,000-block span:
+
+| Tag | Lag in blocks | Lag in time |
+|---|---|---|
+| `safe` | 7,755 | 13.3 min |
+| `finalized` | 11,616 | 20.1 min |
+
+Block time is **0.104 s**, so roughly ten blocks a second.
+
+The consequence for the read side, and the reason this measurement exists:
+**there is no confirmation depth that is both safe and usable.** An indexer
+following `finalized` shows a price twenty minutes stale, which is unusable for
+a trading interface on a curve whose whole lifetime may be hours. One following
+`latest` is exposed to reorgs. So the answer is not a depth: the indexer follows
+`latest` and every handler is written to be reorg-safe — each row a pure function
+of the canonical log set, no handler storing the result of an `eth_call`, and
+every handler idempotent. `docs/DATA_MODEL.md` section 7 states those as
+requirements and decision 19 of `docs/OPEN_DECISIONS.md` records why a depth was
+not chosen.
+
+The lags are also not a safety claim about this chain's finality. They are what
+the endpoint reported at one moment; a sequencer or batch-posting change moves
+them, and nothing in the protocol depends on them.
+
 ## Uniswap v4 — present on BOTH mainnet and testnet
 
 This is the graduation target. The full v4 stack is deployed at the same

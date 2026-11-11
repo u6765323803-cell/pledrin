@@ -52,11 +52,35 @@ jobs:
         with:
           version: v1.9.0
 
+      # Fork tests are excluded here so that a flaky public RPC can never fail
+      # the deterministic suite. They run in their own job below.
       - name: Unit, fuzz and invariant tests
-        run: forge test -vvv
+        run: forge test --no-match-path "test/fork/*" -vvv
 
       - name: Gas report
-        run: forge test --gas-report
+        run: forge test --no-match-path "test/fork/*" --gas-report
+
+  fork:
+    name: fork tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.9.0
+
+      # These run against the live Uniswap v4 contracts on Robinhood Chain and
+      # are the only tests that need the network. The mainnet RPC prunes
+      # historical state, so the fork cannot be pinned to a block; every
+      # assertion here is about v4's code rather than chain state, which is what
+      # makes running at head sound.
+      - name: Fork tests against live Uniswap v4
+        run: |
+          forge test --match-path "test/fork/*" \
+            --rpc-url robinhood --fork-retries 5 --fork-retry-backoff 2000 -vvv
 
   coverage:
     name: coverage

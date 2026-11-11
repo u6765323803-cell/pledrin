@@ -1,7 +1,10 @@
 # Pledrin — normative specification
 
-Status: Phase 0. This document is normative. Where it conflicts with code, the
-code is wrong. Where it is silent, `docs/OPEN_DECISIONS.md` records the gap.
+Status: reconciled against the Phase 1 contracts under `contracts/src` on
+2026-11-11. This document is normative: where it conflicts with code, the code is
+wrong, and every disagreement found during that reconciliation was resolved by
+correcting whichever side was wrong rather than by leaving both. Where this
+document is silent, `docs/OPEN_DECISIONS.md` records the gap.
 
 All external addresses come from `docs/CHAIN_FACTS.md` and nowhere else. No
 address appears in this document that is not in that file.
@@ -36,7 +39,14 @@ code size:
 | Uniswap v4 PoolManager | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
 | Uniswap v4 PositionManager | `0x58daec3116aae6D93017bAAea7749052E8a04fA7` |
 | Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
-| Uniswap v4 StateView (reads only) | `0xF3334192D15450CdD385c8B70e03f9A6bD9E673b` |
+
+Those three are the whole external surface. No Pledrin contract references
+Uniswap v4's StateView: pool state is read with `StateLibrary`'s `extsload` path
+directly against PoolManager, which needs no second address.
+
+Every external address reaches the contracts as a constructor argument. No
+external address is a literal in any source file, which makes the rule at the
+top of this document checkable mechanically rather than by review.
 
 ### 1.1 Graduation venue: Uniswap v4, decided
 
@@ -83,21 +93,96 @@ contract holds a power over user funds.
 | `BondingCurve` | one per launch | curve ETH reserve, fee buckets, bond ETH, unsold tokens | none |
 | `LaunchFactory` | singleton | global launch config, reputation counters | `Timelock` |
 | `CreatorVesting` | singleton | vested creator token allocations | none |
-| `LiquidityLock` | singleton | graduated position NFTs | none |
+| `LiquidityLock` | singleton | graduated position NFTs, retained compounding residuals | none |
 | `Timelock` | singleton | nothing | protocol governance |
+| `CurveDeployer` | singleton | nothing | none |
+| `TokenDeployer` | singleton | nothing | none |
+
+Eight contracts, two of which are plumbing: `CurveDeployer` and `TokenDeployer`
+carry creation code and nothing else, for the reason in section 2.1.
 
 `BondingCurve` is one instance per launch rather than a singleton with a
 `launchId` argument. Reasons: a per-launch instance makes `address(curve).balance`
 the single number that must cover that launch's obligations, which makes
 Invariant 3 a one-read assertion; it removes a 32-byte `launchId` from every
 trade's calldata on a chain where calldata dominates cost; and it removes any
-possibility of cross-launch accounting confusion. The deployment mechanism
-(full deploy versus clone with immutable args) is an open decision; it does not
-affect semantics.
+possibility of cross-launch accounting confusion.
+
+The deployment mechanism is no longer purely an open decision: decision 5 of
+`docs/OPEN_DECISIONS.md` chose option A, a full deployment per launch, and that
+is what shipped. Section 2.1 is the cost of that choice.
 
 Fee splitting is performed inside `BondingCurve`, not in a separate splitter.
 A separate splitter would move value across a contract boundary on every trade
 for no gain.
+
+### 2.1 Why there are two deployer contracts
+
+`BondingCurve`'s creation code plus `LaunchFactory`'s own code exceeds EIP-170's
+24,576-byte runtime limit, so the factory cannot carry it. Measured with the
+build settings in `contracts/foundry.toml`:
+
+| Candidate runtime code | Size |
+|---|---|
+| a factory carrying `BondingCurve`'s creation code, 1,000,000 optimizer runs | 45,134 bytes |
+| the same factory at 200 optimizer runs with the IR pipeline | 32,623 bytes |
+| one deployer carrying both `BondingCurve`'s and `PledrinToken`'s creation code | 25.0 KB |
+| `CurveDeployer` as built | 23,531 bytes |
+| `LaunchFactory` as built | 7,324 bytes |
+
+The limit is therefore the reason for two deployers rather than one, and for any
+deployer at all:
+
+- **`CurveDeployer`** carries `BondingCurve`'s creation code.
+  `deploy(CurveConfig)` is payable, forwards `msg.value` to the curve it creates
+  as that launch's bond, and passes `msg.sender` to the curve as its `factory`.
+  A curve deployed by anyone else is therefore absent from the factory's
+  `isLaunch` mapping and can write no reputation counter; a curve that names the
+  real factory cannot even finish a lifecycle, because `recordGraduation`,
+  `recordStall` and `recordExpiry` all revert `NotLaunch` for a caller the
+  factory did not deploy.
+- **`TokenDeployer`** carries `PledrinToken`'s creation code and mints the whole
+  supply to `msg.sender`. `BondingCurve`'s constructor calls it, so the supply is
+  still minted in one constructor directly to the curve as section 3 requires,
+  and the curve then asserts
+  `totalSupply() == TOTAL_SUPPLY && balanceOf(address(this)) == TOTAL_SUPPLY`
+  before it accepts the token at all.
+
+Both deployers are stateless, ownerless and permissionless, hold nothing, and
+have no function other than `deploy`. Anyone may call either one; what a caller
+gets is a contract of its own with no standing in the factory and no relation to
+any launch (`docs/THREAT_MODEL.md` section 8.2).
+
+What this construction preserves is the property that matters: every launch is a
+full `CREATE` deployment whose immutables are set in a real constructor. There is
+no clone, no immutable-args offset, no proxy, no initialiser and no
+`delegatecall`, so Invariant 54 is intact.
+
+The margin is a standing constraint on future work. `BondingCurve`'s creation
+code is 22,678 bytes of `CurveDeployer`'s 23,531, leaving **1,045 bytes** before
+the deployer itself becomes undeployable. Roughly a kilobyte of new curve code
+exhausts that. Anything larger requires either decision 5 option B — a clone with
+immutable args — or splitting the curve, and neither is a change that can be made
+late.
+
+### 2.2 Deployment order
+
+The order below has no cycles, so no address prediction, no CREATE2 salt and no
+post-deployment wiring step is needed.
+
+| Order | Contract | Constructor arguments |
+|---|---|---|
+| 1 | `Timelock` | the initial admin |
+| 2 | `CreatorVesting` | none |
+| 3 | `LiquidityLock` | PositionManager; PoolManager is read off it so the two cannot be mismatched |
+| 4 | `CurveDeployer` | none |
+| 5 | `TokenDeployer` | none |
+| 6 | `LaunchFactory` | the timelock as owner, both deployers, `CreatorVesting`, `LiquidityLock`, PoolManager, PositionManager, Permit2, the treasury, the initial fee config |
+
+`CreatorVesting` can precede the factory because it holds no factory address at
+all: every mutating function is keyed by its caller (section 12). That is what
+removes the factory-vesting cycle, which would otherwise be the one place in the
+system that needed a predicted address or a setter.
 
 ---
 
@@ -119,7 +204,14 @@ The protocol never takes a fee in tokens. Every protocol fee is denominated in
 ETH. This is what allows the token to be a plain ERC-20 with no hook: nothing in
 the protocol needs to observe or intercept a transfer.
 
-The entire supply is minted to the launch's `BondingCurve`.
+The entire supply is minted to the launch's `BondingCurve`, in one constructor.
+`BondingCurve`'s constructor calls `TokenDeployer.deploy(name, symbol)`, which
+deploys the token and mints `TOTAL_SUPPLY` to `msg.sender` — the curve — inside
+the token's own constructor. The curve then requires
+`totalSupply() == TOTAL_SUPPLY` and `balanceOf(curve) == TOTAL_SUPPLY` exactly,
+and reverts `InvalidToken` otherwise: a launch owns its whole supply at
+construction or it does not exist. Why the mint goes through a separate deployer
+contract at all is section 2.1.
 
 ---
 
@@ -190,11 +282,39 @@ Per launch, in storage:
 | `tokensSold` (`s`) | `uint128` | base units | tokens transferred out by buys, minus tokens returned by sells |
 | `ethReserve` (`r`) | `uint128` | wei | ETH backing the curve |
 
+The rest of the curve's storage is accounting rather than pricing. It is listed
+here in one place because Invariant 3 is stated over all of it:
+
+| Name | Type | Units | Meaning | Section |
+|---|---|---|---|---|
+| `creatorFeeEth` | `uint128` | wei | accrued creator fee | 6 |
+| `protocolFeeEth` | `uint128` | wei | accrued protocol fee | 6 |
+| `protectionEth` | `uint128` | wei | accrued holder-protection fee | 6, 10 |
+| `bondHeldWei` | `uint128` | wei | bond ETH still on the bond account | 11 |
+| `pendingBondWei` | `uint128` | wei | bond credited to the creator, awaiting `claimBond` | 11 |
+| `pendingBountyWei` | `mapping(address => uint256)` | wei | graduation bounty credited per earner | 8.3 |
+| `pendingBountyTotalWei` | `uint128` | wei | sum of every unclaimed bounty | 8.3 |
+| `state` | `State` | — | lifecycle state | 7 |
+| `bondState` | `BondState` | — | bond state | 11.3 |
+| `capReachedAt` | `uint64` | unix seconds | time the cap was reached, zero before | 7, 8 |
+| `graduatedAt` | `uint64` | unix seconds | time the launch graduated, zero before | 8 |
+
 Per launch, immutable:
 
 | Name | Type | Units | Meaning |
 |---|---|---|---|
 | `virtualEthReserve` (`vE0`) | `uint128` | wei | the curve's only free scalar |
+| `ethTarget` (`R_target`) | `uint128` | wei | `ETH_TARGET_MULTIPLE * vE0`, computed once in the constructor |
+| `sqrtPriceTerminal` | `uint160` | Q64.96 | the pool's opening price, computed once in the constructor (section 8.1) |
+| `bondWei` | `uint128` | wei | the dev bond posted at launch, possibly zero (section 11.1) |
+| `gradDeadline` | `uint64` | unix seconds | `block.timestamp + gradWindow`, fixed at construction |
+| `totalFeeBps` | `uint16` | bps | the launch's total trading fee (section 6) |
+| `creatorShareBps`, `protocolShareBps`, `protectionShareBps` | `uint16` | bps of the fee | the launch's fee split (section 6) |
+| `factory`, `token`, `creator`, `protocolTreasury`, `vesting`, `liquidityLock`, `poolManager`, `positionManager`, `permit2` | `address` | — | the launch's fixed counterparties |
+
+`gradWindow` itself is not stored: only the deadline it implies is. There is no
+`launchedAt` field anywhere in the curve, which is why the bond condition of
+section 11.1 is a comparison against `gradDeadline`.
 
 Global constants:
 
@@ -219,7 +339,7 @@ K  = vE0 * vT0            (immutable per launch)
 contract by any means cannot change any price. This single rule removes the
 entire class of balance-manipulation and donation-manipulation attacks against
 pricing. Value genuinely intended as a donation goes through `donate()`
-(section 5.5), which updates `r` explicitly.
+(section 5.7), which updates `r` explicitly.
 
 ### 5.3 Why these constants
 
@@ -274,10 +394,16 @@ Let `v = msg.value`.
 6.  r += net
 7.  s += dT
 8.  split fee per section 6
-9.  token.transfer(msg.sender, dT)
-10. if refund > 0: send refund to msg.sender
-11. if s == C: state = Graduating, capReachedAt = block.timestamp
+9.  if s == C: state = Graduating, capReachedAt = block.timestamp
+10. token.transfer(msg.sender, dT)
+11. if refund > 0: send refund to msg.sender
 ```
+
+Steps 6 to 9 are every storage write the trade performs, including the
+`Live -> Graduating` transition, and all of them complete before either transfer
+in steps 10 and 11. The transition is not an epilogue after the transfers:
+ordering it last would leave a window, inside a single call, in which the cap is
+reached and the state does not say so.
 
 Step 4's second branch is the final buy, clipped exactly to the cap. The buyer
 pays only for the tokens they receive and the fee is recomputed on the ETH
@@ -290,8 +416,8 @@ silently charging more.
 
 `sell(uint256 dT, uint256 minEthOut, uint256 deadline)`. Requires
 `state in {Live, Expired, Stalled}`, `block.timestamp <= deadline`, and
-`dT >= 1`. The caller must have approved or the contract must pull via
-`transferFrom`.
+`dT >= 1`. The caller must have approved the curve for at least `dT`, because
+step 10 pulls the tokens with `transferFrom`.
 
 ```
 1.  require(dT <= s)
@@ -300,12 +426,20 @@ silently charging more.
 4.  fee   = ceil(gross * totalFeeBps / 10000)
 5.  out   = gross - fee
 6.  require(out >= 1 && out >= minEthOut)
-7.  token.transferFrom(msg.sender, address(this), dT)
-8.  r -= gross
-9.  s -= dT
-10. split fee per section 6
+7.  r -= gross
+8.  s -= dT
+9.  split fee per section 6
+10. token.transferFrom(msg.sender, address(this), dT)
 11. send out to msg.sender
 ```
+
+Steps 7 to 9 are every storage write the trade performs and they complete before
+the seller's tokens are pulled in step 10. Pulling first and writing afterwards
+would be observationally identical — any revert in the pull rolls the writes
+back, the launch token is the protocol's own hookless ERC-20 with no callback,
+and `sell` holds a reentrancy guard — but strict checks-effects-interactions is
+the project's standard and Invariant 55 points the same way, so the order above
+is the normative one.
 
 There is no minimum on sells beyond `out >= 1`. A holder with a dust balance
 must always be able to exit; a minimum sell size would trap them.
@@ -355,6 +489,13 @@ holders (sections 11 and 12).
 Because a donation moves the price, it can be used to front-run a pending buy
 so that the buyer receives fewer tokens than quoted. `minTokensOut` on `buy` is
 mandatory and is the mitigation.
+
+`donate()` is the only way to add ETH to `r`. A plain ETH transfer to the curve
+reverts: the curve's `receive` function accepts value from PositionManager alone,
+which is the sweep of unspent `currency0` from a graduation mint, and reverts
+`DirectEthNotAccepted` for every other sender. That is not a pricing measure —
+pricing reads storage either way (section 5.2) — but a usability one: a user
+cannot silently lose ETH by sending it to the curve instead of calling `donate`.
 
 ### 5.8 Rounding, summarised
 
@@ -422,7 +563,14 @@ the treasury.
 | `claimCreatorFees()` | anyone | `state in {Graduated, Stalled}` | `creator` |
 | `claimProtocolFees()` | anyone | any state | `protocolTreasury` |
 | `claimBond()` | anyone | `bondState == Returned` | `creator` |
-| `claimBounty()` | anyone | `pendingBountyWei > 0` | the recorded bounty earner |
+| `claimBounty(address earner)` | anyone | `pendingBountyWei[earner] > 0` | `earner` |
+
+`claimBounty` takes the earner as an argument rather than reading `msg.sender`.
+Graduation credits the bounty to a mapping keyed by the address that graduated
+the launch (section 8.2 step 6), and the claim is a permissionless push to the
+address that mapping names, so an earner needs neither a transaction of its own
+nor a live key to be paid. `pendingBountyTotalWei` tracks the sum of the mapping
+so that Invariant 3 stays a one-read assertion.
 
 `claimCreatorFees` reverting before graduation is load-bearing: **the creator
 cannot withdraw a single wei from a launch until that launch has delivered.**
@@ -432,9 +580,26 @@ design has.
 `protocolTreasury` is copied immutably into the curve at launch, so a later
 change to factory config cannot redirect an existing launch's accrued fees.
 
-Both claim functions are permissionless pushes so that no privileged action is
-ever needed to move accrued value, and both use a checked low-level call. A
-recipient that reverts on receipt blocks only its own bucket.
+All four claim functions are permissionless pushes, so that no privileged action
+is ever needed to move accrued value, and all four use a checked low-level call.
+A recipient that reverts on receipt blocks only its own bucket.
+
+Sells stay open in `Expired` and `Stalled` (section 7), so fees continue to be
+charged and split in those states. Three consequences, stated because they are
+value nobody can move rather than value anyone can take:
+
+- `protocolFeeEth` is claimable in every state, so the protocol share of a
+  post-terminal sell is claimable normally.
+- In `Stalled` the creator share is claimable normally, because
+  `claimCreatorFees` permits that state.
+- In `Expired` the creator share accrued **after** `expire()` has no payout path:
+  `claimCreatorFees` reverts in `Expired`, and `expire()`'s donation into `r` is
+  a one-time event that has already happened. The holder-protection share accrued
+  after either terminal transition has no payout path either, for the same
+  reason. Both accumulate in a contract that has no withdrawal path, so they
+  leave circulation. The amount is bounded by the fee on post-terminal sell
+  volume. Whether a terminal launch should keep splitting its fee this way is
+  decision 13 of `docs/OPEN_DECISIONS.md`.
 
 ---
 
@@ -494,8 +659,11 @@ permanently immobilised without any burn and without `totalSupply()` changing.
 
 ### 8.1 The pool is initialised at launch, not at graduation
 
-`createLaunch` calls `PoolManager.initialize(poolKey, sqrtPriceTerminal)` in
-the launch transaction, with zero liquidity.
+The launch transaction initialises the pool with zero liquidity.
+`BondingCurve`'s constructor makes the call —
+`PoolManager.initialize(poolKey, sqrtPriceTerminal)` — because the constructor is
+the first moment the token address exists, and `createLaunch` cannot return
+before it has run.
 
 The pool key is:
 
@@ -542,6 +710,12 @@ The cost is one `initialize` call per launch including launches that never
 graduate. That is accepted: the alternative leaves the single most important
 transaction in the protocol exposed to a cheap, permanent grief.
 
+`IBondingCurve` exposes `poolId()` and `gradDeadline()`. It exposes no
+`poolKey()` and no `launchedAt()`; both were dropped against the size budget of
+section 2.1. The key is reconstructible from `token()` and the three constants in
+the table above, since `currency0` is always `address(0)`, and the launch time is
+in the `LaunchCreated` log.
+
 `hooks` is `address(0)`. A hook could take a post-graduation fee, but it would
 put protocol code in the swap path of every future trade forever. The claim
 this design makes is that a graduated Pledrin pool is an ordinary, unowned,
@@ -557,37 +731,54 @@ Permissionless. Requires `state == Graduating`. One transaction, no window.
         zeroForOne = slot0(poolKey).sqrtPriceX96 > sqrtPriceTerminal
         swap(zeroForOne, amountSpecified = -1, sqrtPriceLimitX96 = sqrtPriceTerminal)
         require the swap's net currency0 and currency1 deltas are both zero
-        require slot0(poolKey).sqrtPriceX96 == sqrtPriceTerminal
-3.  token.approve(PERMIT2, S_LP)
-    PERMIT2.approve(token, POSITION_MANAGER, S_LP, type(uint48).max)
+3.  require slot0(poolKey).sqrtPriceX96 == sqrtPriceTerminal
 4.  mint position A (core):
+        token.approve(PERMIT2, S_LP)
+        PERMIT2.approve(token, POSITION_MANAGER, S_LP, type(uint48).max)
         tickLower = alignUp(MIN_TICK, tickSpacing)
         tickUpper = alignDown(MAX_TICK, tickSpacing)       // -887200 / 887200
         liquidity:    the largest value whose currency1 requirement is <= S_LP
         token amount: at most S_LP; require S_LP - consumed <= LP_DUST_MAX
         ETH amount:   amount0Max = R_target exactly
         recipient:    LiquidityLock
-5.  floorEth = protectionEth + (r - R_target) + (R_target - ETH used by A)
-    protectionEth = 0
-6.  if floorEth >= MIN_FLOOR_WEI:
-        mint position B (floor), with currentTick read from slot0.tick:
+        coreEth    = the ETH the mint consumed, read from this contract's balance
+        token.approve(PERMIT2, 0)                          // before position B
+        LiquidityLock.registerPosition(positionIdCore, Core)
+5.  floorEth = protectionEth + (r - R_target) + (R_target - coreEth)
+    bounty   = floor(protocolFeeEth * GRAD_BOUNTY_BPS / 10000)
+6.  protectionEth = 0; r = 0
+    protocolFeeEth -= bounty
+    pendingBountyWei[msg.sender] += bounty                 // credited, not pushed
+    pendingBountyTotalWei += bounty
+7.  if bondHeldWei > 0:
+        bondState = Returned
+        pendingBondWei = bondHeldWei; bondHeldWei = 0       // credited, not pushed
+8.  mint position B (floor), which internally:
+        if floorEth < MIN_FLOOR_WEI: no mint, positionIdFloor = 0, ethToFloor = 0
+        otherwise, with currentTick read from slot0.tick:
             tickLower = alignDown(currentTick, tickSpacing) + tickSpacing
             tickUpper = tickLower + alignDown(FLOOR_RANGE_TICKS, tickSpacing)
             require tickLower > currentTick
             require tickUpper <= alignDown(MAX_TICK, tickSpacing)
             ETH amount:   floorEth, single-sided (currency0 only)
             recipient:    LiquidityLock
-7.  r = 0
-8.  bounty = floor(protocolFeeEth * GRAD_BOUNTY_BPS / 10000)
-    protocolFeeEth -= bounty
-    pendingBountyWei[msg.sender] += bounty                  // credited, not pushed
-9.  if bondHeldWei > 0:
-        bondState = Returned
-        pendingBondWei = bondHeldWei; bondHeldWei = 0        // credited, not pushed
-10. CreatorVesting.start(launch, block.timestamp)
-11. factory.recordGraduation(creator, R_target)
-12. emit Graduated
+            LiquidityLock.registerPosition(positionIdFloor, Floor)
+9.  CreatorVesting.start()                                 // keyed by msg.sender
+10. factory.recordGraduation(creator, R_target, bondReturned)
+11. emit Graduated
 ```
+
+The order of steps 4 to 8 is forced, and it is the reason Invariant 55's
+strongest form does not hold in this function. `floorEth` is a function of the
+ETH the core mint actually consumed, which is knowable only after that mint has
+returned, so a storage write necessarily follows an external call here. What
+holds instead is the property the anti-grief argument in section 8.4 and
+`docs/THREAT_MODEL.md` section 7 actually rely on: `graduate` holds a reentrancy
+guard; `state` is written to its terminal value in step 1, before any call leaves
+the contract, so a reentrant attempt fails the state check; and every remaining
+storage write is complete before the function's last external calls, which are
+the floor mint and the two protocol-internal notifications of steps 9 and 10,
+with only the event after them.
 
 Step 2's restoring swap nominates a non-zero `amountSpecified`.
 `PoolManager.swap` rejects `amountSpecified == 0` with
@@ -623,23 +814,53 @@ immobilised was false and is withdrawn.
 `amount0Max` one wei below the amount the mint actually requires is rejected with
 `MaximumAmountExceeded`, `amount0Max = R_target` is accepted, and the ETH
 headroom between the two is **not monotone** in `virtualEthReserve`, so no
-tighter closed-form bound is safe across the permitted range. Any unused ETH
-flows into the floor position in step 5, so no ETH is stranded. Because the pool
-opens at exactly the curve's terminal price, the ETH consumed equals `R_target`
-to within the `sqrtPriceTerminal` rounding-down error.
+tighter closed-form bound is safe across the permitted range. Any unused ETH is
+counted into `floorEth` in step 5 and funds position B in step 8, so no ETH is
+stranded. Because the pool opens at exactly the curve's terminal price, the ETH
+consumed equals `R_target` to within the `sqrtPriceTerminal` rounding-down
+error.
 
-Step 6's `tickUpper <= alignDown(MAX_TICK, tickSpacing)` requirement cannot fire
-at any permitted parameter set: step 2 has just asserted the price is
+The Permit2 allowance is revoked inside step 4, before position B is minted, so
+position B's funding in `currency0` alone is structural rather than a property of
+its parameters: with no token allowance in place, a token-funded mint would
+revert.
+
+Step 5's two subtractions are checked arithmetic and neither can underflow.
+`r - R_target` cannot, because Invariant 13 gives `r >= R_target` at the cap and
+`Graduating` freezes `r` against trades while `donate` can only raise it;
+`R_target - coreEth` cannot, because `amount0Max` for the core mint was
+`R_target`.
+
+Steps 6 and 7 **credit** rather than send. A creator or bounty earner whose
+address reverts on receiving ETH would otherwise be able to make `graduate()`
+revert forever, which would strand every holder. Nothing in `graduate()` makes
+an ETH transfer to an address the caller does not control.
+
+Step 8's `tickUpper <= alignDown(MAX_TICK, tickSpacing)` requirement cannot fire
+at any permitted parameter set: step 3 has asserted the price is
 `sqrtPriceTerminal`, whose tick is at most 207243 across the permitted
 `virtualEthReserve` range (section 8.1), and 207243 plus `FLOOR_RANGE_TICKS` is
 far inside the aligned maximum tick at every permitted spacing. It is an
 assertion, not a branch: a graduation that could not place the floor position
 would be a bug rather than a case to handle.
 
-Steps 8 and 9 **credit** rather than send. A creator or bounty earner whose
-address reverts on receiving ETH would otherwise be able to make `graduate()`
-revert forever, which would strand every holder. Nothing in `graduate()` makes
-an ETH transfer to an address the caller does not control.
+`MIN_FLOOR_WEI` is checked inside the floor mint, which returns zeroes rather
+than reverting. A graduation below the threshold is therefore an ordinary
+graduation whose `Graduated` event carries `positionIdFloor = 0` and
+`ethToFloor = 0` (section 16.1).
+
+Step 9 calls `CreatorVesting.start()` with no arguments: the schedule it starts
+is the one keyed by the caller, which is this curve (section 12). A launch with
+no schedule reaches a no-op rather than a revert, so a creator who skipped the
+first buy cannot make graduation fail.
+
+Step 10 passes three arguments, not one.
+`recordGraduation(address creator, uint128 ethRaised, bool bondReturned)` carries
+the bond outcome because the factory cannot ask a curve that is still
+mid-graduation what happened to its bond, and calling back into the curve to find
+out is exactly the reentrancy that step 1 and the write ordering exist to avoid.
+Without that argument the factory could not increment `bondsReturned` at all.
+`ethRaised` is `R_target`, not the curve's final `r` (section 13).
 
 ### 8.3 Who pays the gas, and why it is always worth paying
 
@@ -665,11 +886,20 @@ there is always an economic actor willing to call it.
 | Pre-initialise the pool at a wrong price | Impossible. The pool is initialised in the launch transaction, before the token address is public. |
 | Move the price of the zero-liquidity pool before graduation | `graduate()` restores it with a limit swap that nominates one unit of input, settles for nothing in a pool with no liquidity, and asserts both zero net deltas and the restored price. |
 | Add liquidity to the pool so the price reset is not free | The reset is required to have zero net cost, so `graduate()` reverts rather than spending curve ETH. State stays frozen and `graduate()` is retryable forever. |
-| Block the primary pool key permanently | After `ALT_DELAY = 1 hour` in `Graduating`, `graduateAlt(uint24 tickSpacing)` runs the identical procedure on a caller-chosen `tickSpacing` in `[10, 200]`, requiring that pool to be uninitialised so it is initialised at `sqrtPriceTerminal` with no prior liquidity. An attacker would have to pre-block the whole permitted spacing range and keep doing so. |
+| Block the primary pool key permanently | After `ALT_DELAY = 1 hour` in `Graduating`, `graduateAlt(uint24 tickSpacing)` runs the identical procedure on a caller-chosen `tickSpacing` in `[10, 200]`, requiring that pool to be uninitialised so it is initialised at `sqrtPriceTerminal` with no prior liquidity. An attacker would have to pre-block every permitted spacing and keep doing so. |
 | Sell at the cap to prevent graduation | `Graduating` freezes `s`. |
 | Revert on ETH receipt to make `graduate()` fail | `graduate()` sends ETH to nobody; bond and bounty are credited. |
 | Starve graduation of a caller | Permissionless and bounty-paid, section 8.3. |
 | Everything above at once | After `GRAD_GRACE = 7 days` in `Graduating`, `abortGraduation()` moves the launch to `Stalled`: sells reopen permanently, the bond is **returned** to the creator because the cap was delivered, creator fees become claimable, and `protectionEth` is donated into `r`. Holders get a permanent exit against the deepest reserve the curve ever held. |
+
+`graduateAlt` takes the spacing as a `uint24` and narrows it to `int24` through
+`SafeCast`, so a value above `int24`'s maximum reverts in the cast and everything
+else is caught by the range check. The permitted range is a range of integers and
+not a menu of canonical tiers: every value from 10 to 199 is available, which is
+190 distinct pool keys. The endpoint 200 is inside the range but **never
+available in practice**, because 200 is the primary key's spacing and that pool
+was initialised in the launch transaction, so `graduateAlt(200)` always reverts
+`AltPoolInitialized` (Invariant 38).
 
 `ALT_DELAY` exists so that the honest primary key wins when it is available and
 a caller cannot fragment the canonical pool onto an odd tick spacing for no
@@ -689,6 +919,10 @@ that cost only because it opens the pool itself, at `sqrtPriceTerminal`, with
 nothing to restore. Those figures are EVM execution gas under a forked EVM; per
 `docs/CHAIN_FACTS.md` Nitro's `gasleft()` and L1 data costs differ, so treat them
 as the relative cost of the loop and not as a chain gas quote.
+
+`abortGraduation()` emits `GraduationStalled` and, whenever `protectionEth` was
+non-zero, also a `Donated` log naming the launch as both launch and donor, which
+is how an indexer learns the new `ethReserve` (section 16.1).
 
 `abortGraduation()` returns rather than forfeits the bond because the creator
 met the only condition the bond encodes — reaching the cap before the deadline —
@@ -719,25 +953,74 @@ subsidy. `docs/THREAT_MODEL.md` says so.
 
 ## 9. Liquidity lock
 
-`LiquidityLock` receives the position NFTs via `safeTransferFrom` and holds
-them. It has no function that calls `transferFrom`, `safeTransferFrom`,
-`approve`, `setApprovalForAll`, `permit`, or any PositionManager action that
-decreases liquidity or burns a position. There is no owner, no rescue function,
-no sweep, no timelock, no escape hatch. `ownerOf` for a locked position is the
-lock, forever.
+`LiquidityLock` is the recipient named by both graduation mints, so a position is
+owned by the lock from the moment it exists; PositionManager delivers it with
+`safeTransferFrom`, which the lock accepts from PositionManager only
+(Invariant 57). It has no function that calls `transferFrom`, `safeTransferFrom`,
+`approve`, `setApprovalForAll` or `permit`, no `BURN_POSITION` action, and no
+liquidity-decreasing action with a non-zero liquidity argument. There is no
+owner, no rescue function, no sweep, no timelock, no escape hatch. `ownerOf` for
+a locked position is the lock, forever.
 
-Trading fees accruing to a locked position are settled by decision 1 of
-`docs/OPEN_DECISIONS.md`: the lock ships with one permissionless compound-only
-function, and the fork test has confirmed that collecting the fees and
-increasing liquidity on the same `tokenId` execute as a single
-`modifyLiquidities` call with no intermediate recipient, so decision 1's
-fallback is not needed. The ratio residual of each compounding is **retained**
-by the lock and accumulates there. It is not reinvested on a later call and the
-lock cannot spend it, because the v4 actions involved work off the PoolManager
-delta of the current call and not off the lock's own balance. Which pair of v4
-actions expresses the compounding is decision 12 and blocks nothing else. Either
-way, no path exists by which a locked position's principal or fees reach any
-address.
+Two functions, and nothing else that writes:
+
+| Function | Caller | Effect |
+|---|---|---|
+| `registerPosition(uint256 positionId, PositionKind kind)` | anyone; in practice the graduating curve | records `launch = msg.sender` and the kind for a position the lock already owns; reverts `NotOwned` otherwise, and `AlreadyLocked` on a second attempt for the same id |
+| `compound(uint256 positionId)` | anyone | collects that registered position's accrued fees and reinvests them into the same position; returns the liquidity gained |
+
+`registerPosition` is permissionless by design and not by omission. The only
+position it can register is one the lock already owns, the only consequence of
+registering one is that its fees become compoundable, it cannot overwrite an
+existing record, and it names no recipient and moves nothing.
+
+Fee compounding is decision 1 of `docs/OPEN_DECISIONS.md`, resolved to a
+permissionless compound-only function; its encoding is decision 12, resolved to
+option B and shipped. One `modifyLiquidities` batch of four actions:
+`DECREASE_LIQUIDITY` with a hard-coded zero liquidity, which credits the accrued
+fees without touching the principal; `INCREASE_LIQUIDITY_FROM_DELTAS` with
+`type(uint128).max` on both amounts, which spends exactly that credit; then two
+`CLOSE_CURRENCY`. No caller-supplied number reaches the call: the amount
+compounded is the position's own fee delta and nothing else. The zero is a
+literal in the encoding, not a parameter (Invariant 46).
+
+Two guards in `compound` are load-bearing and must not be relaxed:
+
+1. `NothingToCompound`, which reverts when the position's liquidity did not
+   change. With fees accrued on one side only this is the normal case rather than
+   an edge case: the liquidity a pair of amounts buys is the minimum over both
+   sides, so a one-sided fee delta buys zero. Without the guard, `CLOSE_CURRENCY`
+   would credit those fees out of the position and into the lock's retained
+   residual, which nothing can ever spend. Reverting leaves them accrued inside
+   the pool until the other side accumulates, where a later call can still
+   compound them.
+2. `LiquidityNotIncreased`, which reverts if the position's liquidity fell. It is
+   a backstop against a mis-encoded batch rather than a case expected to arise.
+
+The ratio residual of each compounding is **retained** by the lock and
+accumulates there. It is not reinvested by a later call and the lock cannot spend
+it, because the v4 actions involved work off the PoolManager delta of the current
+call and not off the lock's own balance. The lock's `receive` accepts ETH from
+PoolManager and PositionManager only, so nobody can add to that residual by
+accident either. No path exists by which a locked position's principal, its fees
+or the residual reach any address.
+
+`compound` emits `PositionCompounded(positionId, caller, liquidityAdded)`. That
+event is the only observable proof a compounding did anything: the position's
+liquidity is otherwise visible only by reading PositionManager.
+
+One cost of this encoding is recorded here because an auditor will meet it in the
+dependency rather than in Pledrin's own source.
+`INCREASE_LIQUIDITY_FROM_DELTAS` is marked
+`DEPRECATED - vulnerable to sandwich attacks` in the vendored v4-periphery,
+because it carries no minimum-liquidity check: an attacker who moves the pool
+price before the call makes the fee delta buy less liquidity. The exposure here
+is value destruction and not theft — the batch names no recipient but the lock,
+so the liquidity not bought becomes retained residual rather than anyone's profit
+— and the attack costs two legs of the pool's own fee on a notional large enough
+to move a pool that holds the whole ETH target, paid into the position being
+griefed. Decision 12 of `docs/OPEN_DECISIONS.md` records the full comparison
+against the alternative, whose grief costs only gas.
 
 ---
 
@@ -789,7 +1072,10 @@ approval present at all, and a seller crossing the whole range received
 `12_105_670_708_310_857_288_856_074` base units of `currency1` for the same
 liquidity, and an ETH-only mint of it reverts with `MaximumAmountExceeded`.
 
-If `floorEth < MIN_FLOOR_WEI = 1e12` the position is not minted. The reason is
+If `floorEth < MIN_FLOOR_WEI = 1e12` the position is not minted. The threshold
+is checked inside the floor mint, which returns zeroes rather than reverting, so
+the launch graduates normally and its `Graduated` event carries
+`positionIdFloor = 0` and `ethToFloor = 0`. The reason is
 de-minimis and not arithmetic: over a range this wide one wei of `floorEth`
 already yields non-zero liquidity and mints successfully, so the earlier
 justification — that v4 would round the liquidity to zero — is false and is
@@ -828,6 +1114,12 @@ before graduation it simply accrues and no party can touch it. On `Expired` or
 holder's exit price. Same principle, same absence of a snapshot, applied to the
 only market that exists in those states.
 
+Only the balance standing at the moment of the transition is donated. Both
+terminal states keep sells open, so later sells accrue a fresh holder-protection
+share that has neither a further donation path nor a claim path; it accumulates
+in a contract with no withdrawal path and leaves circulation (section 6.2 and
+decision 13 of `docs/OPEN_DECISIONS.md`).
+
 ### 10.4 What it is not
 
 It is not insurance. It does not compensate an individual for a loss, does not
@@ -845,8 +1137,11 @@ mechanism is not read as something it is not.
 that launch's `BondingCurve`, and committed against **exactly one
 deterministic, on-chain-observable condition**:
 
-> The launch reaches `tokensSold == CURVE_SUPPLY` before
-> `launchedAt + gradWindow`.
+> The launch reaches `tokensSold == CURVE_SUPPLY` before `gradDeadline`.
+
+`gradDeadline` is `block.timestamp + gradWindow` evaluated once in the curve's
+constructor and stored as an immutable; the curve has no `launchedAt` field, so
+the condition is one comparison against one immutable (section 5.2).
 
 That is the whole of it. The bond is a **delivery bond**, not an honesty bond
 and not an anti-rug bond. It makes one promise that a contract can check without
@@ -854,8 +1149,11 @@ an oracle, without an admin and without judgement, and it makes no other promise
 `docs/THREAT_MODEL.md` states this in those words.
 
 If `bondWei > 0` the launch is Pledged: the `pledged()` view returns true and the
-Pledged fee shares of section 6 apply. Pledged status is derived from
-`bondWei > 0` and `bondState`, never from a settable flag.
+Pledged fee shares of section 6 apply. Pledged status is derived from the
+immutable `bondWei > 0` alone — never from a settable flag, and deliberately not
+from the mutable `bondState` (Invariant 29). The badge therefore records that a
+bond was posted, not that it is still held: a reader who wants the outcome reads
+`bondState`, where `Forfeited` is the interesting value.
 
 Bounds: `bondWei` is 0, or at least `max(MIN_BOND_WEI, R_target / 10)` and at
 most `MAX_BOND_WEI`. The proportional floor means a bond is always meaningful
@@ -901,15 +1199,27 @@ The only trigger is expiry: the cap was not reached before the deadline.
 `expire()` is permissionless and does, atomically:
 
 ```
-state = Expired
-forfeited = bondHeldWei + creatorFeeEth + protectionEth
-if bondHeldWei > 0: bondState = Forfeited
-r += forfeited
-bondHeldWei = 0; creatorFeeEth = 0; protectionEth = 0
-CreatorVesting.void(launch)
-factory.recordExpiry(creator, bondWei)
-emit Expired(...)
+state = Expired                                      // before any call out
+bond = bondHeldWei; creatorFees = creatorFeeEth; protection = protectionEth
+r += bond + creatorFees + protection
+creatorFeeEth = 0; protectionEth = 0
+if bond > 0:
+    bondHeldWei = 0; bondState = Forfeited
+    emit BondStateChanged(launch, creator, Bonded, Forfeited, bond, launch)
+CreatorVesting.void()                                // keyed by msg.sender
+factory.recordExpiry(creator, bond > 0 ? bondWei : 0)
+emit Expired(launch, bond, creatorFees, protection, r)
 ```
+
+`recordExpiry(address creator, uint128 bondForfeited)` takes the forfeited amount
+rather than a flag, because the factory tracks both a count and a wei total
+(section 13). The amount passed is `bondWei`, which while `Live` is identical to
+`bondHeldWei`: the only exit from `Bonded` before a terminal state is this one.
+
+`expire()` emits no `Donated`. `Expired` already carries all three forfeited
+amounts and the resulting `ethReserve`, so a `Donated` log as well would make an
+indexer count the same wei twice (section 16.1). `abortGraduation()` is the
+opposite case and does emit one, because `GraduationStalled` carries no amounts.
 
 The forfeited ETH is donated into the curve reserve, which raises the exit price
 for every holder immediately, with no snapshot, no claim, no list and no gas
@@ -939,7 +1249,8 @@ deterministically on-chain:
 
 ## 12. Creator allocation and vesting
 
-`CreatorVesting` is a singleton holding one schedule per launch.
+`CreatorVesting` is a singleton holding one schedule per launch, keyed by the
+launch's own address.
 
 | Field | Source |
 |---|---|
@@ -958,13 +1269,54 @@ releasable(t) =
     floor(allocation * (t - start - cliff) / duration) - released   otherwise
 ```
 
-`release()` is callable by anyone and always sends to the recorded `creator`.
-There is no early-release path, no owner, no acceleration, no transfer of the
-schedule, and no function that can change `allocation`, `cliff` or `duration`
-after launch. `void()` is callable only by that launch's curve and only on
-expiry; once voided the allocation is irrecoverable by anyone, which removes
-2% of supply from circulation without burning it and without changing
-`totalSupply()`.
+The interface:
+
+| Function | Caller | Effect |
+|---|---|---|
+| `createSchedule(address creator, address token, uint128 allocation, uint32 cliff, uint32 duration)` | anyone; in practice the launch, inside its launch transaction | creates the schedule keyed by `msg.sender` and **pulls** `allocation` from `msg.sender` with `transferFrom`; reverts `ScheduleExists` on a second call |
+| `start()` | anyone; in practice the launch | starts the schedule keyed by `msg.sender` at `block.timestamp`; a caller with no schedule is a no-op |
+| `void()` | anyone; in practice the launch | voids the schedule keyed by `msg.sender`; a caller with no schedule is a no-op |
+| `release(address launch)` | anyone | sends everything vested so far to that schedule's recorded `creator` |
+| `releasable(address launch)`, `scheduleOf(address launch)` | anyone | views |
+
+`start()` reverts `AlreadyStarted` on a second call and `ScheduleVoided` on a
+voided schedule; `void()` reverts `ScheduleVoided` on an already-voided one.
+Neither can fire from a launch, because a launch calls each at most once and only
+from a terminal transition.
+
+Every mutating function is keyed by `msg.sender` and takes no launch argument,
+and `createSchedule` funds itself by pulling the allocation out of its caller.
+That is load-bearing twice over and is worth stating rather than only recording.
+
+First, it is why `CreatorVesting` needs no privileged caller and no factory
+address, which is what breaks the factory-vesting deployment cycle (section 2.2).
+A vesting contract that checked `msg.sender` against a factory would have to know
+the factory's address, while the factory has to know the vesting address: a cycle
+that can only be broken by address prediction or by a setter, and a setter on
+this contract is a power over user funds.
+
+Second, it makes cross-schedule theft structurally impossible rather than merely
+checked for. A contract that is not a Pledrin launch may call `createSchedule`,
+but it can only create the schedule keyed by itself, and only by delivering the
+allocation it declares out of its own balance in the same call. It cannot create,
+start, void, redirect or drain anyone else's schedule, and the tokens any
+schedule can release are tokens that same schedule delivered. There is no check
+to get wrong because there is no cross-schedule operation to check.
+
+The bounds on `cliff` and `duration` are enforced in `LaunchFactory`
+(section 15.2). `CreatorVesting` itself requires only `duration != 0`,
+`allocation != 0` and non-zero `creator` and `token`, because it is
+permissionless and a schedule a stranger creates for itself is not the protocol's
+business.
+
+`release(address launch)` is callable by anyone and always sends to the recorded
+`creator`. There is no early-release path, no owner, no acceleration, no transfer
+of the schedule, and no function that can change `allocation`, `cliff` or
+`duration` after launch. `void()` acts only on the caller's own schedule, and the
+only caller with a schedule the protocol created is that launch's curve, which
+calls it in `expire()` and nowhere else; once voided the allocation is
+irrecoverable by anyone, which removes it — at most 2% of supply — from
+circulation without burning it and without changing `totalSupply()`.
 
 The clock starts at graduation, not at launch. Vesting that ran during the curve
 phase would let a creator reach the cap on the last day of the window and
@@ -993,6 +1345,22 @@ recomputed from logs by anyone.**
 | `bondWeiForfeited` | `uint128` | `+= bondWei` on forfeiture |
 | `ethRaisedGraduated` | `uint128` | `+= R_target` on graduation |
 
+The three recorders are
+`recordGraduation(address creator, uint128 ethRaised, bool bondReturned)`,
+`recordStall(address creator, bool bondReturned)` and
+`recordExpiry(address creator, uint128 bondForfeited)`, each callable only by a
+curve the factory itself deployed, which it checks against its own `isLaunch`
+mapping. Each carries the bond outcome as an argument because the alternative is
+the factory reading it back out of a curve that is still mid-transition; as a
+result the factory never reads a launch's storage at all. Every increment emits
+one `ReputationUpdated` log, so a `createLaunch` with a bond emits three.
+
+`ethRaisedGraduated` is incremented by `R_target` — the amount the curve was
+built to raise, passed as `recordGraduation`'s `ethRaised` argument — and not by
+the launch's final `ethReserve`, which is `R_target` plus accumulated rounding
+plus anything donated. The counter is comparable across launches for that reason;
+it is not a measure of a launch's peak reserve.
+
 The wei-denominated counters exist because counts are cheap to fabricate and wei
 is not. A fresh address can manufacture any number of `launches`; it cannot
 manufacture `bondWeiForfeited` without having actually lost that ETH to holders.
@@ -1019,11 +1387,41 @@ The owner's complete set of powers:
 | `setLaunchesPaused(bool)` | `createLaunch` reverts | affect any existing launch in any way |
 | `setFeeConfig(...)` | changes defaults for future launches, bounded by `MAX_TOTAL_FEE_BPS` and a shares-sum check in code | change any existing launch's fees |
 | `setProtocolTreasury(address)` | changes the treasury recorded into future launches | redirect any existing launch's accrued fees |
+| `renounceOwnership()` | sets the owner to the zero address, after which none of the three functions above can ever be called again | be undone, or hand ownership to a named address |
 
-That is the whole list. There is no function on any deployed contract by which
-the owner, the timelock, the treasury or any other address can move curve
-reserves, bond ETH, protection ETH, accrued fees, vested tokens or a locked
-position. A pause stops new launches only: trading, selling, donating,
+Four powers, and that is the whole list. `LaunchFactory` inherits OpenZeppelin
+`Ownable`, which also declares `transferOwnership(address)`;
+**`transferOwnership` is overridden to revert, so the factory's ownership can
+never move.** The reason is that a transfer executed through the timelock could
+put ownership in an EOA, which removes the delay from every subsequent
+configuration change and quietly voids the guarantee this section exists to make.
+Overriding it makes "the factory's owner is the timelock, permanently" a property
+of the code rather than a promise.
+
+`renounceOwnership` is kept, because it only ever reduces power. It is the exact
+mechanism by which decision 3 option C of `docs/OPEN_DECISIONS.md` — no owner at
+all — can be taken after deployment, through the timelock and its delay, and it
+is irreversible once taken.
+
+`Timelock` itself has four entry points:
+
+| Function | Caller | Effect |
+|---|---|---|
+| `propose(address target, bytes data, bytes32 salt)` | `admin` | records `readyAt = block.timestamp + DELAY` against the operation's id |
+| `cancel(bytes32 id)` | `admin` | drops a pending operation |
+| `execute(address target, bytes data, bytes32 salt)` | `admin` | clears the pending record, then makes the call; reverts before `readyAt` |
+| `setAdmin(address)` | the timelock itself | rotates the admin, so the admin's own rotation also waits out the delay |
+
+`Timelock` is not payable, has no `receive` function, and executes every
+operation as a zero-value call, so no path exists by which it can hold or move
+value. Its authority is exactly the four `onlyOwner` functions of the first table
+in this section. Who holds the `admin` role is decision 3 of
+`docs/OPEN_DECISIONS.md`.
+
+There is no function on any deployed contract by which the owner, the timelock,
+the treasury or any other address can move curve reserves, bond ETH, protection
+ETH, accrued fees, vested tokens or a locked position. A pause stops new
+launches only: trading, selling, donating,
 graduating, expiring, claiming and vesting all continue to work while paused.
 Every launch-time configuration value is copied immutably into the launch at
 creation, so a launch's rules are fixed the moment it exists.
@@ -1067,13 +1465,22 @@ creation, so a launch's rules are fixed the moment it exists.
 | `symbol` | `string` | — | — | 1 to 16 bytes |
 | `virtualEthReserve` | `uint128` | wei | `5 * 10**17` | `1.25e16` to `1.25e20`, giving `R_target` from 0.1 to 1000 ETH |
 | `bondWei` | `uint128` | wei | `0` | `0`, or `max(MIN_BOND_WEI, R_target/10)` to `MAX_BOND_WEI` |
-| `creatorFirstBuyWei` | `uint128` | wei | `0` | `0` to whatever yields at most `CREATOR_FIRST_BUY_MAX` base units |
+| `creatorFirstBuyWei` | `uint128` | wei | `0` | `0`, or `MIN_BUY_WEI` to whatever yields at most `CREATOR_FIRST_BUY_MAX` base units |
 | `gradWindow` | `uint32` | seconds | `2592000` (30 d) | `86400` to `31536000` |
 | `creatorVestCliff` | `uint32` | seconds | `604800` (7 d) | `0` to `7776000` |
 | `creatorVestDuration` | `uint32` | seconds | `15552000` (180 d) | `2592000` to `126144000` |
 | `totalFeeBps` | `uint16` | bps | `100` | from factory config, at most `MAX_TOTAL_FEE_BPS` |
 | `creator` | `address` | — | `msg.sender` | non-zero |
 | `protocolTreasury` | `address` | — | from factory config | non-zero |
+
+Where each bound is enforced: `LaunchFactory` checks every row of the table.
+`BondingCurve`'s constructor independently re-checks `virtualEthReserve`,
+`gradWindow`, `totalFeeBps`, the three shares summing to 10000, the bond bounds,
+`msg.value == bondWei`, and that none of its counterparties is the zero address,
+so those bounds hold for any curve however it was deployed. It does not re-check
+`name`, `symbol`, `creatorVestCliff` or `creatorVestDuration`: those reach a
+launch only through the factory, and a curve deployed directly through
+`CurveDeployer` by a third party is not a Pledrin launch (section 2.1).
 
 `virtualEthReserve` is the curve's only free scalar. It scales the entire curve
 linearly in ETH and leaves every token-side quantity — `CURVE_SUPPLY`,
@@ -1088,17 +1495,54 @@ how much ETH it raises.
 
 ```
 1.  validate every parameter against section 15.2
-2.  deploy PledrinToken, minting TOTAL_SUPPLY to the new BondingCurve
-3.  deploy BondingCurve with all immutables
-4.  PoolManager.initialize(poolKey, sqrtPriceTerminal)
-5.  if bondWei > 0: bondHeldWei = bondWei; bondState = Bonded
-6.  if creatorFirstBuyWei > 0:
-        execute buy(creatorFirstBuyWei) on the curve
-        require tokens out <= CREATOR_FIRST_BUY_MAX
-        deliver tokens to CreatorVesting with start = 0
-7.  launches++, bondsPosted++, bondWeiPosted += bondWei
-8.  emit LaunchCreated and LaunchMetadata
+2.  read the factory's fee config; select the Pledged or unpledged share set
+    from bondWei != 0 (section 6)
+3.  CurveDeployer.deploy{value: bondWei}(config), which deploys the launch's
+    BondingCurve; in that one constructor:
+        validate the config again (section 15.2)
+        if bondWei > 0: bondHeldWei = bondWei; bondState = Bonded
+        TokenDeployer.deploy(name, symbol), minting TOTAL_SUPPLY to the curve
+        require totalSupply == TOTAL_SUPPLY and balanceOf(curve) == TOTAL_SUPPLY
+        PoolManager.initialize(poolKey, sqrtPriceTerminal)
+4.  isLaunch[launch] = true
+5.  if creatorFirstBuyWei > 0:
+        curve.creatorFirstBuy{value: creatorFirstBuyWei}(cliff, duration)
+6.  launches++, bondsPosted++, bondWeiPosted += bondWei
+7.  emit LaunchCreated and LaunchMetadata
 ```
+
+Step 5 runs the creator's first buy **inside the curve**, not in the factory.
+`creatorFirstBuy(uint32 cliff, uint32 duration)` is payable, callable only by the
+curve's own `factory`, and callable only while `tokensSold == 0`, which is true
+only in the launch transaction. It runs the ordinary buy body of section 5.4
+against the curve's own state and charges the ordinary fee, then approves
+`CreatorVesting` and calls `createSchedule`, which pulls the tokens out of the
+curve. The tokens therefore travel from the curve to vesting and never touch the
+creator's wallet or the factory's balance.
+
+Routing it through the curve is what lets `CreatorVesting` be keyed by
+`msg.sender` (section 12): the schedule's key is the launch because the launch is
+both the caller and the funder. A factory-side first buy would have had to move
+the tokens through the factory and would have forced vesting to trust a named
+caller, which reintroduces the deployment cycle of section 2.2.
+
+The call carries no slippage bound and `block.timestamp` as its deadline. That is
+safe only because of the `tokensSold == 0` precondition: the price is the launch's
+opening price by construction, fixed in the same transaction by the curve's own
+constructor, and no third party can have traded against it in between. Were the
+first buy reachable at any other time, both arguments would have to be real.
+
+A clipped first buy cannot produce a refund, and the curve therefore has no
+refund path here. Clipping happens only when a buy takes the whole remaining sale
+supply, which at `tokensSold == 0` is all of `CURVE_SUPPLY`, and the
+`CREATOR_FIRST_BUY_MAX` check rejects any first buy yielding more than
+18,000,000 tokens. The ceiling is checked after the quote has been applied, so an
+oversized first buy reverts the entire launch transaction rather than being
+clipped to the cap. The clipped branch is unreachable in this path and `refund`
+is always zero.
+
+The first buy emits `Bought` with `buyer = creator`, which is the indexer caveat
+in section 16.1.
 
 ---
 
@@ -1111,6 +1555,8 @@ creator, by trader.
 |---|---|
 | `LaunchCreated` | `launch*`, `token*`, `creator*`, `virtualEthReserve`, `ethTarget`, `totalFeeBps`, `creatorShareBps`, `protocolShareBps`, `protectionShareBps`, `bondWei`, `gradDeadline`, `poolId` |
 | `LaunchMetadata` | `launch*`, `name`, `symbol`, `metadata` (opaque bytes, never stored) |
+| `CurveDeployed` | `curve*`, `factory*`, `creator*` |
+| `TokenDeployed` | `token*`, `curve*` |
 | `Bought` | `launch*`, `buyer*`, `ethIn`, `ethToCurve`, `tokensOut`, `fee`, `refund`, `tokensSold`, `ethReserve` |
 | `Sold` | `launch*`, `seller*`, `tokensIn`, `ethGross`, `ethOut`, `fee`, `tokensSold`, `ethReserve` |
 | `FeeAccrued` | `launch*`, `creatorCut`, `protocolCut`, `protectionCut` |
@@ -1121,14 +1567,53 @@ creator, by trader.
 | `Expired` | `launch*`, `bondForfeited`, `creatorFeesForfeited`, `protectionForfeited`, `ethReserve` |
 | `BondStateChanged` | `launch*`, `creator*`, `oldState`, `newState`, `amount`, `destination` |
 | `FeesClaimed` | `launch*`, `recipient*`, `kind`, `amount` |
+| `VestingCreated` | `launch*`, `creator*`, `allocation`, `cliff`, `duration` |
 | `VestingStarted` | `launch*`, `creator*`, `allocation`, `start`, `cliff`, `duration` |
 | `VestingReleased` | `launch*`, `creator*`, `amount`, `cumulative` |
 | `VestingVoided` | `launch*`, `creator*`, `allocation` |
 | `PositionLocked` | `positionId*`, `launch*`, `kind` |
+| `PositionCompounded` | `positionId*`, `caller*`, `liquidityAdded` |
 | `ReputationUpdated` | `creator*`, `counter`, `newValue` |
 | `LaunchesPausedSet` | `paused` |
 | `FeeConfigSet` | `totalFeeBps`, `creatorShareBps`, `protocolShareBps`, `protectionShareBps`, `pledgedCreatorShareBps`, `pledgedProtocolShareBps`, `pledgedProtectionShareBps` |
 | `TreasurySet` | `treasury*` |
+| `OperationProposed` | `id*`, `target*`, `data`, `salt`, `readyAt` |
+| `OperationExecuted` | `id*`, `target*`, `data`, `salt` |
+| `OperationCancelled` | `id*` |
+| `AdminTransferred` | `previousAdmin*`, `newAdmin*` |
+
+The last four are `Timelock`'s. `LaunchFactory` additionally emits OpenZeppelin
+`Ownable`'s `OwnershipTransferred(previousOwner*, newOwner*)`, once at
+construction and once more if ownership is ever renounced; it can never be
+emitted for a transfer, because `transferOwnership` reverts (section 14).
+
+### 16.1 Notes for an indexer
+
+- `Bought` for the creator's first buy reports `buyer = creator`, although the
+  tokens are delivered to `CreatorVesting` and never reach the creator. An
+  indexer that derives balances from trade events rather than from ERC-20
+  `Transfer` events will misattribute that one buy. `VestingCreated`, emitted in
+  the same transaction with the same allocation, disambiguates it.
+- `abortGraduation` emits `Donated(launch, launch, protectionEth, ethReserve)`
+  in addition to `GraduationStalled`, whenever `protectionEth` was non-zero. The
+  donor field is the launch itself. `GraduationStalled` carries no amounts, so
+  without that log an indexer tracking `ethReserve` from events would lose it at
+  the stall.
+- `expire` emits only `Expired`, plus `BondStateChanged` when there was a bond.
+  There is deliberately no `Donated`: `Expired` already carries the bond, the
+  creator fees, the protection ETH and the resulting `ethReserve`, so a second
+  log would double-count the same wei.
+- `Graduated` carries `positionIdFloor = 0` and `ethToFloor = 0` when
+  `floorEth < MIN_FLOOR_WEI` (section 8.2 step 8). Zero is not a position id.
+- A `CurveDeployed` or `TokenDeployed` log is not evidence of a Pledrin launch:
+  both deployers are permissionless (section 2.1). Only `LaunchCreated` from the
+  factory, and the factory's `isLaunch` mapping, identify a launch.
+- `PositionLocked` and `PositionCompounded` carry whatever address registered the
+  position. `LiquidityLock` does not check that address against the factory,
+  because it has no factory address and needs none (section 9), so cross-check
+  `launch` against `isLaunch` before attributing a locked position to a launch.
+- Reputation is reported one counter per log, so the three counters a bonded
+  `createLaunch` touches arrive as three `ReputationUpdated` events.
 
 ---
 
@@ -1147,11 +1632,17 @@ invariant suite.
    never become insolvent against any sell, including a single seller selling
    every token ever sold.
 3. For every launch before graduation,
-   `address(curve).balance >= ethReserve + protectionEth + creatorFeeEth + protocolFeeEth + bondHeldWei + pendingBountyWei + pendingBondWei`.
+   `address(curve).balance >= ethReserve + protectionEth + creatorFeeEth + protocolFeeEth + bondHeldWei + pendingBountyTotalWei + pendingBondWei`.
+   `pendingBountyTotalWei` is the stored sum of the `pendingBountyWei` mapping,
+   which is what keeps this a one-read assertion.
 4. `ethReserve` decreases only in `sell` (by `gross`) and in
    `graduate`/`graduateAlt` (to zero). No other code path reduces it.
-5. `token.balanceOf(curve) == TOTAL_SUPPLY - tokensSold` for every launch before
-   graduation.
+5. `token.balanceOf(curve) >= TOTAL_SUPPLY - tokensSold` for every launch before
+   graduation, with equality unless tokens reached the curve outside the
+   protocol's own transfers. Tokens sent to the curve by a third party are inert
+   and are never counted, because nothing reads `balanceOf` for pricing
+   (Invariant 10), so the inequality is the testable form and the equality holds
+   for every sequence of protocol operations.
 6. `tokensSold <= CURVE_SUPPLY` always.
 7. An immediate round trip never profits: for any `v` and any state, selling the
    tokens a buy of `v` produced yields at most `v`, even with `totalFeeBps == 0`.
@@ -1181,9 +1672,14 @@ invariant suite.
     constructor and not only in factory config.
 17. `protectionCut` is computed as the residual and is therefore the sole
     destination of every rounding remainder of a fee split.
-18. The sum of all ETH ever paid out of a launch's three fee buckets, plus their
-    current balances, equals the sum of all `fee` values ever charged by that
-    launch.
+18. For every launch, the sum of all `fee` values ever charged equals the sum of:
+    ETH paid out by `claimCreatorFees`, `claimProtocolFees` and `claimBounty`;
+    bounty credited but not yet claimed; `protectionEth` deposited into the floor
+    position at graduation; `protectionEth` donated into `ethReserve` by `expire`
+    or `abortGraduation`; creator fees donated into `ethReserve` by `expire`; and
+    the three buckets' current balances. No wei of a fee leaves this accounting in
+    any state, including the post-terminal accruals of section 6.2, which remain
+    in their buckets.
 19. No protocol function transfers the launch token out of any user's balance.
     Fees are ETH-only.
 
@@ -1196,7 +1692,10 @@ invariant suite.
 22. Cumulative released never exceeds `allocation`, and equals `allocation` for
     every `t >= start + cliff + duration` on a non-voided schedule.
 23. `allocation`, `cliff` and `duration` are never writable after `createLaunch`;
-    `start` is writable exactly once, by that launch's curve.
+    `start` is writable exactly once, and only by the launch itself, because
+    `createSchedule`, `start` and `void` are all keyed by `msg.sender` and no
+    function of `CreatorVesting` takes a launch argument it then writes to
+    (section 12).
 24. The tokens delivered to `CreatorVesting` at launch are at most
     `CREATOR_FIRST_BUY_MAX`.
 
@@ -1220,7 +1719,15 @@ invariant suite.
 ### Lifecycle
 
 30. Once `state` is `Graduated`, `Expired` or `Stalled`, it never changes again.
-31. `tokensSold` never changes once `state` leaves `Live`.
+31. `tokensSold` never **increases** once `state` leaves `Live`, and does not
+    change at all while `state` is `Graduating` or `Graduated`. In `Expired` and
+    `Stalled` it decreases by exactly `dT` on every accepted `sell`
+    (section 5.5 step 8), which is mandatory rather than incidental: the sell
+    price is computed from `vT = vT0 - tokensSold`, so holding `tokensSold` fixed
+    while `ethReserve` falls would make `vE * vT` decrease and break Invariants 1
+    and 2. What this invariant forbids is what it was written to forbid: there
+    is no buy after `Live`, so `tokensSold` can never rise again, and the cap is
+    a one-way door because `Graduating` admits neither direction.
 32. `buy` reverts unless `state == Live && block.timestamp < gradDeadline`.
 33. `sell` succeeds in `Live`, `Expired` and `Stalled` and reverts in
     `Graduating` and `Graduated`.
@@ -1233,8 +1740,12 @@ invariant suite.
 37. `graduateAlt` reverts before `capReachedAt + ALT_DELAY`;
     `abortGraduation` reverts before `capReachedAt + GRAD_GRACE`.
 38. `graduateAlt` accepts only `tickSpacing` in
-    `[ALT_TICK_SPACING_MIN, ALT_TICK_SPACING_MAX]` and only a pool that is not
-    yet initialised.
+    `[ALT_TICK_SPACING_MIN, ALT_TICK_SPACING_MAX]`, narrowed from `uint24` to
+    `int24` through `SafeCast`, and only a pool that is not yet initialised. The
+    endpoint `ALT_TICK_SPACING_MAX = 200` is inside the range but never available
+    in practice: it is the primary key's spacing and that pool was initialised in
+    the launch transaction, so `graduateAlt(200)` reverts `AltPoolInitialized`.
+    The usable set is every spacing from 10 to 199.
 
 ### Graduation and liquidity
 
@@ -1257,10 +1768,12 @@ invariant suite.
     `tickUpper <= alignDown(MAX_TICK, tickSpacing)`; and it is funded in
     `currency0` only, consuming zero base units of the token and requiring no
     token approval.
-43. After graduation, `ethReserve == 0`, the curve's remaining ETH balance is
-    at most `MIN_FLOOR_WEI` plus the unclaimed fee, bounty and bond buckets, and
-    the curve's remaining token balance is at most `LP_DUST_MAX` plus any tokens
-    force-sent to it.
+43. After graduation, `ethReserve == 0`; the curve's remaining ETH balance is at
+    most `MIN_FLOOR_WEI`, plus whatever of `floorEth` the floor mint did not
+    consume and swept back, plus the unclaimed fee, bounty and bond buckets, plus
+    any ETH that reached the curve outside its own paths; and the curve's
+    remaining token balance is at most `LP_DUST_MAX` plus any tokens force-sent
+    to it. None of those amounts has a withdrawal path after graduation.
 44. The graduation bounty is at most `protocolFeeEth` at the time of graduation,
     and is never drawn from `ethReserve`, `protectionEth`, `creatorFeeEth` or
     `bondWei`.
@@ -1270,11 +1783,12 @@ invariant suite.
 46. Every position NFT minted by graduation is owned by `LiquidityLock`
     immediately after the transaction, and `LiquidityLock` contains no code path
     that calls `transferFrom`, `safeTransferFrom`, `approve`, `setApprovalForAll`
-    or any liquidity-decreasing or position-burning PositionManager action. If
-    decision 12 of `docs/OPEN_DECISIONS.md` settles on the compounding encoding
-    that credits fees with a zero-liquidity `DECREASE_LIQUIDITY`, the final
-    clause reads instead: no such call with a non-zero liquidity argument, the
-    zero being a hard-coded literal in the encoding and not a parameter.
+    or `permit`, no `BURN_POSITION` action, and no liquidity-decreasing action
+    with a non-zero liquidity argument. Decision 12 of
+    `docs/OPEN_DECISIONS.md` shipped option B, so the lock's action list contains
+    exactly one `DECREASE_LIQUIDITY`, whose liquidity argument is the literal
+    zero in the encoding and not a parameter: no input to any function of the
+    lock can make it non-zero.
 47. After graduation the protocol charges no fee on any trade. All post-graduation
     trading fees accrue inside the locked positions.
 
@@ -1296,13 +1810,35 @@ invariant suite.
 53. A launch's `totalFeeBps`, fee shares, `protocolTreasury`, `creator`,
     `virtualEthReserve`, `gradDeadline`, `creatorVestCliff` and
     `creatorVestDuration` are never writable after `createLaunch`.
-54. No contract in the system has a `selfdestruct`, a `delegatecall` to a
-    non-constant target, a proxy, or an initialiser callable more than once.
+54. No contract in the system has a `selfdestruct`, a `delegatecall`, a proxy, or
+    an initialiser of any kind. Every launch is a full `CREATE` deployment made
+    by `CurveDeployer` with `new`, so its immutables are set in a real
+    constructor; there is no clone, no immutable-args offset read by hand-
+    maintained offsets, and no post-deployment initialisation step
+    (sections 2.1 and 2.2).
 
 ### Reentrancy and call discipline
 
-55. Every external function that moves ETH or tokens holds a reentrancy guard,
-    and within each such function no storage write follows an external call.
+55. Call discipline, in three parts, because the strongest form is not true
+    everywhere and the document must say which form is enforced:
+    (a) every external function that moves ETH or tokens holds a reentrancy
+    guard; (b) every function that moves `state` to a terminal value writes
+    `state` first, before any external call, so that a reentrant entry fails the
+    state check; (c) in `buy`, `sell`, `donate`, `creatorFirstBuy`,
+    `claimCreatorFees`, `claimProtocolFees`, `claimBond`, `claimBounty`,
+    `CreatorVesting.createSchedule`, `CreatorVesting.release` and
+    `LiquidityLock.compound` — which writes no storage at all — no storage write
+    follows any external call, and in `graduate`, `graduateAlt`, `expire`,
+    `abortGraduation` and `createLaunch`, every storage write the function
+    performs is complete before its final external call, so that what follows is
+    only calls that write none of the calling contract's own state — the floor
+    mint and its registration with the lock, `CreatorVesting.start` / `void`,
+    `LaunchFactory.record*`, and the views the event arguments read — and the
+    event itself. The stronger "no storage write after any external call" cannot
+    hold in `graduate`, `graduateAlt` or `createLaunch`: graduation must read how
+    much ETH the core mint consumed before it can compute `floorEth`
+    (section 8.2 steps 4 to 8), and `createLaunch` cannot write `isLaunch` or a
+    reputation counter before the curve those writes describe exists.
 56. `unlockCallback` on the curve reverts unless `msg.sender` is PoolManager and
     the curve is inside its own `unlock`.
 57. `onERC721Received` on `LiquidityLock` reverts unless `msg.sender` is

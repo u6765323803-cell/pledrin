@@ -27,7 +27,8 @@ This was conditional on the fork test named in the appendix proving that
 collect and increase execute as one `modifyLiquidities` call with no
 intermediate recipient. They do, in two different encodings, so the fallback —
 **no collection at all**, never a two-step version that holds funds between
-calls — is not taken. Which encoding ships is decision 12.
+calls — is not taken. Which encoding ships was decision 12, now resolved to
+option B and shipped.
 
 Because the lock is not upgradeable, this function must be written and
 reviewed as the riskiest code in the repository: it is the only code with a
@@ -196,8 +197,9 @@ Blocks mainnet deployment, not Phase 1.
 
 ### Question
 
-`Timelock` has three powers (pause new launches, change future-launch defaults,
-change the future treasury) and a 48-hour delay. Who may propose?
+`Timelock` has four powers (pause new launches, change future-launch defaults,
+change the future treasury, renounce the factory's ownership) and a 48-hour
+delay. Who may propose?
 
 ### Options
 
@@ -225,6 +227,14 @@ it makes section 8 of the threat model trivial.
 timelock's address in the deployment record. A single EOA is acceptable on
 testnet. Revisit C once `createLaunch` has been audited: if the pause is never
 used in the first months, giving it up is a real improvement to the trust story.
+
+Note added 2026-11-11, from the Phase 1 contracts: option C does not need a
+different deployment. `LaunchFactory` keeps OpenZeppelin `Ownable`'s
+`renounceOwnership`, so C can be taken after the fact by proposing and executing
+that call through the timelock, which sets the owner to the zero address and
+makes all three setters permanently uncallable. `transferOwnership` is overridden
+to revert, so the only ownership move the factory permits is the one that reduces
+power, and it is irreversible (`docs/SPEC.md` section 14).
 
 ---
 
@@ -264,7 +274,27 @@ live testnet launch-to-graduation before mainnet.
 
 ## 5. Per-launch curve deployment mechanism
 
-Does not block Phase 1.
+**RESOLVED FOR PHASE 1 2026-11-11 by what shipped: option A, a full deployment
+per launch.** The cost was not the deployment gas the trade-off below
+anticipated; it was EIP-170. `BondingCurve`'s creation code (22,678 bytes) plus
+`LaunchFactory`'s own code does not fit in a 24,576-byte runtime, so the factory
+cannot carry it. A factory that did measured 45,134 bytes at 1,000,000 optimizer
+runs and 32,623 bytes at 200 runs with the IR pipeline, and one deployer carrying
+both `BondingCurve`'s and `PledrinToken`'s creation code measured 25.0 KB.
+
+What shipped instead is two single-purpose deployers that carry creation code and
+nothing else: `CurveDeployer` at 23,531 bytes, with **1,045 bytes of margin**, and
+`TokenDeployer`. Both are stateless, ownerless and permissionless and hold
+nothing. `docs/SPEC.md` sections 2.1 and 2.2 record the mechanism, the deployment
+order and the consequences; `docs/THREAT_MODEL.md` section 8.2 records what a
+stranger can do with a permissionless deployer.
+
+The margin is now a constraint on unrelated work: roughly a kilobyte of new
+`BondingCurve` code makes `CurveDeployer` undeployable, at which point option B
+below, or splitting the curve, stops being optional. Measure
+`forge build --sizes` before adding to the curve, not after.
+
+Did not block Phase 1.
 
 ### Question
 
@@ -528,8 +558,17 @@ hypothetical self-grief that A permits and that gains nobody anything.
 
 ## 12. Which v4 action pair the lock's compounding path uses
 
-Does not block Phase 1. This is for the contracts engineer; decision 1 has
-already settled *that* the lock compounds, and the fork test has shown both
+**RESOLVED 2026-11-11: option B shipped.** `LiquidityLock.compound` encodes
+`DECREASE_LIQUIDITY` with a hard-coded zero liquidity, then
+`INCREASE_LIQUIDITY_FROM_DELTAS` with `type(uint128).max` on both amounts, then
+two `CLOSE_CURRENCY`. No caller-supplied number reaches the call. `docs/SPEC.md`
+Invariant 46 has been flattened from a conditional into the unconditional
+statement that option B implies, and spec section 9 records the encoding. The two
+costs measured while implementing it are at the end of this entry; both are real
+and neither changes the choice.
+
+Does not block Phase 1. This was for the contracts engineer; decision 1 had
+already settled *that* the lock compounds, and the fork test had shown both
 candidate encodings work as one `modifyLiquidities` call with no intermediate
 recipient.
 
@@ -577,12 +616,112 @@ becomes "no liquidity-decreasing action with a non-zero liquidity argument".
 **B.** Removing the only caller-controlled input from the only function that ever
 touches a position that must otherwise never move is worth more than the stronger
 reading of Invariant 46, and the grief A permits is cheap, repeatable and
-irreversible. `docs/SPEC.md` Invariant 46 already carries the qualified wording
-conditioned on this choice, so picking B needs no further spec change and picking
-A lets the qualification be deleted. A third variant — A, but with the lock
-computing the liquidity on-chain from the position's own fee growth instead of
-accepting it as an argument — closes the grief as well, and is rejected because
-it puts more arithmetic in the lock than B's hard-coded zero does.
+irreversible. A third variant — A, but with the lock computing the liquidity
+on-chain from the position's own fee growth instead of accepting it as an
+argument — closes the grief as well, and is rejected because it puts more
+arithmetic in the lock than B's hard-coded zero does.
+
+### What option B cost, measured rather than assumed
+
+**1. `INCREASE_LIQUIDITY_FROM_DELTAS` is marked deprecated in the vendored
+v4-periphery.** The comment on the constant reads
+`DEPRECATED: Vulnerable to sandwich attacks - do not use`, with the reason that
+the delta-based path has no minimum-liquidity check, so an attacker who moves the
+price can reduce the liquidity received. That warning is accurate and is accepted
+here with its exposure stated exactly:
+
+- The exposure is **value destruction, not theft.** There is no recipient
+  parameter in the batch and the only address it can pay is the lock itself. An
+  attacker who moves the pool price before the call makes the fee delta buy less
+  liquidity and pushes the rest into the lock's retained residual, which nobody,
+  including the lock, can ever spend. Nothing is transferred to the attacker.
+- It is not cheap. Moving the price of a pool that holds the whole ETH target
+  plus the floor position means paying the pool's 1% fee on a notional large
+  enough to move it, twice, in and out — and paying it **into the very position
+  being griefed**, where it is locked forever and is itself compoundable.
+- Option A's grief costs only gas: anyone may call with a liquidity of 1 and
+  divert the whole accrued fee into the unspendable residual. A grief that costs
+  gas and one that costs two legs of a 1% fee on a position-sized notional are
+  not comparable, which is why B remains the better choice after the deprecation
+  was found rather than in spite of it.
+
+**2. With one-sided fee accrual, nothing compounds — and that is now a revert.**
+The liquidity a pair of amounts buys is the minimum over both sides, so a
+position whose fees accrued in one currency only computes zero liquidity from its
+delta. `compound` therefore reverts `NothingToCompound` rather than letting the
+two `CLOSE_CURRENCY` actions credit those fees out of the position and into the
+residual, where they could never be recovered. The fees stay accrued inside the
+pool until the other side accumulates, and a later call compounds both. A second
+guard, `LiquidityNotIncreased`, reverts if the position's liquidity fell at all.
+
+Both guards are load-bearing. Without the first, ordinary one-sided accrual would
+quietly convert collected fees into permanently dead ETH on every call; without
+the second, a mis-encoded batch would have no backstop. Neither may be relaxed to
+make a test pass.
+
+---
+
+## 13. Fees charged on sells after a terminal transition
+
+Does not block Phase 1. Found while reconciling the specification against the
+Phase 1 contracts; it is a property of what shipped, not a defect.
+
+### Question
+
+`Expired` and `Stalled` keep sells open forever, and a sell in those states is an
+ordinary sell: it charges `totalFeeBps` and splits it three ways. Two of the
+three destinations have no payout path left at that point.
+
+- The protocol share is claimable in every state, so it is fine.
+- In `Stalled` the creator share is claimable, so it is fine.
+- In `Expired` the creator share accrued after `expire()` is permanently
+  unclaimable, because `claimCreatorFees` reverts in `Expired`.
+- The holder-protection share accrued after either terminal transition is
+  permanently undeliverable, because the one-time donation into `ethReserve` has
+  already happened and there will be no pool.
+
+Both of those accumulate in a contract with no withdrawal path, so they leave
+circulation. Nobody can take them, and no invariant is violated: Invariant 3
+still holds and Invariant 18 counts them as held. The amount is bounded by the
+fee on post-terminal sell volume, which for a failed launch is the volume of
+holders exiting.
+
+Should a terminal launch keep splitting its fee this way?
+
+### Options
+
+**A. Keep it as shipped.** Simplest possible rule: a sell is a sell, the fee
+arithmetic has no state-dependent branch, and the stranded wei raises nobody's
+cost and lowers nobody's payout. Cost: a small, permanent, unexplained-looking
+leak that an auditor will find and ask about, which is why it is written down
+here.
+
+**B. Route the whole fee into `ethReserve` after a terminal transition.** The fee
+becomes a donation to the remaining holders, which is the destination the design
+already chooses for ambiguous value (spec 6.1). Cost: a state-dependent branch in
+the fee path, which is the most tested arithmetic in the protocol.
+
+**C. Charge no fee on post-terminal sells.** Cheapest exit for holders of a
+failed launch and arguably the fairest. Cost: the same branch as B, and it
+removes the protocol's fee on volume it is still providing a market for.
+
+### Trade-offs
+
+The amounts are small and the current behaviour is safe, so this is a question of
+honesty and tidiness rather than of risk. B is the most defensible of the three
+on principle: every other rounding and remainder in the protocol flows to
+holders, and this is the one place where value instead flows nowhere. Against
+that, both B and C put a branch into `_accrueFee` or its caller, and that code is
+covered by Invariants 14, 17 and 18 in every state.
+
+### Recommendation
+
+**A for Phase 1, with B as the change to make if this code is ever touched
+again.** Do not add a branch to the fee path to recover an amount this small
+while the invariant suite is being written against the current behaviour; do add
+it if a future revision opens that function for another reason. Either way the
+behaviour stays documented in spec 6.2 and 10.3 rather than being left for an
+auditor to discover.
 
 ---
 

@@ -1,6 +1,8 @@
 # Pledrin — threat model
 
-Companion to `docs/SPEC.md`. Section references are to that document.
+Companion to `docs/SPEC.md`. Section references are to that document. Both
+documents were reconciled against the Phase 1 contracts under `contracts/src` on
+2026-11-11.
 
 This document has two halves. The first enumerates attacks the design addresses
 and says how. The second, section 10, states what the design does not prevent.
@@ -148,6 +150,16 @@ the bond plus every credited-but-unclaimed payout, and that total fees charged
 equals total fees paid out plus total fees held. A leak in either direction fails
 a test.
 
+One accounting fact is not drift but is worth stating here rather than being
+discovered in an audit: sells stay open after a terminal transition, so fees keep
+accruing, and some of those accruals have no payout path. The creator share of a
+sell made after `expire()`, and the holder-protection share of a sell made after
+either terminal transition, stay in their buckets permanently, because
+`claimCreatorFees` reverts in `Expired` and the one-time donation into
+`ethReserve` has already happened. Nobody can take that ETH; it simply leaves
+circulation. Spec 6.2 states it and decision 13 of `docs/OPEN_DECISIONS.md`
+records whether to change it.
+
 ### 3.5 Redirecting fees after launch
 
 `protocolTreasury` and all three share values are copied immutably into the curve
@@ -204,7 +216,7 @@ actually trading against it, which would cost the curve ETH or tokens.
 than spending any curve value on a swap. Consequences:
 
 - The curve never funds a swap. `ethReserve` is spent only on sells and on the
-  core position. Invariant 4.
+  two graduation positions, the core one and the floor one. Invariant 4.
 - State remains frozen in `Graduating`. `tokensSold`, `ethReserve` and every
   token held by the curve are untouched and remain under Invariants 1 and 2.
   **No user funds are at risk at any point during this grief; the only cost is
@@ -236,10 +248,15 @@ frontend should discourage, not a loss the protocol caused.
 After `ALT_DELAY = 1 hour` in `Graduating`, `graduateAlt(uint24 tickSpacing)`
 performs the identical procedure on a caller-supplied `tickSpacing` in
 `[10, 200]`, and requires that pool to be uninitialised so that it is
-initialised at `sqrtPriceTerminal` with no prior liquidity (Invariant 38). An
-attacker must therefore pre-initialise and hold hostile liquidity on every
-permitted spacing in that range, continuously, for as long as the launch exists,
-and re-do it after every failed attempt. Each instance is a losing position.
+initialised at `sqrtPriceTerminal` with no prior liquidity (Invariant 38). The
+range is a range of integers and not a list of canonical tiers, so the usable set
+is every spacing from 10 to 199 — 190 distinct pool keys. The endpoint 200 is in
+range but never usable, because it is the primary key's spacing and that pool was
+initialised at launch, so `graduateAlt(200)` reverts `AltPoolInitialized`; the
+range should not be read as a menu in either direction. An attacker must
+therefore pre-initialise and hold hostile liquidity on all 190 keys,
+continuously, for as long as the launch exists, and re-do it after every failed
+attempt. Each instance is a losing position.
 
 The uninitialised requirement is load-bearing in a second way that is easy to
 miss, and must not be relaxed. Restoring a griefed price is free in both
@@ -349,6 +366,38 @@ captures ordinary price impact on their own trade. They capture no protocol
 subsidy, no mispricing and no discount, because there is none to capture. This
 is not fixed and cannot be fixed from inside the contract.
 
+### 5.5 Sandwiching a compounding
+
+`LiquidityLock.compound` is permissionless and its encoding has no
+minimum-liquidity check: `INCREASE_LIQUIDITY_FROM_DELTAS` is marked
+`DEPRECATED - vulnerable to sandwich attacks` in the vendored v4-periphery for
+exactly that reason (spec section 9, decision 12). An attacker who moves the pool
+price in the same block, before the call, makes the position's fee delta buy less
+liquidity than it otherwise would.
+
+What that attack can and cannot do:
+
+- It **cannot take anything.** The batch has no recipient parameter and the only
+  address it can pay is the lock itself, which has no withdrawal path. The
+  liquidity not bought becomes retained residual inside the lock.
+- It therefore **destroys value rather than moving it**, which puts it in the
+  same class as 2.4: griefing at the attacker's own expense.
+- The expense is not nominal. Moving the price of a pool holding the whole ETH
+  target plus the floor position costs two legs of the pool's 1% fee on a
+  notional large enough to move it, and those fees are paid **into the position
+  being griefed**, where they are locked forever and are themselves
+  compoundable.
+- The alternative encoding, `INCREASE_LIQUIDITY` with a caller-supplied
+  liquidity, has a grief that costs only gas: call with a liquidity of 1, collect
+  the whole accrued fee, compound almost none of it. That is why the deprecated
+  action is the one that shipped. Decision 12 records the comparison.
+
+Two guards make the failure mode safe rather than silent: `compound` reverts
+`NothingToCompound` when the batch would add no liquidity — which is the ordinary
+case for one-sided fee accrual, not only the griefed case — and
+`LiquidityNotIncreased` if liquidity ever fell. Without the first, fees would be
+credited out of the position into the unspendable residual on every such call.
+
 ---
 
 ## 6. First-depositor and donation attacks
@@ -380,7 +429,15 @@ to graduate by donating, at a price nobody paid.
 
 ### 6.3 Donation outside `donate()`
 
-ETH or tokens sent to the curve by any other means change no price (2.7) and are
+A plain ETH transfer to the curve does not succeed at all: the curve's `receive`
+accepts value from PositionManager only, which is the sweep of unspent
+`currency0` from a graduation mint, and reverts `DirectEthNotAccepted` otherwise.
+That is a usability measure rather than a security one — a user cannot lose ETH
+by sending it to the curve instead of calling `donate` — and it does not claim to
+make forced ETH impossible, since a chain mechanism that credits a balance
+without a call does not run `receive`.
+
+ETH or tokens that reach the curve by such means change no price (2.7) and are
 not counted in any bucket. Forced ETH is bounded in effect: after graduation the
 curve has no withdrawal path, so it is permanently removed from circulation.
 Forced tokens sit in the curve and, since `buy` transfers out exactly the computed
@@ -410,24 +467,32 @@ holders, and nothing about it gives the depositor access to the locked positions
 
 ## 7. Reentrancy surfaces
 
-Every function that moves value carries a reentrancy guard and follows
-checks-effects-interactions, with no storage write after an external call
-(Invariant 55). The complete enumeration:
+Every function that moves value carries a reentrancy guard. Every function that
+reaches a terminal state writes that state first, before any call leaves the
+contract. Strict checks-effects-interactions — no storage write after any
+external call — holds exactly in `buy`, `sell`, `donate`, `creatorFirstBuy`, the
+four claim functions, both of `CreatorVesting`'s value-moving functions and
+`LiquidityLock.compound`. In `graduate`, `graduateAlt` and `createLaunch` it
+cannot hold, and Invariant 55 states the weaker property that is enforced there
+and explains why. The complete enumeration:
 
 | Surface | Entry | Discipline |
 |---|---|---|
-| `buy` | clipped-buy ETH refund to `msg.sender` | guard; `tokensSold`, `ethReserve`, fee buckets and the `Graduating` transition all written before the token transfer and before the refund |
+| `buy` | clipped-buy ETH refund to `msg.sender` | guard; `tokensSold`, `ethReserve`, the fee buckets and the `Graduating` transition all written before the token transfer and before the refund |
 | `buy` | `token.transfer` to `msg.sender` | the token is a plain ERC-20 with no hook, so this is not a callback surface; ordering is still CEI |
-| `sell` | ETH payout to `msg.sender` | guard; `ethReserve`, `tokensSold` and fee buckets written before the payout |
-| `sell` | `token.transferFrom` from `msg.sender` | pulled before any state write; plain ERC-20, no hook |
+| `sell` | ETH payout to `msg.sender` | guard; `ethReserve`, `tokensSold` and the fee buckets written before the payout |
+| `sell` | `token.transferFrom` from `msg.sender` | guard; every state write precedes the pull, not the other way round (spec 5.5 steps 7 to 10); plain ERC-20, no hook |
 | `donate` | none | no external call |
+| `creatorFirstBuy` | `CreatorVesting.createSchedule`, which pulls the tokens | guard; factory-only and reachable only while `tokensSold == 0`; the whole buy is written before the approval and the pull |
 | `claimCreatorFees`, `claimProtocolFees`, `claimBounty`, `claimBond` | ETH to recipient | guard; bucket zeroed before the call |
-| `graduate`, `graduateAlt` | PoolManager `unlock`, PositionManager `modifyLiquidities` | guard; `state` set to `Graduated` as the first write, before any external call, so a reentrant `graduate` fails the state check (Invariant 36) |
+| `graduate`, `graduateAlt` | PoolManager `unlock`, PositionManager `modifyLiquidities`, `LiquidityLock.registerPosition` | guard; `state` set to `Graduated` as the first write, before any external call, so a reentrant `graduate` fails the state check (Invariant 36); the writes that follow the core mint are forced, because the floor amount is a function of what that mint consumed, and they are complete before the function's last external calls |
 | `unlockCallback` | PoolManager | reverts unless `msg.sender` is PoolManager and the curve is inside its own `unlock` (Invariant 56) |
 | `onERC721Received` | PositionManager | reverts unless `msg.sender` is PositionManager (Invariant 57) |
-| `expire`, `abortGraduation` | `CreatorVesting.start` / `void`, `LaunchFactory.record*` | all protocol-internal, non-reentrant callees, called after every local write |
+| `expire`, `abortGraduation` | `CreatorVesting.start` / `void`, `LaunchFactory.record*` | terminal `state` written first; all callees protocol-internal and non-reentrant, called after every local write |
+| `CreatorVesting.createSchedule` | `token.transferFrom` from the caller | guard; the whole schedule is written, and the event emitted, before the pull; the schedule is keyed by the caller, so the pull can only move the caller's own tokens |
 | `CreatorVesting.release` | `token.transfer` to `creator` | guard; `released` incremented before the transfer |
-| `createLaunch` | token deploy, curve deploy, `PoolManager.initialize`, the creator's first buy | guard; reputation counters written last; the first buy runs against a curve the transaction just created, with no third-party code in the path |
+| `LiquidityLock.compound` | PositionManager `modifyLiquidities` | guard; the lock writes no storage in this function at all, and it reverts unless the position's liquidity strictly grew (spec section 9) |
+| `createLaunch` | curve deploy, which deploys the token and initialises the pool, then the creator's first buy | guard; `isLaunch` and the reputation counters cannot precede the curve they describe, so they are written between the two calls and after the second; every callee is a contract this transaction created or a protocol singleton, with no third-party code in the path |
 
 Two notes that remove surfaces rather than guarding them:
 
@@ -442,9 +507,21 @@ Two notes that remove surfaces rather than guarding them:
 
 ## 8. Insider and governance risk
 
-The factory owner is a timelock with a 48-hour delay and exactly three powers:
+### 8.1 The factory owner
+
+The factory owner is a timelock with a 48-hour delay and exactly four powers:
 pause new launches, change defaults for future launches within code-enforced
-bounds, and change the treasury recorded into future launches (section 14).
+bounds, change the treasury recorded into future launches, and renounce
+ownership (section 14).
+
+The fourth one is new to this revision of the document, because
+`LaunchFactory` inherits OpenZeppelin `Ownable` and therefore has more surface
+than the three setters the spec previously enumerated. `renounceOwnership` only
+ever reduces power: after it, none of the three setters can be called again by
+anyone. `transferOwnership` is overridden to revert, so ownership cannot move to
+an EOA, which is the case that would have mattered — an EOA owner removes the
+48-hour delay from every later configuration change while leaving the three
+powers intact.
 
 There is no function on any deployed contract by which the owner, the timelock,
 the treasury or any other address can move curve reserves, bond ETH, protection
@@ -452,13 +529,55 @@ ETH, accrued fees, vested tokens or a locked position. Invariant 52. A pause
 cannot stop a trade, a sell, a donation, a graduation, an expiry, a claim or a
 vesting release. Invariant 50.
 
-A fully compromised owner key can therefore do two things: stop new launches
-being created, and set hostile-but-bounded fee parameters on launches created
-after the 48-hour delay elapses. It cannot touch any existing launch or any user's
-funds. Residual exposure: a user who creates a launch after a malicious config
-change takes effect gets the new parameters. The 48-hour delay and the
-`FeeConfigSet` event are the mitigation; who holds the timelock's proposer role
-is an open decision.
+A fully compromised owner key can therefore do three things: stop new launches
+being created, set hostile-but-bounded fee parameters on launches created after
+the 48-hour delay elapses, and renounce ownership so that nobody can ever undo
+either. It cannot touch any existing launch or any user's funds, and it cannot
+hand the factory to an address that would not be subject to the delay. Residual
+exposure: a user who creates a launch after a malicious config change takes
+effect gets the new parameters. The 48-hour delay and the `FeeConfigSet` event
+are the mitigation; who holds the timelock's proposer role is an open decision.
+
+### 8.2 The permissionless deployers
+
+`CurveDeployer` and `TokenDeployer` are ownerless, stateless and callable by
+anyone (spec section 2.1). Both facts are intentional, and both are exploitable
+only for impersonation, never for theft.
+
+What a stranger can do:
+
+- **Deploy a launch token.** `TokenDeployer.deploy(name, symbol)` mints a
+  1,000,000,000-supply ERC-20 with any name and symbol to its caller. The result
+  is a token that looks exactly like a Pledrin launch token, because it is one,
+  and that belongs to no launch. The protocol validates no name, symbol or
+  metadata anywhere (10.4), so this adds nothing new to the impersonation
+  surface except convenience.
+- **Deploy a curve.** `CurveDeployer.deploy(config)` builds a full
+  `BondingCurve` with the caller as its `factory`. Such a curve is absent from
+  the real factory's `isLaunch` mapping, so it can write no reputation counter;
+  and if it names the real factory as its `factory` instead, it cannot even
+  finish a lifecycle, because `recordGraduation`, `recordStall` and
+  `recordExpiry` all revert `NotLaunch` for a caller the factory did not deploy.
+  Its ETH is whatever its own deployer funded it with, and no real launch's value
+  is reachable from it.
+- **Create a vesting schedule.** `CreatorVesting.createSchedule` is keyed by
+  `msg.sender` and pulls the allocation out of the caller (spec section 12), so a
+  stranger can only create a schedule for itself, funded with tokens it actually
+  delivers. There is no cross-schedule operation to abuse.
+- **Lock a position in the real `LiquidityLock`.** A curve deployed this way
+  chooses its own configuration, so it may name the real lock and, if it names a
+  factory it controls, may graduate. `registerPosition` then records
+  `launch = msg.sender` for a position minted against a token that is not a
+  Pledrin launch. It locks its own liquidity forever and makes it compoundable,
+  and it cannot touch any other position, because every function of the lock
+  takes a position id the lock must already own and names no recipient. The
+  consequence is for readers rather than for holders: a `PositionLocked` log is
+  not proof that the launch behind it is real.
+
+What follows for anyone building on this: a `CurveDeployed` or `TokenDeployed`
+log, and the mere existence of a curve or a token, are not evidence of a launch.
+The factory's `LaunchCreated` log and its `isLaunch` mapping are the only
+authority on what a Pledrin launch is (spec 16.1).
 
 ---
 

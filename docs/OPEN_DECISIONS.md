@@ -7,7 +7,9 @@ carve-out, and the holder-protection pool buying locked depth instead of paying
 holders pro rata. Those are settled with their reasoning in the spec.
 
 Each entry states the question, the options, the trade-offs, a recommendation,
-and whether it blocks Phase 1 (the Solidity implementation).
+and whether it blocks Phase 1 (the Solidity implementation) or Phase 2 (the
+Ponder indexer and the Next.js application). Entries 1 to 15 are Phase 1's;
+entries 16 to 21 are Phase 2's and were raised by `docs/DATA_MODEL.md`.
 
 ---
 
@@ -977,6 +979,374 @@ unsettled rather than reclassifying it as a deliberate exception, because the
 other three exceptions are shared *across* functions and this one is not, and
 collapsing the two kinds would weaken the standard to the point where it stops
 deciding anything.
+
+---
+
+## 16. Post-graduation price history, and an ABI that is not in `contracts/abi/`
+
+**Blocks Phase 2 at the start**, because the answer decides whether the read
+side has one price formula or two, and whether it has a second event source.
+
+After `Graduated` a launch emits nothing: no trade, no fee, no price
+(`docs/SPEC.md` Invariant 47). Trading has moved to an ordinary v4 pool. The
+launch page still has a chart, and the question is what that chart shows after
+the curve phase ends.
+
+Post-graduation trades are observable: Uniswap v4's `PoolManager` emits `Swap`
+with the pool id indexed, so the launch's swaps can be filtered by the
+`poolId` in `Graduated` — which, note, is not necessarily the `poolId` in
+`LaunchCreated`, because `graduateAlt` uses a different pool key
+(`docs/SPEC.md` Invariant 38).
+
+The obstacle is the ABI. `contracts/abi/` holds the eight Pledrin ABIs and no
+external one, `contracts/out/` is gitignored, and the only committed source for
+the `Swap` signature is the vendored v4-core submodule at
+`contracts/lib/v4-periphery/lib/v4-core/src/interfaces/IPoolManager.sol`. The
+project's rule is that the read side builds against frozen ABIs; an external ABI
+pulled from a submodule's source at build time is not that.
+
+### Question
+
+Does the application show post-graduation price and volume, and if so where does
+the data come from?
+
+### Options
+
+**A. Vendor a pinned `PoolManager` ABI and index `Swap`.** Full continuity: one
+chart from the first curve buy to the present. The ABI is added as an external
+artifact with its source commit recorded, kept separate from the ABIs our own
+build produces. `docs/DATA_MODEL.md` gains a `PoolSwap` entity, and a second
+price unit, because `Swap` reports `int128` currency deltas and a
+`sqrtPriceX96`, not the wei-per-whole-token integer section 4.2 defines.
+
+**B. No post-graduation history; current price only, read live.** The curve
+chart ends at `graduatedAt` with a label. The current price comes from an RPC
+read against the Quoter or StateView named in `docs/CHAIN_FACTS.md`, taken by
+the application, not stored by the indexer.
+
+**C. Nothing post-graduation.** The page states that trading has moved and links
+out.
+
+### Trade-offs
+
+A is the only option that gives a continuous chart, and continuity is what a
+reader of a graduated launch actually wants. Its costs are real but bounded: one
+more event source on a singleton that every pool on the chain emits through, so
+the filter is on an indexed topic and cheap, but the historical range runs from
+each launch's graduation to the head and grows with the chain rather than with
+Pledrin. The larger cost is conceptual: a second price formula, a second unit,
+sign handling on `int128` deltas, and the `sqrtPriceX96` conversion — all of
+which are new ways for the two halves to disagree about what a price is.
+
+B keeps exactly one price formula and one unit, needs no new ABI, no new entity
+and no new indexing surface, and matches what `docs/SPEC.md` section 18 already
+says: post-graduation routing and quoting use ordinary v4 tooling. Its cost is
+that a graduated launch's page has no history after graduation, which for a
+successful launch is eventually most of its life.
+
+C is B without the live price and saves nothing worth having.
+
+### Recommendation
+
+**B for the first release.** It is the option that ships the specified data
+model unchanged and makes no claim the read side cannot keep.
+
+Take A deliberately and separately if post-graduation history is wanted, and
+when taking it: pin the ABI with its source commit, put it where it is obviously
+external, filter on `Graduated.poolId` and not `LaunchCreated.poolId`, and add
+the `PoolSwap` entity and the second price unit to `docs/DATA_MODEL.md` before
+either half is built against it. Do not reach for the submodule's source at
+build time as a shortcut; that is the version-drift failure the frozen-ABI rule
+exists to prevent.
+
+---
+
+## 17. The encoding of `LaunchMetadata.metadata`
+
+**Blocks Phase 2 at the start**: the creation form writes this blob and the
+indexer reads it, so an unstated encoding is two halves writing and reading
+different things.
+
+`createLaunch` takes `bytes metadata`, emits it verbatim in `LaunchMetadata`,
+never stores it, applies no length bound and no structure check, and
+`docs/SPEC.md` section 18 is explicit that the protocol interprets none of it.
+The only validated strings are `name` and `symbol`, bounded at 64 and 16 bytes.
+That is correct for the protocol and leaves the read side to decide everything.
+
+### Question
+
+What goes in the blob, in what encoding, and bounded how?
+
+### Options
+
+**A. Inline, ABI-encoded tuple of bounded strings**, behind a leading version
+byte: description, image URI, website, and a small fixed set of social handles.
+
+**B. Inline UTF-8 JSON.**
+
+**C. A short URI only**, pointing at off-chain JSON.
+
+**D. Always empty**, with all metadata held in an application-side database
+keyed by launch address.
+
+### Trade-offs
+
+Calldata dominates cost on this chain (`docs/CHAIN_FACTS.md`), so every inline
+option is the expensive one — paid once, at launch, by the creator.
+
+A is self-describing, cheapest and safest to decode, and bounds each field
+explicitly. It cannot be extended without the version byte, which is why the
+version byte is part of the option rather than a detail.
+
+B is the easiest to write and the easiest to get wrong: no per-field bound,
+duplicate keys, encoding ambiguity, and a parser that must be defensive against
+a blob an attacker chose. It buys flexibility that nothing here needs.
+
+C is about sixty bytes and is **mutable after launch**. That is the deciding
+property: the creator can change the image and the description a buyer saw at
+the moment they bought, in a protocol that otherwise fixes everything about a
+launch at creation. It also makes the indexer depend on an off-chain fetch, with
+its latency, its failure modes and its cache invalidation.
+
+D has no on-chain record at all, so the application becomes a second source of
+truth, with its own write path, its own authentication question and its own
+moderation surface — the three things this project does not otherwise have.
+
+### Recommendation
+
+**A**, with a leading `uint8` version and explicit per-field byte bounds. The
+immutability is the point: what a buyer saw cannot be changed afterwards, and
+nothing has to be fetched for a page to render.
+
+Whichever is chosen, two rules from `docs/DATA_MODEL.md` stand unchanged:
+IDX-20's `METADATA_MAX_BYTES` cap, because the on-chain bound is the block gas
+limit and nothing else; and the rule that an oversize or undecodable blob yields
+a null field and never fails a block or stalls the index.
+
+---
+
+## 18. Whether the read side indexes `Timelock`
+
+**Blocks Phase 2, but not at the start.** It adds one entity and one query and
+changes nothing already specified.
+
+The minimum page list has no governance page. `Timelock`'s four events, and the
+factory's `OwnershipTransferred`, describe the entire set of powers anyone has
+over this protocol, and `docs/DATA_MODEL.md` section 2 lists all five as emitted
+and consumed by nothing.
+
+### Question
+
+Does the indexer index `Timelock`, and does the API expose a governance query?
+
+### Options
+
+**A. Index and expose**, as one list of operations with their `readyAt`.
+
+**B. Index, expose nothing**, so the history exists if a page is added later.
+
+**C. Do not index.**
+
+### Trade-offs
+
+The argument for A is not a product argument. `TIMELOCK_DELAY` is 48 hours, and
+a delay protects users only if somebody can observe what is pending during it.
+An unobserved timelock delivers the delay and none of its benefit, and
+`docs/THREAT_MODEL.md` treats the delay as a mitigation. Making the pending set
+visible is what converts it from a promise into something checkable by anyone.
+
+The cost of A is close to nothing: one event source on a singleton that will
+emit a handful of events in its lifetime, plus one page that is not in the
+minimum set.
+
+What moderates the urgency is that the powers are small. `setFeeConfig` and
+`setProtocolTreasury` cannot reach an existing launch, and `transferOwnership`
+reverts (`docs/SPEC.md` section 14), so the only power with a user-visible
+effect is `setLaunchesPaused`, whose current value `ProtocolConfig` already
+carries. B is therefore defensible: the data is kept, the page waits.
+
+C saves nothing measurable and gives up the auditability for free.
+
+### Recommendation
+
+**A, minimally.** Index the four `Timelock` events and the factory's
+`OwnershipTransferred`, expose one `governanceOperations` query, and render it as
+a plain list with `readyAt` and a derived status. No voting, no proposal
+decoding beyond target and calldata, no notifications.
+
+Fold the integrity cross-check in here as well, since it is the same
+near-zero-cost category: if `CurveDeployed` and `TokenDeployed` are indexed,
+then a `LaunchCreated` whose launch did not appear in a `CurveDeployed` in the
+same transaction is an anomaly, and the right response is an operator alert,
+never a displayed field (`docs/DATA_MODEL.md` IDX-8).
+
+---
+
+## 19. The confirmation depth the indexer should trust
+
+**Blocks Phase 2 before mainnet, not before building**, and it needs a
+measurement rather than an opinion.
+
+`docs/CHAIN_FACTS.md` records that this is an Arbitrum Nitro chain, records how
+`block.number` relates to `arbBlockNumber()`, and records nothing about
+finality: not the reorg depth, not whether the RPC serves the `safe` and
+`finalized` block tags, not the observed lag of either. `docs/DATA_MODEL.md`
+IDX-14 therefore states the correctness requirements and leaves the depth as
+configuration, deliberately, rather than guessing a number.
+
+### Question
+
+What block does the indexer treat as final, and what does the API serve in the
+meantime?
+
+### Options
+
+**A. Index at the unsafe head**, relying on the framework's rollback, with the
+reorg-handling depth as configuration.
+
+**B. Index only to `finalized`** (or `safe`), if the RPC serves the tag.
+
+**C. Index at head with a fixed confirmation lag** of N blocks.
+
+### Trade-offs
+
+A gives the freshest data, which a trade feed and a live curve price need. Its
+cost is that the API sometimes serves rows that can still disappear, and the
+application has no way to signal that: `docs/DATA_MODEL.md` APP-13's staleness
+notice covers data that is behind, not data that is ahead of finality.
+
+B is the strongest correctness position and probably unusable. On an L2 whose
+finality depends on L1 batch posting, the lag can be minutes to hours; a
+launchpad whose trade list is an hour old is not a launchpad.
+
+C is a compromise whose N is a guess until somebody measures.
+
+### Recommendation
+
+**A**, with the framework's rollback relied upon and the depth as configuration
+with a conservative default — but the prerequisite is a measurement and not a
+choice. Before Phase 2 reaches mainnet, verify against both networks with `cast`
+whether `safe` and `finalized` are served, what each one's observed lag is, and
+whether a reorg of the unsafe head has ever been observed on this chain. Those
+three facts belong in `docs/CHAIN_FACTS.md` with the commands used, in the same
+form as everything else in that file, and the depth follows from them.
+
+Until that measurement exists, nobody may describe the indexer as reorg-proof.
+What can be said, and is already specified, is that every row is a pure function
+of the canonical log set, so a correct rollback restores every row exactly
+(IDX-12, IDX-14).
+
+---
+
+## 20. Whether ERC-20 `Transfer` is indexed for every launch token
+
+**Blocks Phase 2 at the start**, because it decides whether `holderCount`,
+`marketCapWei` and `HolderRow` exist in the API shapes at all.
+
+Holder counts, circulating supply, market capitalisation and holder
+concentration all need the full balance set, which means indexing `Transfer` for
+every launch token. It is the largest single cost in the indexer and the only
+one that grows with the product's success rather than with its age.
+
+### Question
+
+Is `Transfer` indexed, and for which launches?
+
+### Options
+
+**A. Every launch token, from its creation, forever.**
+
+**B. Only launches past an activity threshold**, backfilled from the token's
+first block when the threshold is crossed.
+
+**C. Not at all.** Drop `holderCount` and `marketCapWei`; keep
+`uniqueTraderCount` as the activity metric.
+
+### Trade-offs
+
+A is the complete answer. Its cost is unbounded in the number of launches, which
+on a launchpad is the fastest-growing number there is, and a graduated token
+that trades heavily emits a `Transfer` per swap leg forever.
+
+B is not the saving it looks like. The threshold cannot be a filter, because a
+launch whose indexing starts mid-history has wrong balances; it has to be a
+backfill trigger, re-reading from the token's first block, which is known. That
+is implementable and it keeps the worst case identical to A for exactly the
+launches that matter.
+
+C is cheap and honest and loses the metric most readers look for. The deciding
+point against it is concentration: top-N holder share is the one holder-derived
+figure that sybil wallets cannot inflate, and it needs the full balance set.
+`uniqueTraderCount` is a weaker substitute that measures something else.
+
+### Recommendation
+
+**A.** The frontend brief names holder counts, and concentration is worth more
+than the count itself. The exclusion set in `docs/DATA_MODEL.md` section 3.9 is
+mandatory and not an optimisation: without it the curve, the vesting contract
+and — after graduation — the v4 PoolManager all appear as the largest holders of
+every launch.
+
+If cost becomes a real problem, retreat to B with a full backfill, not to C, and
+make the affected fields null rather than zero so that a missing count is never
+read as a count of zero.
+
+---
+
+## 21. The API transport
+
+**Blocks Phase 2 at the start.** It decides the application's entire
+data-fetching layer, and it is the one decision in this group that cannot be
+deferred by a day.
+
+`docs/DATA_MODEL.md` section 5 specifies the queries, the arguments and the
+shapes, and deliberately does not specify the transport. Ponder serves GraphQL
+by default and can also serve custom HTTP routes.
+
+### Question
+
+GraphQL, HTTP JSON, or both?
+
+### Options
+
+**A. GraphQL**, with a generated schema the application types against.
+
+**B. HTTP JSON**, one route per query in section 5.3.
+
+**C. Both.**
+
+### Trade-offs
+
+A gives a typed schema both halves share, per-page field selection — which
+matters for `LaunchDetail`, the largest shape — and one pagination convention.
+Its awkwardness is the request-time derivations: `EffectiveState`,
+`availableActions`, `releasableNow` and `claimable` are evaluated against the
+server clock rather than read from a column, so each is a resolver rather than a
+field, and a resolver that fans out across launches is easy to write and
+expensive to run.
+
+B makes those four natural and cacheable per route, and keeps section 5.2's
+shapes literal on the wire. Its cost is hand-written types on both sides and a
+hand-written cursor convention, which is exactly the kind of duplicated
+definition this document exists to avoid.
+
+C is tempting precisely because the awkward cases are few, and it is still two
+surfaces to keep in agreement, two places for a field to be added to one and not
+the other, and no single schema that is the truth.
+
+### Recommendation
+
+**A**, with the time-dependent values as resolvers and with `claimable` and
+`indexerStatus` accepted as the two that will feel wrong there. If either is
+materially clearer as a named HTTP route, that is a bounded exception worth
+taking — two named routes, documented in `docs/DATA_MODEL.md` section 5.3 — and
+not a licence for a second API.
+
+Whichever is chosen: every field name in `docs/DATA_MODEL.md` section 5.2 is
+binding, the integer encoding of section 1.2 applies without exception, and the
+choice is made before either half writes a line, because retrofitting it is a
+rewrite of the application's data layer and of the indexer's API surface at
+once.
 
 ---
 

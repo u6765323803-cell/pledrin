@@ -1,0 +1,57 @@
+name: indexer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "indexer/**"
+      - ".github/workflows/indexer.yml"
+  pull_request:
+    paths:
+      - "indexer/**"
+      - ".github/workflows/indexer.yml"
+
+concurrency:
+  group: indexer-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: indexer
+
+jobs:
+  static:
+    name: lint, typecheck and test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: pledrin
+          POSTGRES_PASSWORD: pledrin
+          POSTGRES_DB: pledrin_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://pledrin:pledrin@localhost:5432/pledrin_test
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: indexer/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test

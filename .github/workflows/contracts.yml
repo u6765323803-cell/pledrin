@@ -1,0 +1,98 @@
+name: contracts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "contracts/**"
+      - ".github/workflows/contracts.yml"
+      - ".github/scripts/coverage-gate.sh"
+
+concurrency:
+  group: contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FOUNDRY_PROFILE: ci
+  MINIMUM_COVERAGE: "95"
+
+defaults:
+  run:
+    working-directory: contracts
+
+jobs:
+  build:
+    name: build and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.9.0
+
+      - name: Check formatting
+        run: forge fmt --check
+
+      - name: Build
+        run: forge build --sizes
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.9.0
+
+      - name: Unit, fuzz and invariant tests
+        run: forge test -vvv
+
+      - name: Gas report
+        run: forge test --gas-report
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.9.0
+
+      # Until the first contract lands there is nothing to measure, and an
+      # empty report would otherwise read as a failure.
+      - name: Check for sources
+        id: sources
+        run: |
+          if compgen -G "src/**/*.sol" > /dev/null || compgen -G "src/*.sol" > /dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No Solidity sources under contracts/src yet; skipping coverage."
+          fi
+
+      - name: Measure coverage
+        if: steps.sources.outputs.present == 'true'
+        run: forge coverage --exclude-tests --report lcov --report-file lcov.info --report summary
+
+      - name: Enforce minimum coverage
+        if: steps.sources.outputs.present == 'true'
+        run: ../.github/scripts/coverage-gate.sh lcov.info "$MINIMUM_COVERAGE"
+
+      - name: Upload coverage report
+        if: steps.sources.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: contracts/lcov.info

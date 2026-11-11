@@ -1,0 +1,64 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history so a secret introduced in an earlier commit of the
+          # branch is still caught.
+          fetch-depth: 0
+
+      # The binary is used directly rather than the marketplace action, which
+      # gates organization use behind a licence key.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.0
+        run: |
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan history
+        run: gitleaks git --redact --verbose --exit-code 1
+
+      - name: Scan working tree
+        run: gitleaks dir --redact --verbose --exit-code 1
+
+  slither:
+    name: slither
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Check for sources
+        id: sources
+        run: |
+          if compgen -G "contracts/src/**/*.sol" > /dev/null || compgen -G "contracts/src/*.sol" > /dev/null; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No Solidity sources under contracts/src yet; skipping Slither."
+          fi
+
+      - uses: crytic/slither-action@v0.4.1
+        if: steps.sources.outputs.present == 'true'
+        with:
+          target: contracts/
+          slither-args: --exclude-dependencies --fail-high
+          fail-on: high

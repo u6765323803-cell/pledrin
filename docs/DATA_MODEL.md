@@ -134,6 +134,12 @@ They correspond one-to-one with the fields of `reputationOf`'s return tuple in
 
 The read side adds two **derived** state vocabularies that have no on-chain
 counterpart, defined in section 4.5: `EffectiveState` and `BondOutcome`.
+`BondOutcome` is a returned field. `EffectiveState` is not: it is a filter
+argument on the `launches` query and otherwise the application's own derivation
+from `onChainState` and `gradDeadline`, because it depends on the time of the
+request (section 5.1 rule 4). The same split applies to `vestingStatus`, whose
+clock-independent four values are returned and whose `Cliff`/`Vesting`
+refinement is the application's (section 4.8).
 
 ### 1.6 Protocol constants the read side needs
 
@@ -175,6 +181,8 @@ Every parameter the read side introduces, with type, units, bounds and default.
 | `TOP_HOLDERS_N` | integer | addresses | `10` | `5` to `50` | indexer |
 | `STALENESS_WARN_SECONDS` | integer | seconds | `10` | `2` to `QUOTE_TTL_SECONDS - 1` | application |
 | `QUOTE_TTL_SECONDS` | integer | seconds | `15` | `3` to `60` | application |
+| `CLOCK_ANCHOR_MAX_AGE_SECONDS` | integer | seconds | `60` | `5` to `600` | application |
+| `WINDOW_CLOSE_MARGIN_SECONDS` | integer | seconds | `5` | `0` to `60` | application |
 
 `METADATA_MAX_BYTES` is a defence, not a preference: `createLaunch` applies no
 length bound and no validation to `params.metadata`, and `LaunchMetadata` emits
@@ -209,6 +217,35 @@ which is the one relation between these two parameters that is not a matter of
 taste. A healthy indexer's lag on a chain producing roughly ten blocks a second
 is far below either number, so 10 seconds warns on a real fault and not on normal
 operation.
+
+**The last two parameters exist because no returned field depends on the time of
+the request** (section 5.1 rule 4, decision 21). Every clock-dependent value is
+derived by the application from served facts plus the time anchor, so the two
+parameters bound the two ways that derivation can go wrong.
+
+`CLOCK_ANCHOR_MAX_AGE_SECONDS` bounds the age of the anchor a derivation may use.
+The application estimates chain time as the anchor's `evaluatedAt` plus a
+**monotonic** elapsed count since the response arrived, never from the device's
+wall-clock date: a device's date can be arbitrarily wrong and nothing in this
+design can bound it, while a monotonic counter needs the date to be correct in no
+way at all. A monotonic count is still invalidated by a suspended device or a
+throttled background tab, which is what the age bound is for. Past the bound the
+anchor is refreshed before any derived value is rendered, and a countdown that
+cannot be re-anchored is replaced by the absolute timestamp rather than
+extrapolated.
+
+`WINDOW_CLOSE_MARGIN_SECONDS` applies to **closing** windows only — the buy
+window at `gradDeadline` is the one that matters — and not to opening ones. The
+asymmetry is in what the two failures cost. Offering an action after its window
+closed can cost the user gas, because a transaction can be included after the
+window shut; offering one before it opens costs a refused simulation and nothing
+else (APP-1). Padding an opening window would hide a permissionless call that is
+genuinely available, which is the worse trade. The default of 5 seconds sits
+above the normal error of the estimate — the indexer's lag plus one network round
+trip, both sub-second in healthy operation — and far below the only closing
+window it applies to: the buy window is `gradWindow` long, whose floor is 86,400
+seconds (`docs/SPEC.md` section 15.2). Decision 21 states the full error budget
+and which chain facts bound each term.
 
 ---
 
@@ -559,6 +596,20 @@ count that means something and one that does not:
 set, and section 9 is explicit that `holderCount` is inflatable by anyone
 willing to pay gas.
 
+**Decision 20 of `docs/OPEN_DECISIONS.md` resolves that `Transfer` is indexed for
+every launch token from the token's creation**, and the shape above is what makes
+that decision's cost model precise. One row per `(token, holder)` with a running
+balance is not a log of transfers: stored size grows with the holder set summed
+over launches, and a
+holder who trades a thousand times occupies the same row as one who trades once.
+What grows with the number of `Transfer` logs is processing throughput, one
+read-modify-write per log, and that is the budget a heavily traded graduated
+token consumes — it emits a `Transfer` per swap leg forever. The two budgets have
+different triggers for the documented retreat, which decision 20 states; the
+retreat is to a per-launch backfill and never to dropping the fields, and until a
+launch has been backfilled every holder-derived field for it is null rather than
+zero.
+
 ### 3.10 `Candle`
 
 Derived aggregation. Keyed `(launch, interval, bucketStart)`. Written by every
@@ -618,15 +669,31 @@ Derived, not event-sourced. One row.
 | `headBlock` | `BlockNumber` | the highest block fully indexed |
 | `headTimestamp` | `Timestamp` | its `block.timestamp` |
 | `chainHeadBlock` | `BlockNumber` | the chain's head as the indexer last observed it |
-| `blocksBehind` | number | **derived** |
-| `secondsBehind` | number | **derived**: server time minus `headTimestamp` |
+| `blocksBehind` | number | **derived**: `chainHeadBlock - headBlock` |
+| `evaluatedAt` | `Timestamp` | the server's clock when the response was generated. **The one value in the whole API that depends on the time of the request** (section 5.1 rule 4) |
 | `backfillComplete` | boolean | whether the historical range is finished |
 
-Every page reads this. The application shows a staleness warning when
-`secondsBehind > STALENESS_WARN_SECONDS`, and on no other condition, and must not
-present a backfilling index as complete data (APP-13). `blocksBehind` is
-displayed and is not a threshold; section 1.7 says why there is one threshold and
-why it is in seconds.
+Every page reads this. `headBlock`, `headTimestamp` and `evaluatedAt` are the
+**time anchor** of section 5.1 rule 2, carried on every response, and every
+derived time value in section 4 is evaluated against it.
+
+The application shows a staleness warning when its derived seconds behind exceed
+`STALENESS_WARN_SECONDS`, and on no other condition, and must not present a
+backfilling index as complete data (APP-13).
+
+**`secondsBehind` is not a field.** It was defined here as server time minus
+`headTimestamp`, which freezes at the moment the response is generated: a page
+left open for five minutes went on reporting that the index was current, so the
+threshold of section 1.7 fired on refetch and never while a user sat watching a
+stale price. The application derives it instead, as its estimate of chain time
+(section 1.7) minus `headTimestamp`, which keeps growing while the page is open
+and is the quantity APP-13's warning is supposed to measure. `evaluatedAt -
+headTimestamp` remains available as the server's own statement of the same
+quantity at response time, and is the only observable bound on the server's clock
+offset.
+
+`blocksBehind` is displayed and is not a threshold; section 1.7 says why there is
+one threshold and why it is in seconds.
 
 ---
 
@@ -774,7 +841,14 @@ launch whose `gradDeadline` has passed is still `Live` in storage until somebody
 calls `expire()`, while `buy` has already been refusing with `BuyWindowClosed`
 (`docs/SPEC.md` Invariant 32).
 
-`EffectiveState`, **derived**, evaluated at a query time `now`:
+Everything in this section is derived **by the application**, from fields the API
+serves and the time anchor of section 3.13, and none of it is a returned field
+(section 5.1 rule 4, decision 21). The definitions below are normative for that
+derivation and for the one place the server evaluates the same predicate itself,
+the `filter.effectiveState` argument of the `launches` query. `now` below is the
+application's estimate of chain time, formed as section 1.7 specifies.
+
+`EffectiveState`, **derived**, evaluated at `now`:
 
 | `EffectiveState` | Condition | Buys | Sells |
 |---|---|---|---|
@@ -785,7 +859,9 @@ calls `expire()`, while `buy` has already been refusing with `BuyWindowClosed`
 | `Expired` | `onChainState == Expired` | no | yes |
 | `Stalled` | `onChainState == Stalled` | no | yes |
 
-Windows, all in seconds, all clamped at zero, all read `block.timestamp`:
+Windows. The two `*At` rows are absolute timestamps and are pure functions of
+`capReachedAt` and the constants of section 1.6; the three `secondsUntil*` rows
+are countdowns in seconds, clamped at zero, evaluated at `now`:
 
 | Derived field | Formula | Reads |
 |---|---|---|
@@ -817,9 +893,18 @@ a failed simulation.
 | `release` | section 4.8's `releasableNow > 0` | nothing to the caller; pays the recorded creator |
 | `compound` | a `LockedPosition` exists for the launch | nothing, ever |
 
-`availableActions` is advisory. It is computed from indexed state that is at
-least one block old, so it decides what to offer, never what to sign: the
-application still simulates (APP-1).
+`availableActions` is advisory. Its clock-independent inputs come from indexed
+state that is at least one block old, so it decides what to offer, never what to
+sign: the application still simulates (APP-1).
+
+Two rules on the clock-dependent rows, both from decision 21's error budget. A
+row whose condition is a window **closing** — `buy` at `gradDeadline` — drops out
+of `availableActions` `WINDOW_CLOSE_MARGIN_SECONDS` before the derived instant,
+because a transaction included after the window shut costs the user gas. A row
+whose condition is a window **opening** — `graduateAlt`, `abortGraduation`,
+`expire`, `release` — appears at the derived instant with no margin, because being
+early there costs a refused simulation and nothing else, and hiding a
+permissionless call somebody is waiting to make is the worse failure.
 
 ### 4.6 Fee buckets, and what is actually claimable
 
@@ -911,21 +996,33 @@ The release schedule itself is `docs/SPEC.md` section 12's `releasable(t)`
 formula and is not restated here. The read side adds the fields a page needs,
 all reading `start`, `cliff`, `duration`, `allocation`, `released` and `voided`:
 
-| Derived field | Formula |
-|---|---|
-| `cliffEndsAt` | `start + cliff`, null while `start` is null |
-| `fullyVestedAt` | `start + cliff + duration`, null while `start` is null |
-| `vestedNow` | `docs/SPEC.md` section 12's formula at `now`, plus `released` |
-| `releasableNow` | `docs/SPEC.md` section 12's `releasable(now)` |
-| `unreleased` | `allocation - released` |
-| `percentReleasedBps` | `floor(released * 10000 / allocation)` |
+| Derived field | Formula | Derived by |
+|---|---|---|
+| `cliffEndsAt` | `start + cliff`, null while `start` is null | API |
+| `fullyVestedAt` | `start + cliff + duration`, null while `start` is null | API |
+| `unreleased` | `allocation - released` | API |
+| `percentReleasedBps` | `floor(released * 10000 / allocation)` | API |
+| `vestedNow` | `docs/SPEC.md` section 12's formula at `now`, plus `released` | application |
+| `releasableNow` | `docs/SPEC.md` section 12's `releasable(now)` | application |
+
+The last two are not returned fields. They depend on the time of the request, so
+the API serves the six facts they are computed from — `start`, `cliff`,
+`duration`, `allocation`, `released`, `voided` — and the application evaluates
+`docs/SPEC.md` section 12's formula at its own estimate of chain time (section
+1.7, decision 21). Nothing is lost by this: the figure is display-only in either
+case, because `release(launch)` carries no amount argument and APP-4 forbids an
+indexer-derived number from reaching a transaction at all.
 
 `releasableNow` is zero for a voided schedule, zero before the cliff and zero
 for a finished one, and the `releasable(launch)` view cannot tell those apart
 (`docs/SPEC.md` section 12). The read side can, because it holds `voided`,
-`start` and `released`, so the API returns a `vestingStatus` of `NotStarted`,
-`Cliff`, `Vesting`, `Complete` or `Voided`, and the application's copy comes
-from that rather than from a zero.
+`start` and `released`, so a zero is never presented bare. The status is split
+across the two sides on the same rule as everything else here:
+
+| Vocabulary | Values | Where |
+|---|---|---|
+| `vestingStatus` | `NotStarted` (`start` is null), `Active` (`start` set, `released < allocation`, not voided), `Complete` (`released == allocation`), `Voided` | returned by the API; every condition changes only when a log is emitted |
+| the display status | `Active` refined into `Cliff` when `now < cliffEndsAt` and `Vesting` otherwise | derived by the application |
 
 A schedule's clock starts at graduation or at a stall, never at launch, so
 `start` is null for every launch still on its curve.
@@ -1014,8 +1111,10 @@ Every state change in Pledrin is a wallet transaction signed by the user
 against the frozen ABIs. An API that could write would be an admin path by
 another name.
 
-The transport is decision 21. Every query and every field below must exist
-whatever that decision is, under exactly these names.
+The transport is **GraphQL**, decided by decision 21 of
+`docs/OPEN_DECISIONS.md`, with at most two named HTTP routes as a bounded
+exception recorded in section 5.3 if either is taken. Every query and every field
+below exists under exactly these names.
 
 ### 5.1 Rules that bind the API itself
 
@@ -1024,17 +1123,32 @@ whatever that decision is, under exactly these names.
    `(blockNumber, logIndex)`), and returns `items`, `nextCursor` and
    `hasMore`. Offset pagination is not used: rows can be rolled back by a reorg
    and an offset silently skips or repeats rows when they are.
-2. Every response carries the `IndexerStatus` fields `headBlock` and
-   `headTimestamp`, so the application can date every number it renders without
-   a second request.
+2. Every response carries the `IndexerStatus` fields `headBlock`,
+   `headTimestamp` and `evaluatedAt`, so the application can date every number it
+   renders, and derive every time-dependent value, without a second request.
+   Those three are the **time anchor**.
 3. `launch(address)` returns null for an address that is not a known launch,
    including an address that is a `CurveDeployed` curve but not a
    `LaunchCreated` launch. It never errors on a well-formed address.
-4. Derived time-dependent fields — `EffectiveState`, every `secondsUntil*`,
-   `availableActions`, `releasableNow` — are evaluated against the server's
-   clock at request time, and the response states the `evaluatedAt` timestamp it
-   used. The application recomputes them locally from `gradDeadline`,
-   `capReachedAt` and `start` for a live countdown rather than polling.
+4. **No returned field depends on the time of the request.** `evaluatedAt` is
+   the single declared exception, because its whole purpose is to report the
+   server's clock. Every value that would change without a log being emitted —
+   `EffectiveState`, every `secondsUntil*`, `availableActions`, `releasableNow`,
+   `vestedNow`, the `Cliff`/`Vesting` distinction, and the staleness in seconds —
+   is derived by the application from served facts plus the anchor of rule 2, as
+   sections 1.7, 4.5, 4.8 and 3.13 specify. The server evaluates one of those
+   predicates in exactly one place that is not a field: the
+   `filter.effectiveState` argument of `launches`, which decides which rows cross
+   the wire at all and cannot be applied by a client that has not received them.
+   The `deadlineSoonest` sort needs no clock, because it orders by the stored
+   `gradDeadline`.
+   `docs/OPEN_DECISIONS.md` decision 21 records the reasoning, the error budget
+   and the case against. Three consequences follow, and all three are testable:
+   two responses to the same query at the same `headBlock` are identical apart
+   from `evaluatedAt`; no countdown is stale on arrival, because none is sent;
+   and a row returned under `filter: {effectiveState: Live}` may render as
+   `ExpiryPending` when the deadline passed in between, which the application
+   shows as derived rather than dropping the row (APP-17).
 5. No query returns a row whose `isPledrinLaunch` is false (IDX-8).
 6. No query returns raw metadata bytes longer than `METADATA_MAX_BYTES`.
 7. Integer encoding is section 1.2's, everywhere, with no exceptions for
@@ -1042,21 +1156,36 @@ whatever that decision is, under exactly these names.
 
 ### 5.2 Shapes
 
+Under rule 4 of section 5.1 these shapes carry the inputs of every
+time-dependent value and none of the values themselves. Six fields of the
+previous revision are therefore gone — `effectiveState`, `secondsUntilDeadline`,
+`secondsUntilAltGraduate`, `secondsUntilAbort`, `availableActions` and
+`releasableNow` — and two are added: `onChainState` on `LaunchListItem`, which
+makes a list row's state derivable at all, and `vesting` on `ClaimableItem`,
+which carries the facts the removed `releasableNow` was computed from. Every
+other input the removed six needed was already here. `IndexerStatus` changes in
+the same way and for the same reason (section 3.13).
+
 `LaunchListItem` — the launch list and every list of launches elsewhere.
 
 `address`, `token`, `name`, `symbol`, `creator`, `pledged`, `bondWei`,
-`effectiveState`, `capProgressBps`, `ethRaisedWei`, `ethTargetWei`,
+`onChainState`, `capProgressBps`, `ethRaisedWei`, `ethTargetWei`,
 `priceSpot`, `fdvWei`, `holderCount`, `volumeEthWei`, `buyCount`, `sellCount`,
-`createdAt`, `gradDeadline`, `secondsUntilDeadline`, `lastTradeAt`,
-`bondOutcome`, `metadataDecoded`.
+`createdAt`, `gradDeadline`, `lastTradeAt`, `bondOutcome`, `metadataDecoded`.
+
+`onChainState` and `gradDeadline` are the whole input to `EffectiveState`, so a
+list row derives its own state and its own countdown to the deadline. The two
+`Graduating` sub-windows need `capReachedAt`, which is on the detail shape only,
+because no page in section 6 offers `graduate` or `abortGraduation` from a list
+row.
 
 `LaunchDetail` — `LaunchListItem` plus:
 
 every immutable of section 3.1 (`virtualEthReserve`, `ethTarget`, the four fee
 fields, `initialPoolId`, `createdTx`), the cursor (`tokensSold`, `ethReserve`),
-`priceTerminal`, `marketCapWei`, `circulatingBaseUnits`, `onChainState`,
+`priceTerminal`, `marketCapWei`, `circulatingBaseUnits`,
 `capReachedAt`, `graduatedAt`, `stalledAt`, `expiredAt`, `settledAt`,
-`secondsUntilAltGraduate`, `secondsUntilAbort`, `availableActions`, the fee
+`poolPreInitialized`, `poolPreInitializedPriceX96`, the fee
 block (`feeChargedTotalWei`, `creatorFeeBalanceWei`, `protocolFeeBalanceWei`,
 `protectionBalanceWei`, and the claimed and forfeited totals), the bond block
 (`bondState`, `bondOutcome`, `bondSettledAt`, `bondClaimedAt`,
@@ -1067,6 +1196,13 @@ block (`feeChargedTotalWei`, `creatorFeeBalanceWei`, `protocolFeeBalanceWei`,
 `VestingSummary` or null, `lockedPositions` as a list of `LockedPositionSummary`,
 `creatorProfile` as a `CreatorProfile`, `uniqueTraderCount`, `donationCount`,
 `donatedEthWei`, `metadataBytes`.
+
+`poolPreInitialized` and `poolPreInitializedPriceX96` are on the detail shape
+because they are fields of section 3.1 that no shape carried, and the launch they
+describe may need the recovery path of `docs/SPEC.md` section 8.6 at graduation.
+Whether a page shows them is a product decision (IDX-28); serving them is what
+makes the count behind decision 23 answerable from the API rather than from the
+indexer's database, together with the `poolPreInitialized` filter of section 5.3.
 
 `TradeRow` — `id`, `side`, `trader`, `timestamp`, `blockNumber`, `txHash`,
 `tokenAmount`, `ethVolumeWei`, `feeWei`, `priceExecuted`, `priceSpotAfter`,
@@ -1086,7 +1222,11 @@ block (`feeChargedTotalWei`, `creatorFeeBalanceWei`, `protocolFeeBalanceWei`,
 
 `VestingSummary` — `launch`, `creator`, `allocation`, `cliff`, `duration`,
 `start`, `released`, `unreleased`, `voided`, `vestingStatus`, `cliffEndsAt`,
-`fullyVestedAt`, `releasableNow`, `percentReleasedBps`.
+`fullyVestedAt`, `percentReleasedBps`. The six facts section 4.8's
+application-side derivations need — `allocation`, `cliff`, `duration`, `start`,
+`released`, `voided` — are all here, so `releasableNow` and `vestedNow` are
+computed from this shape and are not in it, and `vestingStatus` is the
+four-valued vocabulary of section 4.8 rather than the five-valued display one.
 
 `LockedPositionSummary` — `positionId`, `kind`, `lockedAt`, `compoundCount`,
 `liquidityAddedTotal`, `lastCompoundedAt`.
@@ -1094,9 +1234,21 @@ block (`feeChargedTotalWei`, `creatorFeeBalanceWei`, `protocolFeeBalanceWei`,
 `ClaimableItem` — `launch`, `launchName`, `launchSymbol`, `kind` (the five
 `Payout` kinds), `asset`, `amount`, `contract` (`"BondingCurve"` or
 `"CreatorVesting"`), `functionName` (`claimCreatorFees`, `claimBond`,
-`claimBounty`, `claimProtocolFees`, `release`), `recipient`, `blockedReason`
-(null when claimable; otherwise the SPEC-defined refusal that currently
-applies), `nextEligibleAt` (for a vesting item inside its cliff).
+`claimBounty`, `claimProtocolFees`, `release`), `recipient`, `blockedReason`,
+`nextEligibleAt`, `vesting`.
+
+Three of its fields are constrained by section 5.1 rule 4, and the vesting kind
+is where all three bite:
+
+| Field | Rule |
+|---|---|
+| `amount` | The amount a call would pay, for every kind whose amount changes only when a log is emitted. **Null for the vesting kind**, whose amount is a function of the request's time; the item carries `vesting` as a `VestingSummary` instead and the application derives the figure from it (section 4.8). |
+| `blockedReason` | The SPEC-defined refusal that holds **independently of the clock** — `BondForfeitedToHolders`, `BondAlreadyClaimed`, `ScheduleVoided`, a `WrongState` for creator fees on a launch still on its curve — and null when none does. Null does not mean a call would succeed now: for the vesting kind the application decides that from `cliffEndsAt` and the anchor, and the simulation decides it for every kind (APP-1). |
+| `nextEligibleAt` | An absolute timestamp, `cliffEndsAt` for a vesting item. It is a fact about the schedule and not a countdown, so it is served; the countdown to it is the application's. |
+
+Membership is clock-independent too, which is what keeps `claimable` a server
+query at all: an item appears on conditions that change only by a log, and never
+because time passed. Section 5.3 states them.
 
 `PayoutRow` — `id`, `launch`, `kind`, `asset`, `amount`, `recipient`, `caller`,
 `timestamp`, `txHash`.
@@ -1129,10 +1281,24 @@ Each exists because a page needs it. The page is named.
 
 `filter` for `launches`: `effectiveState` (one or more of section 4.5's six
 values), `pledged` (boolean), `bondOutcome`, `creator`, `minHolderCount`,
-`minVolumeEthWei`, `createdAfter`, `createdBefore`. Filtering on
-`effectiveState` is evaluated against the server clock, which is why
-`ExpiryPending` is a filterable value and the raw `onChainState` is not
-(IDX-11).
+`minVolumeEthWei`, `createdAfter`, `createdBefore`, `poolPreInitialized`
+(boolean).
+
+`effectiveState` is a filter argument and not a returned field. It is the one
+predicate the server evaluates against its own clock, because deciding which
+rows cross the wire cannot be done by a client that has not received them, and
+`ExpiryPending` is filterable for that reason while the raw `onChainState` is
+returned instead (IDX-11, section 5.1 rule 4). The server's evaluation and the
+application's can disagree about a row whose deadline passed in between; the row
+is shown with the state the application derives and is not dropped, because
+dropping rows makes `hasMore` and the cursor lie (APP-17).
+
+`poolPreInitialized` filters on the flag of section 3.1. It is not a product
+feature: the count of launches carrying it, against the count of launches in the
+same period, is the measurement `docs/OPEN_DECISIONS.md` decision 23 is deferred
+on, and IDX-28 records that counting it — unlike presenting it — is not a product
+decision. A filter makes that count reproducible by anyone with API access
+instead of a hand-written query against the indexer's database.
 
 `search` matches a case-folded substring of `name` or `symbol`, and an exact
 match on `address` or `token`. It must never be the thing that identifies a
@@ -1140,19 +1306,41 @@ launch: names and symbols are unvalidated and not unique (IDX-21).
 
 `claimable(address)` is the query that cannot be replaced by an RPC read,
 because it is the only way to find out *which* launches owe an address
-anything without enumerating every launch. It aggregates, for the given
-address: creator fees on launches where it is the creator and `onChainState` is
-`Graduated` or `Stalled`; a returned, unclaimed bond on launches where it is the
-creator; a bounty credit on launches it graduated; `releasableNow` on vesting
-schedules where it is the recorded creator; and protocol fees **only when the
-address equals the configured treasury**. Each item carries the exact function
-to call and on which contract, and a `blockedReason` naming the SPEC refusal
-when an item is visible but not yet claimable.
+anything without enumerating every launch. That enumeration, and not any
+request-time arithmetic, is why it stays a server query under section 5.1 rule 4:
+removing the clock from it removes none of the work it exists to do. It
+aggregates, for the given address, on these conditions, every one of which
+changes only when a log is emitted:
+
+| Item | Included when |
+|---|---|
+| creator fees | the address is the launch's creator, `onChainState` is `Graduated` or `Stalled`, and `creatorFeeBalanceWei > 0` |
+| bond | the address is the creator and `bondState == Returned` with `bondClaimedAt` null |
+| bounty | the address is `Graduated.caller`, `Graduated.bounty > 0`, and no `FeesClaimed(kind = Bounty)` names it for that launch |
+| vesting | the address is the schedule's recorded creator, the schedule is not voided, and `released < allocation` |
+| protocol fees | the address equals the configured treasury and `protocolFeeBalanceWei > 0` |
+
+The vesting row is the one whose membership used to be `releasableNow > 0`, which
+made the query's result depend on the second it was asked and hid a schedule
+inside its cliff entirely. It is now included for the whole life of the schedule
+and carries `vesting` plus `nextEligibleAt`, so the application can show "nothing
+releasable yet, next on this date" instead of nothing at all. Each item carries
+the exact function to call and on which contract.
 
 Two things are deliberately absent. There is no cross-launch holdings query,
 because no page in section 6 needs one: the sell form reads the user's balance
 by RPC. There is no governance query, pending decision 18. If a portfolio page
 or a governance page is added, the query is added with it.
+
+**Named HTTP routes: none at present.** Decision 21 permits at most two, for
+`claimable` and `indexerStatus`, and the reason it originally expected to need
+them — that both were request-time resolvers — no longer applies to either.
+`indexerStatus` is the remaining candidate, on a transport reason rather than a
+modelling one: it carries the anchor, so it is the one response whose content
+changes every second and the one worth giving explicit cache headers. If a route
+is taken it is listed here, with its path, its arguments and the shape it
+returns, and it serves exactly the fields the GraphQL query serves under exactly
+the same names.
 
 ---
 
@@ -1172,8 +1360,11 @@ filter excludes nothing, because hiding `Expired` launches by default would
 hide the outcome a reader most needs to see when judging a creator. Every row
 shows `capProgressBps` as the bar and `ethRaisedWei` against `ethTargetWei` as
 amounts (section 4.4). Every row shows `pledged` and `bondOutcome` together
-(section 4.7). A row whose `effectiveState` is `ExpiryPending` is labelled as
-closed to buyers, not as live.
+(section 4.7). A row whose derived `EffectiveState` is `ExpiryPending` is
+labelled as closed to buyers, not as live — derived from the row's own
+`onChainState` and `gradDeadline` against the anchor, so a row crosses from
+`Live` to `ExpiryPending` while the page is open and without a refetch, and a row
+the server returned under a `Live` filter may already have crossed (APP-17).
 
 ### 6.2 Launch detail
 
@@ -1187,16 +1378,21 @@ Writes, all against `BondingCurve` at the launch's own address:
 
 | Write | Preconditions the page must check first |
 |---|---|
-| `buy(minTokensOut, deadline)` payable | `effectiveState == Live`; `msg.value >= MIN_BUY_WEI`; `minTokensOut` set from a fresh `quoteBuy` |
-| `sell(tokensIn, minEthOut, deadline)` | `effectiveState` allows sells; allowance covers `tokensIn` |
+| `buy(minTokensOut, deadline)` payable | derived `EffectiveState == Live`, with `WINDOW_CLOSE_MARGIN_SECONDS` applied (section 4.5); `msg.value >= MIN_BUY_WEI`; `minTokensOut` set from a fresh `quoteBuy` |
+| `sell(tokensIn, minEthOut, deadline)` | derived `EffectiveState` allows sells; allowance covers `tokensIn` |
 | `PledrinToken.approve(curve, tokensIn)` | only when the allowance is short; exact amount (APP-8) |
-| `donate()` payable | `effectiveState` allows donations |
-| `graduate()` / `graduateAlt(fee, tickSpacing)` | section 4.5's windows |
-| `abortGraduation()` | `now >= abortAvailableAt` |
-| `expire()` | `effectiveState == ExpiryPending` |
+| `donate()` payable | derived `EffectiveState` allows donations |
+| `graduate()` / `graduateAlt(fee, tickSpacing)` | section 4.5's windows, derived from `capReachedAt` |
+| `abortGraduation()` | derived `now >= abortAvailableAt` |
+| `expire()` | derived `EffectiveState == ExpiryPending` |
 | the four claim functions | section 4.5 |
-| `CreatorVesting.release(launch)` | `releasableNow > 0` |
+| `CreatorVesting.release(launch)` | a derived `releasableNow > 0` (section 4.8), confirmed by `releasable(launch)` before signing |
 | `LiquidityLock.compound(positionId)` | a locked position exists |
+
+Every precondition in that table that names a time is derived by the application
+from the launch's served timestamps and the anchor (section 5.1 rule 4), and
+every one of them is advisory: the simulation decides what is signed (APP-1,
+APP-16).
 
 The chart shows the curve-phase series from `launchCandles` and stops at
 `graduatedAt`. After graduation it shows the last curve price, labels it as the
@@ -1293,7 +1489,11 @@ someone else is a supported and useful action, and presenting it as "claim your
 rewards" when the recipient is another address is wrong.
 
 An item with a `blockedReason` is shown with that reason and no button. The
-reason text comes from `docs/SPEC.md` sections 11.3, 12 and 16.2 (APP-10).
+reason text comes from `docs/SPEC.md` sections 11.3, 12 and 16.2 (APP-10). A
+vesting item with no `blockedReason` and a `nextEligibleAt` in the future is
+shown with the date and no button either: `blockedReason` carries only the
+clock-independent refusals (section 5.2), and whether the cliff has passed is the
+page's own derivation from `nextEligibleAt` and the anchor.
 
 ---
 
@@ -1399,9 +1599,12 @@ several trades on one launch.
 **IDX-11. The state a user is in is time-dependent and emits no event.** A
 launch past `gradDeadline` is still `Live` in storage, and `buy` is already
 refusing. Any list or filter built on the stored state shows dead launches as
-live and offers a buy that always reverts. `EffectiveState` (section 4.5) is the
-field the API exposes for filtering; `onChainState` is available on the detail
-shape for completeness. The same applies to the `Graduating` sub-windows:
+live and offers a buy that always reverts. `EffectiveState` (section 4.5) is what
+the API exposes **as a filter argument**, and it is the only predicate the server
+evaluates against its own clock; `onChainState` is what the API returns, on both
+the list and the detail shape, because the application derives the effective
+state from it (section 5.1 rule 4, decision 21). The same applies to the
+`Graduating` sub-windows:
 `graduateAlt` becomes available at `capReachedAt + ALT_DELAY` and
 `abortGraduation` at `capReachedAt + GRAD_GRACE`, and nothing is emitted at
 either moment.
@@ -1625,8 +1828,11 @@ says what it promises and `docs/THREAT_MODEL.md` says what it does not. A
 `Pledged` badge is always shown together with `bondOutcome` (section 4.7).
 
 **APP-13. Never present stale or partial index data as current.** A staleness
-notice is shown when the thresholds of section 1.7 are exceeded, and a
-backfilling index is labelled as incomplete.
+notice is shown when the threshold of section 1.7 is exceeded, and a
+backfilling index is labelled as incomplete. The staleness is the application's
+own figure — its estimate of chain time minus `headTimestamp` (section 3.13) —
+and not a number the API serves, so it keeps growing while a page sits open and
+the notice appears without a refetch.
 
 **APP-14. Never extend a price series past its last data point.** A missing
 candle bucket carries the previous close forward only as an explicitly flat
@@ -1640,8 +1846,35 @@ rather than sent, so claiming it is a second transaction (`docs/SPEC.md`
 section 8.3).
 
 **APP-16. Never offer an action `availableActions` excludes**, and never rely on
-`availableActions` alone: it is computed from data at least one block old, so it
-decides what to offer and the simulation decides what to sign.
+`availableActions` alone: it is composed by the application itself (section 4.5)
+over indexed data at least one block old, so it decides what to offer and the
+simulation decides what to sign.
+
+**APP-17. Derive every time-dependent value from the anchor, and never from the
+device's clock.** The API returns no field that depends on the time of the
+request (section 5.1 rule 4), so these derivations are the application's and the
+rules on them are not optional:
+
+1. The estimate of chain time is the anchor's `evaluatedAt` plus a **monotonic**
+   elapsed count since the response arrived. The device's wall-clock date is
+   never an input, because it can be arbitrarily wrong and nothing here can
+   bound it.
+2. Re-anchor whenever the page becomes visible again and whenever the anchor is
+   older than `CLOCK_ANCHOR_MAX_AGE_SECONDS`. A monotonic count does not survive
+   a suspended device or a throttled background tab, and a countdown that cannot
+   be re-anchored is replaced by the absolute timestamp rather than extrapolated.
+3. Apply `WINDOW_CLOSE_MARGIN_SECONDS` to closing windows only, for the reason
+   section 1.7 gives: being late can cost gas and being early cannot.
+4. A row the server returned under a `filter: {effectiveState: ...}` whose
+   derived state no longer matches is shown with its derived state and **not
+   dropped**. Dropping rows from a page makes `hasMore` and the cursor describe a
+   different result set than the one displayed.
+5. A derived value is display copy. APP-3 and APP-4 are unchanged by it: the
+   amount, the window and the quote that decide a transaction come from an
+   on-chain read in the same session, and a failed simulation still blocks
+   signing (APP-1). A derived figure that disagrees with the contract is
+   expected — the contract evaluates `block.timestamp` in a block that does not
+   exist yet — and must never be the thing a signature trusts.
 
 ### 8.1 The simulation and explanation requirements, per call
 
@@ -1681,8 +1914,13 @@ Stated here so that no page implies a completeness the data does not have.
    Decision 16 covers what, if anything, the application shows instead.
 3. **`holderCount` is inflatable.** Splitting one balance across a thousand
    addresses costs gas and nothing else. Concentration — `TOP_HOLDERS_N` and
-   their combined `shareBps` — is the figure that is not inflatable, and is the
-   one worth showing.
+   their combined `shareBps` — is the figure that cannot be inflated, and is the
+   one worth showing, but it is one-sided and the direction matters: a **high**
+   share is a real fact about the supply, while a **low** share can be
+   manufactured by one operator dispersing a holding across addresses they
+   control, for one transfer each. Present a high concentration as a warning;
+   never present a low one as safety. `docs/OPEN_DECISIONS.md` decision 20 states
+   the asymmetry and why it is still the reason the full balance set is indexed.
 4. **No address can be linked to another.** Reputation is per address; a creator
    using a fresh address per launch has an empty record; a creator buying their
    own launch through other addresses is indistinguishable from organic demand.
@@ -1695,15 +1933,25 @@ Stated here so that no page implies a completeness the data does not have.
    is no per-trade fee split, only a per-trade fee total and a per-launch split.
 7. **The metadata blob is whatever a creator put there.** It is not validated on
    chain, not interpreted by the protocol, and not guaranteed to decode.
+8. **Every time-dependent value on the screen is an estimate, and no design
+   makes it exact.** The API serves no request-time value, so states, countdowns
+   and releasable amounts are derived by the application from the anchor
+   (APP-17); the error is the server's clock offset plus the indexer's lag plus
+   one network hop, observable only as a sum through `evaluatedAt -
+   headTimestamp`. The exact figure is the one the contract computes from
+   `block.timestamp` in the block that includes the transaction, which is a
+   number nobody can know in advance. `docs/OPEN_DECISIONS.md` decision 21 states
+   the full budget. A server-evaluated field would have the same error with a
+   longer lag, so this is a limitation of the problem and not of the choice.
 
 ---
 
 ## 10. Open decisions this document raises
 
 Recorded in `docs/OPEN_DECISIONS.md` as entries 16 to 21 and 24, each with
-options and a recommendation. They block Phase 2 rather than Phase 1, and the
-first two block it at the start rather than at the end. Decisions 19 and 24 have
-since been resolved, and their rows state the answer rather than the question.
+options and a recommendation. They block Phase 2 rather than Phase 1. Decisions
+19, 20, 21 and 24 have since been resolved, and their rows state the answer
+rather than the question; 16, 17 and 18 are still open.
 
 | # | Question |
 |---|---|
@@ -1711,6 +1959,6 @@ since been resolved, and their rows state the answer rather than the question.
 | 17 | The encoding of `LaunchMetadata.metadata`, which the protocol does not interpret and both halves must agree on |
 | 18 | Whether the indexer indexes `Timelock` and exposes a governance query |
 | 19 | **Resolved**: the indexer follows `latest` with no confirmation depth, because the measurement now in `docs/CHAIN_FACTS.md` shows that no depth is both safe and usable (IDX-14) |
-| 20 | Whether ERC-20 `Transfer` is indexed for every launch token, which is what `holderCount` and `marketCapWei` cost |
-| 21 | The API transport, which must be chosen once before either half starts |
+| 20 | **Resolved**: `Transfer` is indexed for every launch token from its creation, with section 3.9's exclusion set mandatory, because top-N holder share is the one holder-derived figure whose informative reading sybils cannot manufacture and it needs the full balance set. Stored size grows with the holder set and throughput with the log count; the retreat is a per-launch backfill with null fields, never dropping them (section 3.9) |
+| 21 | **Resolved**: GraphQL, as the single transport, and **no returned field depends on the time of the request** — the API serves the clock-independent facts plus one time anchor and the application derives the rest (sections 1.7, 3.13, 4.5, 4.8, 5.1 rule 4, APP-17) |
 | 24 | **Resolved**: one staleness threshold, measured in seconds, because two thresholds in two units for one quantity cannot be held in agreement against a block time that is an observation rather than a bound (section 1.7) |

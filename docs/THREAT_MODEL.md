@@ -594,16 +594,75 @@ What that attack can and cannot do:
   notional large enough to move it, and those fees are paid **into the position
   being griefed**, where they are locked forever and are themselves
   compoundable.
-- The alternative encoding, `INCREASE_LIQUIDITY` with a caller-supplied
-  liquidity, has a grief that costs only gas: call with a liquidity of 1, collect
-  the whole accrued fee, compound almost none of it. That is why the deprecated
-  action is the one that is implemented. Decision 12 records the comparison.
+- The alternative encoding with a **caller-supplied** liquidity,
+  `INCREASE_LIQUIDITY` with the number passed in, has a grief that costs only
+  gas: call with a liquidity of 1, collect the whole accrued fee, compound almost
+  none of it, and the rest becomes residual the lock can never spend. Decision 12
+  records that comparison.
+
+The caller-supplied variant is not the only alternative, and disposing of it does
+not dispose of the other one. `INCREASE_LIQUIDITY` with a **lock-computed**
+liquidity — the lock deriving the number itself, so that no caller can under-size
+it — is the variant a reviewer proposes once the bullet above is granted, and the
+gas-only grief does not apply to it. It is still worse than the deprecated
+action, for two reasons that have nothing to do with who supplies the number.
+Decision 12 rejects this variant for putting more arithmetic in the lock than a
+hard-coded zero does; these two are the stronger reasons.
+
+- **It does not remove the sandwich.** It changes who computes the liquidity, not
+  what the liquidity is computed from. The lock has two sources available to it:
+  `slot0`, which is the price an attacker has just moved, and the position's
+  fee-growth state, read in the same block. A reference an attacker cannot move
+  in that block would have to come from outside the pool — the graduated pool is
+  hookless (`docs/SPEC.md` section 8.1) and v4 core keeps no price history of its
+  own, so there is no in-pool past to read. `docs/SPEC.md` section 18 rules out
+  anything that needs an oracle, and section 9 of this document is the list of
+  external dependencies graduated liquidity already carries: an oracle would add
+  one with an owner to a path that currently has none. The exposure is the same
+  exposure with the arithmetic moved.
+- **It adds a debt path that the deprecated action structurally cannot have.**
+  `_increase` settles whatever the chosen liquidity costs, so an over-estimate by
+  one wei leaves a debt that `CLOSE_CURRENCY` must settle. For `currency1`, the
+  launch token, settlement goes through Permit2 from the lock, which holds no
+  Permit2 approval for anything, so the call reverts. For `currency0`, native
+  ETH, v4-periphery's settle path pays `{value: amount}` out of
+  **PositionManager's own balance**, and the lock forwards no value of its own, so
+  the whole of any native debt would be paid out of whatever a third party has
+  parked there. That is finding 1's surface again
+  (`docs/security/REVIEW-2026-11-11-phase1-contracts.md`), this time inside the
+  lock: the outcome of a permissionless call on a position that must never move
+  would depend on a balance no Pledrin contract controls, reverting when it is
+  empty and spending a stranger's ETH when it is not.
+  `INCREASE_LIQUIDITY_FROM_DELTAS` cannot create a debt at all. Its liquidity is
+  derived from the credit the preceding zero-liquidity `DECREASE_LIQUIDITY`
+  created, and the flooring in `getLiquidityForAmount0` bounds the amount
+  required on each side by the credit on that side. No debt means no settle leg,
+  and no settle leg means neither Permit2 nor PositionManager's balance is ever
+  on the path.
+
+Both alternatives are therefore worse than the action marked deprecated, which is
+why the deprecated one is implemented: against the caller-supplied variant
+because its grief costs only gas, and against the lock-computed variant because it
+keeps the same sandwich exposure and adds a settle path that depends on a balance
+no Pledrin contract controls.
 
 Two guards make the failure mode safe rather than silent: `compound` reverts
 `NothingToCompound` when the batch would add no liquidity — which is the ordinary
 case for one-sided fee accrual, not only the griefed case — and
 `LiquidityNotIncreased` if liquidity ever fell. Without the first, fees would be
 credited out of the position into the unspendable residual on every such call.
+
+That bound on each side has a consequence for the reverts as well as for the
+debt: **`compound` cannot revert for a rounding reason**, so the two guards above
+are the only reverts the function can produce. The proof of the bound is in
+`docs/SECURITY_NOTES.md` section 4, under `_floorLiquidity`'s fallback, which
+establishes that the amount `getAmount0Delta` requires for the liquidity
+`getLiquidityForAmount0` returns is one rounding and never exceeds the input
+amount. It holds for every input rather than for the permitted range only, and it
+rests on three rounding directions in vendored code this repository does not own:
+a v4-periphery bump that changes one of them makes this paragraph false and makes
+graduation's own floor guard live, which is the event that section keeps both
+guards to survive.
 
 ---
 

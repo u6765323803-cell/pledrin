@@ -706,6 +706,18 @@ on-chain from the position's own fee growth instead of accepting it as an
 argument — closes the grief as well, and is rejected because it puts more
 arithmetic in the lock than B's hard-coded zero does.
 
+**That reason for rejecting the third variant is the weakest of the three now on
+record, and it is the variant a reviewer actually proposes.**
+`docs/THREAT_MODEL.md` 5.5 carries the other two, found by reading the vendored
+periphery: a lock-computed liquidity does not remove the sandwich, because the
+lock would have to compute it from the same `slot0` an attacker just moved and a
+reference it cannot move would have to come from outside the pool, which
+`docs/SPEC.md` section 18 rules out; and it adds a debt path that
+`INCREASE_LIQUIDITY_FROM_DELTAS` structurally cannot have, settling through
+Permit2 from a lock that holds no approval or, for native, out of
+PositionManager's own balance. Whoever revisits this decision should read that
+section first.
+
 ### What option B cost, measured rather than assumed
 
 **1. `INCREASE_LIQUIDITY_FROM_DELTAS` is marked deprecated in the vendored
@@ -1398,8 +1410,15 @@ of the canonical log set, so a correct rollback restores every row exactly
 
 ## 20. Whether ERC-20 `Transfer` is indexed for every launch token
 
-**Blocks Phase 2 at the start**, because it decides whether `holderCount`,
-`marketCapWei` and `HolderRow` exist in the API shapes at all.
+**DECIDED 2026-11-11 by the tech lead: option A.** Every launch token's
+`Transfer` is indexed from the token's creation; the exclusion set in
+`docs/DATA_MODEL.md` section 3.9 is mandatory and not an optimisation; and the
+documented retreat is B with a full backfill, never C. The cost model this entry
+originally recorded for A was wrong in a way that understated A, and is corrected
+below rather than deleted.
+
+**Still the first thing Phase 2 settles**, because it decides whether
+`holderCount`, `marketCapWei` and `HolderRow` exist in the API shapes at all.
 
 Holder counts, circulating supply, market capitalisation and holder
 concentration all need the full balance set, which means indexing `Transfer` for
@@ -1422,9 +1441,25 @@ first block when the threshold is crossed.
 
 ### Trade-offs
 
-A is the complete answer. Its cost is unbounded in the number of launches, which
-on a launchpad is the fastest-growing number there is, and a graduated token
-that trades heavily emits a `Transfer` per swap leg forever.
+A is the complete answer, and its cost is two budgets rather than one. This
+entry originally read that the cost "is unbounded in the number of launches,
+which on a launchpad is the fastest-growing number there is, and a graduated
+token that trades heavily emits a `Transfer` per swap leg forever" — three claims
+run together in a way that reads as though stored size grows with trading volume.
+It does not.
+
+| Budget | Grows with | Why |
+|---|---|---|
+| Stored size | `Σ holders` over launches | `docs/DATA_MODEL.md` section 3.9 specifies `TokenBalance` as **one row per `(token, holder)` with a running balance**, not a log of transfers. A holder who trades a thousand times occupies the same row as one who trades once, and a holder whose balance returns to zero occupies a row that stops being counted. |
+| Processing throughput | the number of `Transfer` logs | One handler invocation per log, every one of them a read-modify-write of one row. This is the budget a graduated token that trades heavily consumes, since it emits a `Transfer` per swap leg forever. |
+
+That is a materially smaller claim than the original one and it strengthens A
+rather than weakening it: the expensive half is throughput, which is bounded by
+the chain's own capacity and is a question of how fast handlers run, while
+storage — the half that cannot be bought back once spent — grows with the holder
+set and not with activity. The honest part of the original claim survives intact,
+because `Σ holders` is summed **over launches** and on a launchpad the number of
+launches is the fastest-growing number there is.
 
 B is not the saving it looks like. The threshold cannot be a filter, because a
 launch whose indexing starts mid-history has wrong balances; it has to be a
@@ -1434,14 +1469,16 @@ launches that matter.
 
 C is cheap and honest and loses the metric most readers look for. The deciding
 point against it is concentration: top-N holder share is the one holder-derived
-figure that sybil wallets cannot inflate, and it needs the full balance set.
-`uniqueTraderCount` is a weaker substitute that measures something else.
+figure that sybil wallets cannot inflate — in the precise, one-sided sense set
+out under "Why concentration is the deciding argument" below — and it needs the
+full balance set. `uniqueTraderCount` is a weaker substitute that measures
+something else.
 
 ### Recommendation
 
-**A.** The frontend brief names holder counts, and concentration is worth more
-than the count itself. The exclusion set in `docs/DATA_MODEL.md` section 3.9 is
-mandatory and not an optimisation: without it the curve, the vesting contract
+**A**, taken. The frontend brief names holder counts, and concentration is worth
+more than the count itself. The exclusion set in `docs/DATA_MODEL.md` section 3.9
+is mandatory and not an optimisation: without it the curve, the vesting contract
 and — after graduation — the v4 PoolManager all appear as the largest holders of
 every launch.
 
@@ -1449,12 +1486,88 @@ If cost becomes a real problem, retreat to B with a full backfill, not to C, and
 make the affected fields null rather than zero so that a missing count is never
 read as a count of zero.
 
+### Why concentration is the deciding argument
+
+Not the count. `holderCount` is inflatable by anyone willing to pay gas —
+splitting one balance across a thousand addresses costs gas and nothing else —
+and `docs/DATA_MODEL.md` section 9 limitation 3 and `docs/THREAT_MODEL.md` 10.1
+both say so. **Top-N holder share is the one holder-derived figure sybil wallets
+cannot inflate**, and the exact form of that claim has to be written down,
+because the figure is one-sided rather than sybil-proof:
+
+| Figure | What a sybil operator can do to it, for gas | Therefore |
+|---|---|---|
+| `holderCount` | raise it without bound: there is no conservation law on addresses | a high count is evidence of nothing |
+| top-N holder share | lower it, by dispersing a holding across addresses they control | a **high** share is a real fact about the supply; a low share is evidence of nothing |
+
+Concentration is a distribution of a conserved quantity — the shares of
+circulating supply sum to one — so nothing can manufacture a high reading, and a
+high reading is exactly the reading a buyer needs before risking money. That is
+the asymmetry worth paying A's cost for: the figure's informative direction is
+the one sybils cannot reach. `holderCount` has the opposite shape, and its
+informative direction is the one nobody looks at.
+
+What concentration does **not** do is certify dispersion. A low top-N share is
+consistent with one operator holding everything through a thousand addresses, it
+costs one transfer per address to produce, and `docs/THREAT_MODEL.md` 10.1 and
+10.2 are the statement that this is not detectable on chain. The application must
+therefore present a high concentration as a warning and must never present a low
+one as safety. What A buys over C is the ability to state the warning at all:
+neither B nor C can compute the figure for every launch, and `marketCapWei` and
+`circulatingBaseUnits` have the same prerequisite.
+
+This is also where the read side meets the founder's instruction to document
+plainly what the design cannot prevent. The honest sequence is: a creator buying
+their own launch through fresh addresses is not detectable on chain
+(`docs/THREAT_MODEL.md` 10.2); `holderCount` is therefore not evidence of
+anything and must never be presented as distribution; concentration is the one
+figure with a reading that survives that adversary, and it survives only in the
+direction that warns. A product that indexes `Transfer` and then leads with the
+count has paid A's cost and kept C's information.
+
+`uniqueTraderCount`, C's substitute, measures a different thing — how many
+addresses have traded, which is inflatable in exactly the same way and says
+nothing about who holds the supply now.
+
+### What would reverse this, and what the trigger is measured on
+
+The retreat to B is taken on a measurement and not on a feeling, and the two
+budgets above have different triggers.
+
+| Budget | Trigger for the retreat | Why this trigger |
+|---|---|---|
+| Processing throughput | the indexer's lag exceeding `STALENESS_WARN_SECONDS` (`docs/DATA_MODEL.md` 1.7, decision 24) during normal operation rather than during a backfill | The threshold already exists, is already displayed to users through `IndexerStatus`, and firing in normal operation is the observable form of "handlers cannot keep up with `Transfer`". |
+| Stored size | no trigger; it is not the binding budget | Rows are one per `(token, holder)`. A retreat that drops launches below an activity threshold saves rows for exactly the launches nobody reads. |
+
+If B is entered, it is a backfill trigger and never a filter: a launch whose
+indexing starts mid-history has wrong balances, so crossing the threshold
+re-reads from the token's first block, which is known from `LaunchCreated`.
+Until a launch has been backfilled, `holderCount`, `marketCapWei`,
+`circulatingBaseUnits` and `HolderRow` are null for it and never zero.
+
 ---
 
 ## 21. The API transport
 
-**Blocks Phase 2 at the start.** It decides the application's entire
-data-fetching layer, and it is the one decision in this group that cannot be
+**DECIDED 2026-11-11 by the tech lead: option A, GraphQL, as the single
+transport.** Every field name in `docs/DATA_MODEL.md` section 5.2 is binding,
+section 1.2's integer encoding applies without exception, and the bounded
+exception stands as written: if `claimable` or `indexerStatus` is materially
+clearer as a named HTTP route, that is two routes documented in
+`docs/DATA_MODEL.md` section 5.3 and not a licence for a second API.
+
+**One part of the recommendation below is withdrawn, and it is the part that made
+the transport awkward.** This entry put `EffectiveState`, `availableActions`,
+`releasableNow` and `claimable` on the server as request-time resolvers. Three of
+the four are now not served at all: the API returns the clock-independent facts
+it already holds plus one time anchor, and the application derives the rest.
+`claimable` stays a server query for a reason that has nothing to do with the
+clock. "The four request-time derivations" below is the analysis, including the
+case against, and `docs/DATA_MODEL.md` sections 1.7, 3.13, 4.5, 4.8, 5.1, 5.2,
+5.3, 6.1, 6.2, 6.5, 7, 8 and 9 have been brought into line with it.
+
+**Blocked Phase 2 at the start.** It decides the application's entire
+data-fetching layer, and it was the one decision in this group that could not be
 deferred by a day.
 
 `docs/DATA_MODEL.md` section 5 specifies the queries, the arguments and the
@@ -1483,6 +1596,11 @@ server clock rather than read from a column, so each is a resolver rather than a
 field, and a resolver that fans out across launches is easy to write and
 expensive to run.
 
+**That last clause is wrong and the correction is below.** Checked against the
+shapes of `docs/DATA_MODEL.md` section 5.2 rather than assumed, three of the four
+do not fan out at all and the fourth fans out for a reason that is not the clock.
+The awkwardness was real; its cause was not cost.
+
 B makes those four natural and cacheable per route, and keeps section 5.2's
 shapes literal on the wire. Its cost is hand-written types on both sides and a
 hand-written cursor convention, which is exactly the kind of duplicated
@@ -1505,6 +1623,166 @@ binding, the integer encoding of section 1.2 applies without exception, and the
 choice is made before either half writes a line, because retrofitting it is a
 rewrite of the application's data layer and of the indexer's API surface at
 once.
+
+### The four request-time derivations, and where each belongs
+
+The proposal put to this entry before it was recorded: do not serve
+`EffectiveState`, `availableActions`, `releasableNow` and `claimable` at all.
+Return the clock-independent facts the API already holds — `gradDeadline`,
+`capReachedAt`, `graduatedAt`, the vesting cliff, duration and accrued amounts,
+the state transitions — plus one server time anchor, and let the application
+derive the four. The answer is that three of the four move to the application and
+the fourth stays, and the argument that decides it is not the one this entry
+originally gave.
+
+**First, the cost claim, corrected against the shapes rather than restated.**
+
+| Derivation | Where it appears in section 5.2 | Evaluations per request | Is that a fan-out? |
+|---|---|---|---|
+| `effectiveState`, `secondsUntilDeadline` | `LaunchListItem` | one per row, at most `PAGE_LIMIT_MAX` = 100 | No. Each is one comparison of a stored timestamp against one `now` held constant for the request: arithmetic in the projection, not a query per row. |
+| `availableActions`, `secondsUntilAltGraduate`, `secondsUntilAbort` | `LaunchDetail` only | one, because `launch(address)` returns one launch | No. |
+| `releasableNow` | `VestingSummary`, one per `LaunchDetail` | one | No. |
+| `claimable` | its own query | one per launch that owes the address anything | **Yes, and the clock is not why.** The fan-out is the enumeration: finding which launches owe an address anything is the entire reason the query exists (section 5.3), and removing the clock from it removes none of that work. |
+
+So "expensive to run" was wrong about three of the four and misattributed in the
+fourth. Cost does not decide this question. Correctness does.
+
+**Second, the argument that does decide it was already in the document.** Section
+5.1 rule 4 ended: *"The application recomputes them locally from `gradDeadline`,
+`capReachedAt` and `start` for a live countdown rather than polling."* The
+application was therefore already required to implement every one of these
+derivations, so serving them as well meant **two implementations of one
+predicate, of which the server's is stale by construction** — and the document
+whose section 1.1 exists to stop a definition being written twice had written one
+twice. A served `secondsUntilDeadline` is wrong at the instant it is serialised
+and wronger at every instant after; a client that trusts it and a client that
+recomputes it disagree on the same screen. Deleting the server's copy removes a
+duplicate definition, not a feature.
+
+**Third, the product argument stands, with one correction.** A graduation
+deadline, a vesting cliff and a buy window are countdowns, and a stale "you can
+still buy" is a failed transaction — but under APP-1 a failed simulation blocks
+signing, so the usual cost of a stale offer is a refused signature and a confused
+user, not gas. The case where gas is actually lost is narrower: a buy that
+simulates against an open window and is included after it closed. No clock design
+prevents that one. It is bounded by `buy`'s own `deadline` argument (decision 14)
+and by the margin parameter below, and it is the only money in this question.
+
+**The verdict.**
+
+| Derivation | Evaluated by | Why |
+|---|---|---|
+| `EffectiveState` and every `secondsUntil*` | the application, from `onChainState`, `gradDeadline`, `capReachedAt` and the anchor | Pure comparisons over facts that change only when a log is emitted. The countdown has to be live, and the inputs were already on the wire. |
+| `availableActions` | the application, composing `docs/DATA_MODEL.md` section 4.5's table over fields the API already serves | Same inputs. Each row of that table flips at an instant no event marks, so a served list is wrong between refetches, and it is advisory in either case because the simulation decides what is signed (APP-16). |
+| `releasableNow`, `vestedNow` | the application, evaluating `docs/SPEC.md` section 12's formula over the six schedule facts | Same, and the amount is never a transaction argument (APP-4): `release(launch)` takes no amount, so a displayed figure cannot be signed. |
+| `claimable` | **the server**, with its membership rule made clock-independent | Its value is the enumeration, not the amounts. An item is included on conditions that change only by a log — a non-zero bucket balance, a returned and unclaimed bond, an unclaimed bounty credit, a schedule with unreleased unvoided allocation — and the vesting item's releasable-now portion is derived by the application from the schedule facts the item carries. |
+
+The server keeps a clock for one thing that is not a field: the
+`filter.effectiveState` predicate of the `launches` query (IDX-11). It decides
+which rows cross the wire at all, which cannot be done client-side without
+shipping every row. The `deadlineSoonest` sort was expected to need a clock too
+and does not — it orders by the stored `gradDeadline`. So the rule this decision
+adopts is not "no server clock" but **no returned field depends on the time of
+the request**, with the anchor itself as the single declared exception.
+
+### The error budget the anchor-plus-elapsed approach has to state
+
+The estimator is specified, because the obvious one is wrong. The application's
+estimate of chain time is
+
+```
+t_hat = evaluatedAt + (monotonic elapsed since the response was received)
+```
+
+and never the device's wall-clock date. A device clock can be arbitrarily wrong
+and is the one input in this whole design that nothing can bound; a monotonic
+elapsed counter is not a clock and needs the device's date to be correct in no
+way at all. Four error terms remain, and `docs/CHAIN_FACTS.md` bounds two of
+them:
+
+| Term | Size | How it is bounded |
+|---|---|---|
+| The server's clock offset from chain time | unobservable alone; its sum with the indexer's lag is exactly `evaluatedAt - headTimestamp`, the quantity `secondsBehind` used to carry | `STALENESS_WARN_SECONDS` = 10 seconds, after which the application is already showing a staleness notice (`docs/DATA_MODEL.md` 1.7, decision 24). The client can observe the sum and nothing finer, which is worth stating rather than implying a decomposition it cannot make. |
+| One-way network latency between serialising the response and receiving it | unobservable directly | bounded above by the round trip the client itself measures. |
+| Monotonic elapsed diverging from real elapsed | negligible as drift, **unbounded** across device suspend or a throttled background tab | `CLOCK_ANCHOR_MAX_AGE_SECONDS` (default 60) plus re-anchoring whenever the page becomes visible again. Past that age a countdown is replaced by the absolute timestamp rather than extrapolated. |
+| Inclusion latency: the gap between signing and `block.timestamp` in the including block | small on this chain — block time is **0.104 s**, about ten blocks a second — but irreducible | nothing in any API can bound it. `WINDOW_CLOSE_MARGIN_SECONDS` (default 5) is the product's answer, and the simulation is the correctness answer. |
+
+Two further facts from `docs/CHAIN_FACTS.md` bear on the budget, and the second
+of them does not do what it looks like it should. The 0.104 s block time means
+`block.timestamp` advances about ten times a second, so the quantisation of chain
+time is not a term worth counting against a seconds-scale UI. The finality tags
+lagging **13.3 and 20.1 minutes** do *not* enter the budget at all, and the
+reason is decision 19: the
+indexer follows `latest`, so `headTimestamp` trails the chain head by the
+indexer's own lag rather than by a finality depth. Had a depth been chosen, the
+anchor would have been up to twenty minutes old and no client-side derivation
+could have repaired it — which is a second, independent reason that decision was
+right.
+
+**The direction of the error decides where the margin goes.** An estimate biased
+late offers a *closing* window after it has closed, and that is the case that can
+cost gas. An estimate biased early offers an *opening* window before it opens —
+a cliff end, `altGraduateAt`, `abortAvailableAt` — and that case costs a refused
+simulation under APP-1 and nothing else. So `WINDOW_CLOSE_MARGIN_SECONDS` is
+applied to closing windows only. Padding the opening ones would hide an action
+that is genuinely available, which is a worse trade for a permissionless call
+somebody is waiting to make.
+
+### The case against, which is not weightless
+
+1. **Normative logic moves into a client this document cannot test.** Section
+   4.5's table and `docs/SPEC.md` section 12's formula become application code.
+   A server has one implementation and one bug; clients have as many as there are
+   clients, and a third-party client that gets the table wrong shows a wrong
+   state with nothing to check it. The mitigation is only that both definitions
+   stay normative here and that the derivations are arithmetic over served
+   facts — it is not a guarantee.
+2. **The client's clock is the one input nothing bounds.** Monotonic anchoring
+   removes the device's date from the path, and does not remove a suspended
+   device, a throttled tab, or an anchor that was already stale when it arrived.
+   The age bound and the re-anchor rule are mandatory for that reason, not as
+   polish.
+3. **The agreement the proposal was least sure of cannot be achieved by either
+   side.** `releasableNow` and `claimable` must agree with what the contract
+   computes at execution time, which uses `block.timestamp` in a block that does
+   not exist yet. Neither a server nor a client can compute that number. What
+   makes this safe is already specified and is unchanged by this decision: APP-3
+   re-reads the chain before signing, APP-4 forbids any indexer-derived number
+   from being a transaction argument, APP-1 blocks signing on a failed
+   simulation, and `release(launch)` carries no amount. The residual failure
+   modes are a figure displayed slightly low, where the user receives more than
+   the screen promised, and a non-zero figure displayed in the last seconds of a
+   cliff, where the simulation refuses and the user learns nothing was lost. A
+   server-evaluated figure has the same two failure modes with a longer lag.
+4. **The filter and the field can disagree about the same row.** A row returned
+   under `filter: {effectiveState: Live}` may render as `ExpiryPending`, because
+   the deadline passed between the server's evaluation and the client's. That is
+   the truth and not a defect, and the application must show the row with its
+   derived state rather than silently dropping it: dropping rows from a page
+   makes `hasMore` and the cursor lie about what the next page contains.
+5. **Every consumer re-implements the arithmetic.** The wire cost, though, is a
+   small saving rather than a cost: the inputs were already in the shapes in
+   almost every case, so the change removes six fields and adds two —
+   `onChainState` on `LaunchListItem` and `vesting` on `ClaimableItem` — while
+   `IndexerStatus` trades `secondsBehind` for `evaluatedAt`.
+
+One benefit found while checking the above, worth recording because it is
+testable: with no returned field depending on request time, two responses to the
+same query at the same `headBlock` are identical apart from the anchor. That
+makes an API test an equality assertion instead of a clock-freezing exercise, and
+it extends IDX-12 — every stored row is a pure function of the canonical log
+set — to the API surface, which was the one place the server clock had leaked
+back in.
+
+### What this does to the bounded HTTP exception
+
+It weakens its motivation without withdrawing it. `claimable` felt wrong as a
+GraphQL resolver because it was request-time evaluated; with the clock out of it,
+it is an ordinary aggregation and GraphQL fits it. `indexerStatus` now carries the
+anchor, so it is the one response whose content changes every second, and the
+defensible reason to give it a named HTTP route is transport-level caching rather
+than the resolver problem. The exception therefore stands, exercised only for a
+transport reason and recorded in `docs/DATA_MODEL.md` section 5.3 if it is taken.
 
 ---
 
@@ -1948,6 +2226,37 @@ tolerated and only liquidity blocks a key.
 produces.** Not a blocker, and explicitly sequenced after decision 22: taking
 this instead of change 1 would be a probabilistic defence standing in front of a
 permanent brick.
+
+**Still correctly deferred after `375bdc2`, with the reason restated so that it
+cannot be read as waiting on code.** Change 1 is implemented and committed, so
+the *instrument* exists: the constructor emits `PoolPreInitialized` whenever a
+launch finds its canonical key already open, `docs/DATA_MODEL.md` 3.1 stores it
+as a flag and a price on the `Launch` row, and IDX-28 of that document records
+that counting it is what resolves this entry. The *measurement* does not exist
+and cannot yet, because nothing has been deployed to any network and the event
+has therefore never had an opportunity to fire. The blocker has changed in kind,
+from an implementation to a deployment plus elapsed observation time, and not in
+effect.
+
+| Needed before this can be settled | Who produces it | State on 2026-11-11 |
+|---|---|---|
+| A count of `PoolPreInitialized` over the first weeks of testnet and then mainnet, against the count of launches in the same period | deployment, then the indexer | Not started. Nothing is deployed. |
+| Whether a pending transaction is observable on this chain, and whether ordering is first-come-first-served | a measurement against an endpoint or a sequencer feed other than the one in `docs/CHAIN_FACTS.md`, which answers `-32601` to both pool queries | Open. Listed in that file's "Not measured, and needed". |
+| Whether `blockhash` on this Nitro chain returns what option B's salt would need | a fork test that calls it from a contract | Open. Listed in the same place. |
+
+The second row is the one that could make this entry actionable with no
+deployment at all: if a pending transaction turns out not to be observable, option
+B stops being a race and becomes a near-closure, and the recommendation below
+already says to revisit on that evidence alone. The third row is a prerequisite
+of B rather than a trigger for it, since a salt that reads an unusable
+`blockhash` is not an option in the first place.
+
+One read-side gap closed while checking this: the count the first row needs had
+no query. `poolPreInitialized` is a field on `Launch` but was not among the
+filters of `launches`, so the figure that resolves this entry would have been a
+hand-written query against the indexer's database rather than something the API
+can answer. `docs/DATA_MODEL.md` section 5.3 now lists it as a filter, which
+costs one boolean and makes the measurement reproducible by anyone.
 
 ### Question
 

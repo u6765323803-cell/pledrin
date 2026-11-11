@@ -1,0 +1,133 @@
+[
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "internalType": "address",
+            "name": "creator",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "protocolTreasury",
+            "type": "address"
+          },
+          {
+            "internalType": "contract ITokenDeployer",
+            "name": "tokenDeployer",
+            "type": "address"
+          },
+          {
+            "internalType": "contract ICreatorVesting",
+            "name": "vesting",
+            "type": "address"
+          },
+          {
+            "internalType": "contract ILiquidityLock",
+            "name": "liquidityLock",
+            "type": "address"
+          },
+          {
+            "internalType": "contract IPoolManager",
+            "name": "poolManager",
+            "type": "address"
+          },
+          {
+            "internalType": "contract IPositionManager",
+            "name": "positionManager",
+            "type": "address"
+          },
+          {
+            "internalType": "contract IAllowanceTransfer",
+            "name": "permit2",
+            "type": "address"
+          },
+          {
+            "internalType": "uint128",
+            "name": "virtualEthReserve",
+            "type": "uint128"
+          },
+          {
+            "internalType": "uint128",
+            "name": "bondWei",
+            "type": "uint128"
+          },
+          {
+            "internalType": "uint32",
+            "name": "gradWindow",
+            "type": "uint32"
+          },
+          {
+            "internalType": "uint16",
+            "name": "totalFeeBps",
+            "type": "uint16"
+          },
+          {
+            "internalType": "uint16",
+            "name": "creatorShareBps",
+            "type": "uint16"
+          },
+          {
+            "internalType": "uint16",
+            "name": "protocolShareBps",
+            "type": "uint16"
+          },
+          {
+            "internalType": "uint16",
+            "name": "protectionShareBps",
+            "type": "uint16"
+          },
+          {
+            "internalType": "string",
+            "name": "name",
+            "type": "string"
+          },
+          {
+            "internalType": "string",
+            "name": "symbol",
+            "type": "string"
+          }
+        ],
+        "internalType": "struct IBondingCurve.CurveConfig",
+        "name": "config",
+        "type": "tuple"
+      }
+    ],
+    "name": "deploy",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "curve",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "curve",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "factory",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "creator",
+        "type": "address"
+      }
+    ],
+    "name": "CurveDeployed",
+    "type": "event"
+  }
+]

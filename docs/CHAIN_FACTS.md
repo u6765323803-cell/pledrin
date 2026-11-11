@@ -4,6 +4,9 @@ Every address and parameter here was verified directly against the chain with
 `cast` on 2026-11-11, and cross-checked against the official Uniswap deployment
 pages. Nothing in this file is from memory.
 
+All addresses here are EIP-55 checksummed, which is the form
+Solidity requires in a literal.
+
 **Rule for the whole team: never introduce an external address that is not in
 this file. If you need one, verify it on-chain first and add it here with the
 command you used.**
@@ -46,6 +49,96 @@ that bind our contracts:
 - `gasleft()` and the 63/64 rule behave differently from L1. Do not build
   logic that depends on precise gas accounting.
 
+## Block time and finality tags — measured, mainnet
+
+```
+cast block latest    --rpc-url https://rpc.mainnet.chain.robinhood.com --field number
+# 111735270
+cast block safe      --rpc-url https://rpc.mainnet.chain.robinhood.com --field number
+# 111727515
+cast block finalized --rpc-url https://rpc.mainnet.chain.robinhood.com --field number
+# 111723654
+```
+
+Both `safe` and `finalized` are served. Converted to wall-clock time from the
+timestamps of the same three blocks, with the block time measured over a
+10,000-block span:
+
+| Tag | Lag in blocks | Lag in time |
+|---|---|---|
+| `safe` | 7,755 | 13.3 min |
+| `finalized` | 11,616 | 20.1 min |
+
+Block time is **0.104 s**, so roughly ten blocks a second.
+
+The consequence for the read side, and the reason this measurement exists:
+**there is no confirmation depth that is both safe and usable.** An indexer
+following `finalized` shows a price twenty minutes stale, which is unusable for
+a trading interface on a curve whose whole lifetime may be hours. One following
+`latest` is exposed to reorgs. So the answer is not a depth: the indexer follows
+`latest` and every handler is written to be reorg-safe — each row a pure function
+of the canonical log set, no handler storing the result of an `eth_call`, and
+every handler idempotent. `docs/DATA_MODEL.md` section 7 states those as
+requirements and decision 19 of `docs/OPEN_DECISIONS.md` records why a depth was
+not chosen.
+
+The lags are also not a safety claim about this chain's finality. They are what
+the endpoint reported at one moment; a sequencer or batch-posting change moves
+them, and nothing in the protocol depends on them.
+
+## Gas accounting and what actually limits an attacker — measured, mainnet
+
+```
+cast block latest --field gasLimit        # 1125899906842624   (2**50)
+cast block latest --field gasUsed         # 2362448
+cast call 0x...006C "getGasAccountingParams()(uint256,uint256,uint256)"
+# 7000000     speed limit, gas per second
+# 32000000    gas pool maximum
+# 32000000    maximum gas for one transaction
+cast gas-price                            # 20030000 wei   (0.02003 gwei)
+cast call 0x...006C "getMinimumGasPrice()(uint256)"
+# 20000000 wei   (0.02 gwei)
+```
+
+**The block gas limit is a sentinel, not a bound.** `2**50` is not a real cap and
+blocks run far below it, so block space is not the scarce resource on this chain.
+The two figures that do bind are the **32,000,000 gas ceiling on a single
+transaction** and the **7,000,000 gas per second speed limit**, the latter
+enforced by the price rising rather than by transactions being rejected.
+
+This is what makes a key-space argument quantitative rather than rhetorical. Using
+the Phase 1 review's measured 47,027 gas to initialise a pool key, and the
+`fee` x `tickSpacing` key space of 1,337,190 keys that `docs/OPEN_DECISIONS.md`
+decision 22 adopts:
+
+| Per key | Keys per transaction | Total gas | At 7M gas/s | At the minimum price |
+|---|---|---|---|---|
+| 47,027 — initialise only | 680 | 6.29e10 | 2.5 h of the chain's entire capacity | 1.26 ETH |
+| ~250,000 — initialise and mint dust | 128 | 3.34e11 | 13.3 h of the chain's entire capacity | 6.69 ETH |
+
+Both rows understate the cost, because sustained demand at that rate raises the
+price well above the minimum, and because the work has to be repeated **per
+launch**: the key includes the launch token's address, so seizing the space for
+one launch seizes nothing for the next. The second row is the one that matters,
+since after decision 22 a bare `initialize` is tolerated and only liquidity
+blocks a key — and its dust is stranded.
+
+## Not measured, and needed
+
+- **Whether a pending transaction is observable before it executes, and whether
+  ordering is first-come-first-served.** `txpool_content` and
+  `eth_newPendingTransactionFilter` are both absent from this endpoint
+  (`error -32601`), while a `pending` block tag is served. That is a fact about
+  this endpoint, not about the sequencer: another endpoint or the sequencer's own
+  feed may expose what this one does not. No claim about mempool privacy or
+  ordering may rest on it. This is the fact `docs/OPEN_DECISIONS.md` decision 23
+  needs.
+- **Whether `blockhash` is usable here.** Cannot be answered with `cast` alone;
+  it needs a fork test that calls it from a contract.
+- **The gas cost of a minimal Uniswap v4 position mint on this chain.** The
+  47,027 to initialise is measured; the larger half of the table above is an
+  estimate.
+
 ## Uniswap v4 — present on BOTH mainnet and testnet
 
 This is the graduation target. The full v4 stack is deployed at the same
@@ -54,22 +147,22 @@ testnet.
 
 | Contract | Address |
 |---|---|
-| PoolManager | `0x8366a39cc670b4001a1121b8f6a443a643e40951` |
-| PositionManager | `0x58daec3116aae6d93017baaea7749052e8a04fa7` |
-| Quoter | `0x8dc178efb8111bb0973dd9d722ebeff267c98f94` |
-| StateView | `0xf3334192d15450cdd385c8b70e03f9a6bd9e673b` |
-| PositionDescriptor | `0x9639443158e8c5efa35bd45287bf2effd3d8dc06` |
+| PoolManager | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
+| PositionManager | `0x58daec3116aae6D93017bAAea7749052E8a04fA7` |
+| Quoter | `0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94` |
+| StateView | `0xF3334192D15450CdD385c8B70e03f9A6bD9E673b` |
+| PositionDescriptor | `0x9639443158E8C5efa35Bd45287bf2EFfd3D8dC06` |
 | Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
-| UniversalRouter | `0x8876789976decbfcbbbe364623c63652db8c0904` |
+| UniversalRouter | `0x8876789976dEcBfCbBbe364623C63652db8C0904` |
 
 Wiring verified on mainnet and testnet:
 
 ```
-cast call 0x58daec3116aae6d93017baaea7749052e8a04fa7 "poolManager()(address)" --rpc-url <rpc>
+cast call 0x58daec3116aae6D93017bAAea7749052E8a04fA7 "poolManager()(address)" --rpc-url <rpc>
 # 0x8366a39CC670B4001A1121B8F6A443A643e40951   (both networks)
-cast call 0x58daec3116aae6d93017baaea7749052e8a04fa7 "permit2()(address)" --rpc-url <mainnet>
+cast call 0x58daec3116aae6D93017bAAea7749052E8a04fA7 "permit2()(address)" --rpc-url <mainnet>
 # 0x000000000022D473030F116dDEE9F6B43aC78BA3
-cast call 0x58daec3116aae6d93017baaea7749052e8a04fa7 "name()(string)" --rpc-url <mainnet>
+cast call 0x58daec3116aae6D93017bAAea7749052E8a04fA7 "name()(string)" --rpc-url <mainnet>
 # "Uniswap v4 Positions NFT"
 ```
 
@@ -80,18 +173,40 @@ Two properties matter for Pledrin:
 2. v4 liquidity positions minted through PositionManager are **ERC-721 tokens**,
    so a position can be transferred to a lock contract and made permanent.
 
+### v4 governance surface
+
+Neither value is referenced by any Pledrin contract. Both are recorded so the
+external governance exposure in `docs/THREAT_MODEL.md` section 9 is auditable
+against a named source rather than an assertion.
+
+| | Mainnet 4663 | Testnet 46630 |
+|---|---|---|
+| `PoolManager.protocolFeeController()` | `0x6d0009504D129CF5002Dba61D9Ae8575AA79314c` | `0x0000000000000000000000000000000000000000` |
+| `PoolManager.owner()` | `0x2BAD8182C09F50c8318d769245beA52C32Be46CD` | `0x9701fb0aDe1E269c8f64Ec0C7b3cfADB31A13A52` |
+
+```
+cast call 0x8366a39CC670B4001A1121B8F6A443A643e40951 "protocolFeeController()(address)" --rpc-url <rpc>
+cast call 0x8366a39CC670B4001A1121B8F6A443A643e40951 "owner()(address)" --rpc-url <rpc>
+```
+
+A protocol fee on a v4 pool is set by the controller and is capped by the
+protocol at a fraction of the pool's swap fee. It reduces what a locked
+position earns; it cannot touch the position itself. The mainnet controller is
+live, so Pledrin's locked positions are exposed to a Uniswap governance
+decision on fee switching, and nothing in Pledrin can or should prevent that.
+
 ## Uniswap v3 — mainnet only
 
 | Contract | Address |
 |---|---|
-| UniswapV3Factory | `0x1f7d7550b1b028f7571e69a784071f0205fd2efa` |
-| NonfungiblePositionManager | `0x73991a25c818bf1f1128deaab1492d45638de0d3` |
-| SwapRouter02 | `0xcaf681a66d020601342297493863e78c959e5cb2` |
-| QuoterV2 | `0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7` |
-| TickLens | `0x7dfd4f31be6814d2906bde155c3e1b146eac1468` |
-| UniswapInterfaceMulticall | `0x282a3c4d320cc7f0d5eaf56b8029e4b88338f0a3` |
-| NonfungibleTokenPositionDescriptor | `0x6f84dae9c064ff453e5c8af51efb819f8f610225` |
-| NFTDescriptor | `0x2e9d45bb7b30549f5216813ada9a6b7982c5b3ed` |
+| UniswapV3Factory | `0x1f7d7550B1b028f7571E69A784071F0205FD2EfA` |
+| NonfungiblePositionManager | `0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3` |
+| SwapRouter02 | `0xCaf681a66D020601342297493863E78C959E5cb2` |
+| QuoterV2 | `0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7` |
+| TickLens | `0x7DfD4F31be6814D2906BDE155c3e1B146EAc1468` |
+| UniswapInterfaceMulticall | `0x282A3C4D320Cc7f0d5eaf56B8029e4B88338f0a3` |
+| NonfungibleTokenPositionDescriptor | `0x6F84dAE9c064ff453E5C8af51EfB819f8f610225` |
+| NFTDescriptor | `0x2E9D45Bb7b30549F5216813aDA9a6b7982C5B3ED` |
 
 Factory identity confirmed by its canonical fee tiers:
 
@@ -110,7 +225,7 @@ testnet.
 ### Wrapped native (v3 only)
 
 ```
-cast call 0x73991a25c818bf1f1128deaab1492d45638de0d3 "WETH9()(address)" --rpc-url <mainnet>
+cast call 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3 "WETH9()(address)" --rpc-url <mainnet>
 # 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73
 ```
 

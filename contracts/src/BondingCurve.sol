@@ -705,6 +705,11 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
         tokensUsed = tokensBefore - token.balanceOf(address(this));
 
         uint256 remainder = PledrinConstants.LP_SUPPLY - tokensUsed;
+        // `tokensUsed` is a delta across the mint and `remainder` is derived from it and a
+        // constant, never from an absolute post-call balance. That is deliberate: it is
+        // what makes a token donation to the curve cancel out instead of reverting
+        // graduation. Verdict in `docs/SECURITY_NOTES.md` section 2.
+        // slither-disable-next-line reentrancy-balance
         if (remainder > PledrinConstants.LP_DUST_MAX) revert LpDustTooHigh(remainder);
 
         // Revoked before the floor position is minted, so that position's funding in

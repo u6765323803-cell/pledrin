@@ -15,21 +15,22 @@ The configuration lives in `contracts/slither.config.json` rather than in CI
 arguments, so a reviewer running the command above analyses the same set of
 contracts with the same detectors as the pipeline.
 
-As of this revision Slither reports **28 findings across 9 detectors** and
-generates an intermediate representation for every function in `src`:
+As of this revision Slither reports **27 findings across 8 detectors**,
+generates an intermediate representation for every function in `src`, and
+`--fail-high` exits **0**:
 
 | Impact | Findings | Detectors |
 |---|---|---|
-| High | 1 | `reentrancy-balance` |
 | Medium | 13 | `unused-return` 9, `divide-before-multiply` 2, `incorrect-equality` 1, `locked-ether` 1 |
 | Low | 13 | `timestamp` 8, `reentrancy-benign` 4, `reentrancy-events` 1 |
 | Informational | 1 | `low-level-calls` |
 
-None is a defect. The one high finding has a written verdict in section 2, and
-it is the reason `--fail-high` exits 255: the flag fails on impact alone and
-cannot be told that a high finding has been reviewed. A permanently red gate is
-an ignored gate, so this will not be left as it stands — the fix belongs in the
-same change that implements it, not in a note here.
+None is a defect. One high-impact finding, `reentrancy-balance`, is carried by an
+inline directive at its single site rather than by a configuration change, so the
+gate still fails on a high finding anywhere else; its verdict is in section 2.
+`--fail-high` fails on impact alone and cannot be told that a finding has been
+reviewed, and a permanently red gate is an ignored gate, so the choice was
+between suppressing the one reviewed site and losing the gate entirely.
 
 ---
 
@@ -148,7 +149,15 @@ Four detectors that appeared in the previous revision are absent from this one �
 described in section 1 and disappeared when the analysis became complete. They
 are not suppressed and not fixed; they were never real.
 
-### reentrancy-balance — high — not a defect
+### reentrancy-balance — high — not a defect, suppressed at the site
+
+Carried by a `slither-disable-next-line reentrancy-balance` directive on the dust
+comparison in `_mintCore`, with a comment there pointing at this verdict. The
+directive is deliberately anchored to that one condition and
+`slither.config.json` is untouched, so the detector still runs everywhere else
+and a second `reentrancy-balance` anywhere in `src` fails the build. Verified
+consumed rather than coincidentally absent: `--warn-unused-ignores` does not
+report this directive as unused.
 
 ```
 Reentrancy in BondingCurve._mintCore(PoolKey,int24):

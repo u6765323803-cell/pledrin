@@ -111,3 +111,36 @@ first pass.
 Blocked on item 8. The team produces the deploy script, the exact command, and a
 deployment checklist; you review and sign from your own wallet. No one else
 signs, and the team never has access to the signing key.
+
+## 10. Decide whether the "Pledged" badge distinguishes bond size — soon
+
+`bondWei` is chosen by the creator at launch, and the contracts treat any
+non-zero bond the same way: the launch is pledged, the creator's fee share
+rises, and the bond is forfeitable. A bond of 0.01 ETH therefore earns the same
+badge as a bond of 10 ETH.
+
+That is a product decision rather than a contract defect, and it is the weakest
+point in the protocol's main claim. The bond is what makes "skin in the game"
+literal; a badge that does not distinguish size lets a creator buy the signal
+for almost nothing, and once buyers notice, the badge stops carrying
+information for the creators who posted a real bond.
+
+Options, none of which needs a contract change except the last:
+
+- Show the bond amount next to the badge and let buyers judge. Costs nothing
+  and keeps the contracts as they are, but puts the work on the buyer.
+- Show the bond relative to something — the ETH raised so far, or the creator's
+  own first buy — so the number means something without the buyer doing
+  arithmetic.
+- Band the badge in the interface only, by bond size. Still no contract change.
+- Set a minimum bond for the badge in the contracts. This one is a contract
+  change and a new deploy parameter, so it has to be decided before the
+  contracts are reviewed and frozen rather than after.
+
+My recommendation is the second option with the fourth held in reserve: display
+the bond relative to the ETH raised, and keep a minimum out of the contracts
+until there is real usage to set it from. A minimum chosen now would be a guess
+baked into an immutable parameter.
+
+Needed before the web application designs the launch card, and before the
+testnet deploy parameters are fixed if you want the fourth option.

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity 0.8.38;
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 import {BondingCurve} from "src/BondingCurve.sol";
 import {ICreatorVesting} from "src/interfaces/ICreatorVesting.sol";
 
@@ -119,5 +121,41 @@ contract ProbeFactory is StateSnapshotter {
 
     function recordSnapshot() external view returns (CurveSnapshot memory) {
         return lastRecord;
+    }
+}
+
+/// @notice Pushes ERC-20 tokens it already holds into an arbitrary address on demand.
+/// @dev Fault injection, used as a `MockPositionManager` probe target to make a launch's
+/// token balance *rise* in the middle of the graduation mint — between the reading
+/// `BondingCurve._mintCore` takes before `modifyLiquidities` and the one it takes after.
+/// Nothing in the real system can do that, which is the point: the delta the mint is
+/// measured by then underflows, and the test using this asserts that the graduation fails
+/// closed rather than mismeasuring what the mint consumed.
+contract TokenPusher {
+    function push(IERC20 token, address to, uint256 amount) external {
+        require(token.transfer(to, amount), "TokenPusher: transfer failed");
+    }
+}
+
+/// @notice Records an ERC-20 allowance every time it is asked to, keeping the whole series.
+/// @dev Used as a `MockPositionManager` probe target to read `token.allowance(curve, PERMIT2)`
+/// from *inside* `modifyLiquidities`. A graduation makes two such calls — the core mint and
+/// the floor mint — and the series is what shows the approval exists during the first and is
+/// already revoked by the second, which is the ordering `docs/SPEC.md` section 8.2 step 4
+/// requires and Invariant 61 rests on. `MockPositionManager.probeReturn` holds only the last
+/// call's return data, so a watcher that accumulates is needed to see both.
+contract AllowanceWatcher {
+    uint256[] private _readings;
+
+    function record(IERC20 token, address owner, address spender) external {
+        _readings.push(token.allowance(owner, spender));
+    }
+
+    function count() external view returns (uint256) {
+        return _readings.length;
+    }
+
+    function reading(uint256 index) external view returns (uint256) {
+        return _readings[index];
     }
 }

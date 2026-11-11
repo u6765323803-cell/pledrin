@@ -34,7 +34,11 @@ import {ILiquidityLock} from "./interfaces/ILiquidityLock.sol";
 /// compounding, which Uniswap v4 routes to the position's own owner — this contract — and
 /// which stays here permanently. No address can receive value from this contract.
 contract LiquidityLock is ILiquidityLock, IERC721Receiver, ReentrancyGuardTransient {
-    using SafeCast for uint256;
+    // The cast names its function instead of attaching the whole library, because Uniswap
+    // v4-core declares a second library called `SafeCast` and both reach this file through
+    // the imports above. Naming it binds the cast below to OpenZeppelin's implementation at
+    // the attachment site rather than leaving a reader to work out which one applies.
+    using {SafeCast.toUint8} for uint256;
 
     /// @notice Uniswap v4 PositionManager, the only contract that may send this lock a
     /// position and the only contract this lock ever calls.

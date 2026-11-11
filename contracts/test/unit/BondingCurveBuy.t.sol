@@ -63,7 +63,9 @@ contract BondingCurveBuyTest is PledrinTestBase {
             CurveMath.splitFee(fee, UNPLEDGED_CREATOR_BPS, UNPLEDGED_PROTOCOL_BPS);
 
         vm.expectEmit(true, true, false, true, address(curve));
-        emit IBondingCurve.FeeAccrued(address(curve), creatorCut, protocolCut, protectionCut);
+        // A buy only runs in `Live`, where every bucket still has a payout path, so
+        // `reserveCut` is zero and the three cuts carry the whole fee.
+        emit IBondingCurve.FeeAccrued(address(curve), creatorCut, protocolCut, protectionCut, 0);
         vm.expectEmit(true, true, false, true, address(curve));
         emit IBondingCurve.Bought(
             address(curve), TRADER, 1 ether, ethToCurve, tokensOut, fee, 0, tokensOut, ethToCurve

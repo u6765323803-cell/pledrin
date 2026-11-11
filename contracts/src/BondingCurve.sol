@@ -44,8 +44,19 @@ import {TickAlign} from "./libraries/TickAlign.sol";
 /// makes the curve solvent against every sell it will accept (Invariant 2).
 contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransient {
     using BalanceDeltaLibrary for BalanceDelta;
-    using SafeCast for int256;
-    using SafeCast for uint256;
+    // The casts name their functions instead of attaching the whole library, because
+    // Uniswap v4-core declares a second library called `SafeCast` and both reach this file
+    // through the imports above. Naming them binds every cast below to OpenZeppelin's
+    // implementation at the attachment site, for a reader and for a static analyser alike,
+    // and makes any future cast an explicit addition to this list.
+    using {SafeCast.toInt24} for int256;
+    using {
+        SafeCast.toInt256,
+        SafeCast.toUint8,
+        SafeCast.toUint64,
+        SafeCast.toUint128,
+        SafeCast.toUint160
+    } for uint256;
     using StateLibrary for IPoolManager;
 
     /// @notice The factory that deployed this launch and holds its reputation counters.
@@ -264,11 +275,11 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
         if (ethGross == 0 || out == 0) revert ZeroAmount();
         if (out < minEthOut) revert SlippageExceeded(out, minEthOut);
 
-        uint128 reserveAfter = ethReserve - ethGross.toUint128();
+        uint128 feeToReserve = _accrueFee(fee, current);
+        uint128 reserveAfter = ethReserve - ethGross.toUint128() + feeToReserve;
         uint128 soldAfter = sold - tokensIn.toUint128();
         ethReserve = reserveAfter;
         tokensSold = soldAfter;
-        _accrueFee(fee);
 
         emit Sold(address(this), msg.sender, tokensIn, ethGross, out, fee, soldAfter, reserveAfter);
 
@@ -527,7 +538,9 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
         uint128 soldAfter = sold + tokensOut.toUint128();
         ethReserve = reserveAfter;
         tokensSold = soldAfter;
-        _accrueFee(fee);
+        // Every share has a payout path while the launch is `Live`, which is the only
+        // state this body runs in, so the split redirects nothing here.
+        _accrueFee(fee, State.Live);
 
         emit Bought(
             address(this), buyer, value, ethToCurve, tokensOut, fee, refund, soldAfter, reserveAfter
@@ -540,17 +553,45 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
         }
     }
 
-    /// @dev Splits one trade's fee three ways and accrues each part. The holder-protection
-    /// share is the residual, so the three parts sum to `fee` exactly (Invariants 14, 17).
-    function _accrueFee(uint256 fee) private {
+    /// @dev Splits one trade's fee three ways and accrues each share that still has a
+    /// payout path. The holder-protection share is the residual, so the three parts sum to
+    /// `fee` exactly (Invariants 14, 17).
+    ///
+    /// Two of the three destinations close for good at a terminal transition, while `sell`
+    /// stays open in both terminal states and keeps charging the fee. The protection
+    /// bucket has no claim function at all and is distributed only by the transition
+    /// itself, which has already happened; `claimCreatorFees` reverts in `Expired`. A
+    /// share accrued into either bucket after that point could never leave this contract,
+    /// so it is reported to the caller for the reserve instead: holder protection is for
+    /// holders, and the reserve is what holders sell against. `Stalled` keeps the
+    /// creator's claim open, so only the protection share moves there, and the protocol
+    /// share keeps its path in every state.
+    ///
+    /// Adding wei to the reserve only raises `(vE0 + ethReserve) * (vT0 - tokensSold)`, so
+    /// Invariant 1 is unaffected.
+    /// @param fee The trade's fee in wei.
+    /// @param current The state the trade is executing in.
+    /// @return feeToReserve Wei the caller adds to `ethReserve` instead of to a bucket. It
+    /// is emitted as `FeeAccrued.reserveCut`, so that event's four amounts sum to the
+    /// trade's fee in every state and a reader never has to infer a destination.
+    function _accrueFee(uint256 fee, State current) private returns (uint128 feeToReserve) {
         (uint256 creatorCut, uint256 protocolCut, uint256 protectionCut) =
             CurveMath.splitFee(fee, creatorShareBps, protocolShareBps);
+
+        if (current == State.Expired) {
+            feeToReserve = (creatorCut + protectionCut).toUint128();
+            creatorCut = 0;
+            protectionCut = 0;
+        } else if (current == State.Stalled) {
+            feeToReserve = protectionCut.toUint128();
+            protectionCut = 0;
+        }
 
         creatorFeeEth += creatorCut.toUint128();
         protocolFeeEth += protocolCut.toUint128();
         protectionEth += protectionCut.toUint128();
 
-        emit FeeAccrued(address(this), creatorCut, protocolCut, protectionCut);
+        emit FeeAccrued(address(this), creatorCut, protocolCut, protectionCut, feeToReserve);
     }
 
     /// @dev The graduation procedure of `docs/SPEC.md` section 8.2, shared by `graduate`

@@ -105,9 +105,18 @@ interface IBondingCurve {
         uint256 ethReserve
     );
 
-    /// @notice A trade's fee was split across the three buckets.
+    /// @notice A trade's fee was split and accrued, one amount per destination. The four
+    /// amounts always sum to the trade's fee, in every state, so the split reconciles from
+    /// this log alone. `reserveCut` is the part of the fee whose bucket has no payout path
+    /// left in the launch's state — the creator's share in `Expired`, the holder-protection
+    /// share in either terminal state — and which was added to `ethReserve` instead. It is
+    /// zero on every `Live` trade.
     event FeeAccrued(
-        address indexed launch, uint256 creatorCut, uint256 protocolCut, uint256 protectionCut
+        address indexed launch,
+        uint256 creatorCut,
+        uint256 protocolCut,
+        uint256 protectionCut,
+        uint256 reserveCut
     );
 
     /// @notice ETH was donated to the curve, raising every holder's exit price.

@@ -59,7 +59,10 @@ library PledrinConstants {
     /// @notice Smallest tick spacing `graduateAlt` accepts.
     int24 internal constant ALT_TICK_SPACING_MIN = 10;
     /// @notice Largest tick spacing `graduateAlt` accepts.
-    int24 internal constant ALT_TICK_SPACING_MAX = 200;
+    /// @dev Strictly below `POOL_TICK_SPACING`, so the alternate key is always a different
+    /// pool than the one the launch transaction initialised. At 200 the "alternative" pool
+    /// key would be the canonical pool key, which is the one key `graduate` exists for.
+    int24 internal constant ALT_TICK_SPACING_MAX = 199;
     /// @notice Width of the holder-protection band, counted upward in tick terms.
     int24 internal constant FLOOR_RANGE_TICKS = 13_800;
     /// @notice De-minimis threshold below which the floor position is not minted.

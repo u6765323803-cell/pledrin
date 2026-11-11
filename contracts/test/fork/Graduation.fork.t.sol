@@ -245,6 +245,76 @@ contract GraduationForkTest is ForkBase {
         );
     }
 
+    /// @notice **Invariant 60 on the real PositionManager.** A launch-token donation of any
+    /// size, made by an ordinary holder before `graduate()`, changes nothing about the
+    /// graduation: the same position id, the same ETH and token consumed, the same floor
+    /// funding, and the donation still sitting in the curve afterwards.
+    /// @dev A differential test, run twice from the same forked state: once untouched, then
+    /// rolled back and again with the donation in place. Asserting a single donated
+    /// graduation would prove nothing, because the implementation this guards against — one
+    /// absolute `token.balanceOf` after the mint in place of the delta across it — fails
+    /// only by *comparison* with the undonated run. `D` here is 5,000 whole tokens, five
+    /// hundred million times `LP_DUST_MAX`, so the post-mint balance the broken version
+    /// would have measured is far outside the dust bound and would have reverted the
+    /// graduation outright. `test/unit/BondingCurveDonationNeutrality.t.sol` fuzzes `D`
+    /// across the whole donatable range; this is the same property against the real mint.
+    function test_aTokenDonationChangesNothingAboutTheRealGraduationMint() public {
+        (BondingCurve curve, IERC20 token) = createLaunch(defaultParams());
+        buyToCap(curve);
+
+        uint256 donation = 5000e18;
+        uint256 coreId = POSITION_MANAGER.nextTokenId();
+        uint256 snapshot = vm.snapshotState();
+
+        vm.prank(TRADER);
+        curve.graduate();
+        uint128 baselineLiquidity = POSITION_MANAGER.getPositionLiquidity(coreId);
+        uint128 baselineFloorLiquidity = POSITION_MANAGER.getPositionLiquidity(coreId + 1);
+        uint256 baselineDust = token.balanceOf(address(curve));
+        uint256 baselineEthToPool = address(POOL_MANAGER).balance;
+
+        assertTrue(vm.revertToState(snapshot), "the pre-graduation state was restored");
+        assertEq(
+            token.balanceOf(address(curve)),
+            PledrinConstants.LP_SUPPLY,
+            "back at the cap holding exactly the LP allocation"
+        );
+
+        vm.prank(TRADER);
+        token.transfer(address(curve), donation);
+        vm.prank(TRADER);
+        curve.graduate();
+
+        assertEq(
+            POSITION_MANAGER.getPositionLiquidity(coreId),
+            baselineLiquidity,
+            "Invariant 60: the core position is identical"
+        );
+        assertEq(
+            POSITION_MANAGER.getPositionLiquidity(coreId + 1),
+            baselineFloorLiquidity,
+            "Invariant 60: and so is the floor position"
+        );
+        assertEq(
+            address(POOL_MANAGER).balance,
+            baselineEthToPool,
+            "Invariant 60: the same ETH reached the pool"
+        );
+        assertEq(
+            token.balanceOf(address(curve)),
+            baselineDust + donation,
+            "Invariant 60: the donation is still held by the curve"
+        );
+        assertEq(baselineDust, 1088, "the measured core-mint dust is unchanged by all of this");
+        assertGt(
+            token.balanceOf(address(curve)),
+            PledrinConstants.LP_DUST_MAX,
+            "an absolute post-mint balance read would have reverted this graduation"
+        );
+        assertEq(ownerOfPosition(coreId), address(lock), "both positions are still locked");
+        assertEq(ownerOfPosition(coreId + 1), address(lock), "both positions are still locked");
+    }
+
     /// @notice **Invariants 40 and 41.** A griefer moves the price of the empty pool; the
     /// graduation restores it with a swap that settles for nothing and then mints.
     /// @dev The grief is performed through the real PoolManager, so the restoration is the
@@ -301,9 +371,11 @@ contract GraduationForkTest is ForkBase {
         curve.graduateAlt(9);
         vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 201));
         curve.graduateAlt(201);
-        // The primary key is already initialised, so the primary spacing is unavailable.
-        vm.expectRevert(IBondingCurve.AltPoolInitialized.selector);
-        curve.graduateAlt(200);
+        // The primary spacing is outside the alternate window, which stops at 199, so the
+        // range check rejects it before the pool-state check is reached. The alternate key
+        // can therefore never be the canonical key the launch transaction initialised.
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 200));
+        curve.graduateAlt(uint24(int24(PledrinConstants.POOL_TICK_SPACING)));
 
         uint256 coreId = POSITION_MANAGER.nextTokenId();
         curve.graduateAlt(100);

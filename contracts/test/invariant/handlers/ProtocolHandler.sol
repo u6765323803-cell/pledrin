@@ -11,6 +11,7 @@ import {BondingCurve} from "src/BondingCurve.sol";
 import {LaunchFactory} from "src/LaunchFactory.sol";
 import {IBondingCurve} from "src/interfaces/IBondingCurve.sol";
 import {ILaunchFactory} from "src/interfaces/ILaunchFactory.sol";
+import {CurveMath} from "src/libraries/CurveMath.sol";
 import {PledrinConstants} from "src/libraries/PledrinConstants.sol";
 
 import {Actor} from "./Actor.sol";
@@ -44,11 +45,9 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
     /// @notice Every wei a launch has ever paid out of its three fee buckets.
     mapping(address launch => uint256) public feePaidOut;
     /// @notice Fee a launch charged by a sell made *after* it reached a terminal state.
-    /// @dev Tracked separately because where that fee ends up is changing: two of the three
-    /// shares accrued this way currently have no payout path, and they are being redirected
-    /// into `ethReserve`. Keeping the figure separate lets the fee invariants assert what is
-    /// true under either behaviour, and lets the stronger equality be extended to terminal
-    /// launches once the redirection lands.
+    /// @dev Kept separate because this is the fee section 6.3 redirects part of, so it is
+    /// the ceiling the redirect is checked against: no more can be sent to `ethReserve`
+    /// than was charged after terminality.
     mapping(address launch => uint256) public feeChargedAfterTerminal;
     /// @notice Bond wei a launch has paid to its creator.
     mapping(address launch => uint256) public bondPaidOut;
@@ -68,17 +67,50 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
     /// @notice The terminal state a launch reached, and whether it has reached one.
     mapping(address launch => IBondingCurve.State) public terminalState;
     mapping(address launch => bool) public isTerminal;
-    /// @notice Fee wei a launch moved out of its buckets into its own `ethReserve`, which
-    /// is what the forfeiture on `expire` and the donation on `abortGraduation` do.
+    /// @notice Fee wei a launch moved out of its buckets, or past them, into its own
+    /// `ethReserve`. Three things do this: the forfeiture on `expire`, the donation on
+    /// `abortGraduation`, and section 6.3's per-trade redirect on every sell accepted in a
+    /// terminal state.
     mapping(address launch => uint256) public feeToReserve;
     /// @notice Holder-protection wei a launch deposited into its floor position at
     /// graduation, which is the other way fee ETH leaves the buckets.
     mapping(address launch => uint256) public protectionToFloor;
 
+    /// @dev What every post-terminal trade on one launch did with its fee: what section
+    /// 6.3's table says each bucket should have received, what each bucket actually
+    /// received, and the two reserve figures the fold is checked with. Invariant 59 is the
+    /// comparison of the expected columns against the observed ones, so the two are
+    /// accumulated separately and never from each other.
+    struct TerminalFees {
+        uint256 redirected;
+        uint256 creatorExpected;
+        uint256 protocolExpected;
+        uint256 creatorToBucket;
+        uint256 protocolToBucket;
+        uint256 protectionToBucket;
+        uint256 gross;
+        uint256 reserveDecrease;
+        uint256 trades;
+    }
+
+    mapping(address launch => TerminalFees) internal terminalFees;
+
+    /// @dev The four balances a fee can move between, snapshotted either side of a trade.
+    struct Balances {
+        uint256 creator;
+        uint256 protocol;
+        uint256 protection;
+        uint256 reserve;
+    }
+
     // --- Call counters, reported by the invariant tests ---
 
     uint256 public buys;
     uint256 public sells;
+    /// @notice Sells the run landed in `Expired` or `Stalled`, which is the only kind of
+    /// trade section 6.3 redirects anything on. Reported so that a green Invariant 59 cannot
+    /// be a run that never charged a fee in a terminal state.
+    uint256 public postTerminalSells;
     uint256 public donations;
     uint256 public graduations;
     uint256 public stalls;
@@ -113,14 +145,30 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         return launches[index];
     }
 
+    /// @notice Everything the run observed about fees charged after a terminal transition,
+    /// which is what Invariant 59 is asserted against.
+    function terminalFeesOf(address launch) external view returns (TerminalFees memory) {
+        return terminalFees[launch];
+    }
+
     // ------------------------------------------------------------------
     // Trading
     // ------------------------------------------------------------------
 
+    /// @notice An ordinary buy, bounded so that it cannot reach the cap on its own.
+    /// @dev The bound is a quarter of the raise rather than a multiple of it. A value above
+    /// the target takes the clipped branch of `CurveMath.buyQuote` and caps the launch in one
+    /// call, which is what `buyToCap` is for; drawing ordinary buys from that range instead
+    /// capped every launch within a few calls, left all eight out of `Live` with the array
+    /// full, and spent the rest of the run being refused. A run that cannot buy cannot sell
+    /// either, because an actor can only sell tokens a buy gave it, so the sell side and
+    /// everything downstream of it — the post-terminal fee redirect especially — went
+    /// untested. The clipped branch itself is covered by `buyToCap` and by the boundary
+    /// cases in `test/unit/BondingCurveBuy.t.sol`.
     function buy(uint256 launchSeed, uint256 actorSeed, uint256 value) external {
         BondingCurve curve = _liveLaunch(launchSeed);
         Actor actor = _actor(actorSeed);
-        value = bound(value, PledrinConstants.MIN_BUY_WEI, 4 * uint256(curve.ethTarget()));
+        value = bound(value, PledrinConstants.MIN_BUY_WEI, uint256(curve.ethTarget()) / 4);
         if (address(actor).balance < value) return;
 
         (,, uint256 fee,) = curve.quoteBuy(value);
@@ -157,16 +205,33 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
 
     function sell(uint256 launchSeed, uint256 actorSeed, uint256 amount) external {
         Actor actor = _actor(actorSeed);
-        BondingCurve curve = _sellableLaunch(launchSeed, actor);
+        _sell(_sellableLaunch(launchSeed, actor), actor, amount);
+    }
+
+    /// @notice A sell aimed at a launch that has already reached `Expired` or `Stalled`,
+    /// which is the only kind of trade section 6.3 redirects a fee share on.
+    /// @dev Here for the same reason `buyToCap` is: `sell` reaches a terminal launch only by
+    /// coincidence — the actor has to be holding the token of a launch that happens to have
+    /// expired or stalled — and Invariant 59 asserted over a handful of trades per campaign
+    /// would be a weak test of the one branch of `_accrueFee` that can strand ETH.
+    function sellInTerminalState(uint256 launchSeed, uint256 actorSeed, uint256 amount) external {
+        Actor actor = _actor(actorSeed);
+        BondingCurve curve = _terminalLaunchHeldBy(launchSeed, actor);
+        if (address(curve) == address(0)) return;
+        _sell(curve, actor, amount);
+    }
+
+    function _sell(BondingCurve curve, Actor actor, uint256 amount) private {
         IERC20 token = curve.token();
 
         uint256 held = token.balanceOf(address(actor));
         if (held == 0) return;
         amount = bound(amount, 1, held);
 
-        (, uint256 fee,) = curve.quoteSell(amount);
+        (uint256 ethGross, uint256 fee,) = curve.quoteSell(amount);
         actor.approve(token, address(curve), amount);
         _snapshotLiveness(curve);
+        Balances memory before = _balances(curve);
         (bool ok,) = actor.execute(
             address(curve), 0, abi.encodeCall(IBondingCurve.sell, (amount, 0, block.timestamp))
         );
@@ -174,6 +239,7 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
 
         sells++;
         _recordFee(curve, fee);
+        _recordTerminalTradeFee(curve, fee, ethGross, before);
         _observe(curve);
     }
 
@@ -214,7 +280,16 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
     function graduateAlt(uint256 launchSeed, uint256 actorSeed, uint24 spacing) external {
         BondingCurve curve = _launch(launchSeed);
         Actor actor = _actor(actorSeed);
-        spacing = uint24(bound(spacing, 10, 200));
+        // The permitted window is `[10, 199]`: 200 is `POOL_TICK_SPACING`, which the range
+        // check rejects, so bounding to it would have made every such draw a silent refusal
+        // on the one function whose whole point is to reach a *different* pool key.
+        spacing = uint24(
+            bound(
+                spacing,
+                uint24(int24(PledrinConstants.ALT_TICK_SPACING_MIN)),
+                uint24(int24(PledrinConstants.ALT_TICK_SPACING_MAX))
+            )
+        );
 
         uint256 protection = curve.protectionEth();
         _snapshotLiveness(curve);
@@ -492,6 +567,20 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         return launches[seed % n];
     }
 
+    /// @dev The first launch at or after `seed` that is in a terminal state the curve still
+    /// trades in and whose token this actor holds, or the zero address if there is none.
+    function _terminalLaunchHeldBy(uint256 seed, Actor actor) private view returns (BondingCurve) {
+        uint256 n = launches.length;
+        for (uint256 i = 0; i < n; i++) {
+            BondingCurve candidate = launches[(seed % n + i) % n];
+            IBondingCurve.State current = candidate.state();
+            bool terminal =
+                current == IBondingCurve.State.Expired || current == IBondingCurve.State.Stalled;
+            if (terminal && candidate.token().balanceOf(address(actor)) != 0) return candidate;
+        }
+        return BondingCurve(payable(address(0)));
+    }
+
     function _actor(uint256 seed) private view returns (Actor) {
         return actors[seed % actors.length];
     }
@@ -512,6 +601,54 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         ) {
             feeChargedAfterTerminal[address(curve)] += fee;
         }
+    }
+
+    /// @dev Section 6.3's destinations for one trade, recorded both as what the table
+    /// predicts and as what the launch's own storage did, so Invariant 59 can be asserted
+    /// as the equality of the two rather than as a restatement of the table.
+    ///
+    /// The state used is the one snapshotted immediately before the call: `sell` never
+    /// transitions a launch, so it is the state the fee was charged in. A post-terminal sell
+    /// always lowers the reserve — the redirect is at most the fee and the fee is strictly
+    /// less than the gross — so the decrease below cannot underflow.
+    function _recordTerminalTradeFee(
+        BondingCurve curve,
+        uint256 fee,
+        uint256 ethGross,
+        Balances memory before
+    ) private {
+        address launch = address(curve);
+        IBondingCurve.State charged = lastState[launch];
+        bool expired = charged == IBondingCurve.State.Expired;
+        if (!expired && charged != IBondingCurve.State.Stalled) return;
+
+        (uint256 creatorCut, uint256 protocolCut, uint256 protectionCut) =
+            CurveMath.splitFee(fee, curve.creatorShareBps(), curve.protocolShareBps());
+
+        postTerminalSells++;
+        TerminalFees storage ghost = terminalFees[launch];
+        ghost.trades++;
+        ghost.redirected += expired ? creatorCut + protectionCut : protectionCut;
+        ghost.creatorExpected += expired ? 0 : creatorCut;
+        ghost.protocolExpected += protocolCut;
+        ghost.gross += ethGross;
+
+        Balances memory now_ = _balances(curve);
+        ghost.creatorToBucket += now_.creator - before.creator;
+        ghost.protocolToBucket += now_.protocol - before.protocol;
+        ghost.protectionToBucket += now_.protection - before.protection;
+        ghost.reserveDecrease += before.reserve - now_.reserve;
+
+        feeToReserve[launch] += expired ? creatorCut + protectionCut : protectionCut;
+    }
+
+    function _balances(BondingCurve curve) private view returns (Balances memory) {
+        return Balances({
+            creator: curve.creatorFeeEth(),
+            protocol: curve.protocolFeeEth(),
+            protection: curve.protectionEth(),
+            reserve: curve.ethReserve()
+        });
     }
 
     function _recordBondExit(BondingCurve curve) private {

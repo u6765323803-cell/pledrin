@@ -10,9 +10,11 @@ import {PledrinConstants} from "src/libraries/PledrinConstants.sol";
 import {InvariantBase} from "./InvariantBase.sol";
 
 /// @title Curve solvency, as an invariant
-/// @notice **Invariants 1 and 2, the two the specification marks mandatory**, plus
-/// Invariants 3, 5, 6 and 13, asserted after every call of a random interleaving of buys,
-/// sells, donations, graduations, stalls, expiries, claims and the passage of time.
+/// @notice **Invariants 1 and 2, the first two of the four the specification marks
+/// mandatory** — the four are 1, 2, 14 and 25, and `FeeSplit.invariant.t.sol` covers 14
+/// while `BondAndLifecycle.invariant.t.sol` covers 25 — plus Invariants 3, 5, 6 and 13,
+/// asserted after every call of a random interleaving of buys, sells, donations,
+/// graduations, stalls, expiries, claims and the passage of time.
 /// @dev Invariant 2 is asserted in its strongest form: the gross for `dT == tokensSold` —
 /// one seller selling every token the curve ever sold — must be payable out of
 /// `ethReserve`, and so must the gross for the interior sizes a real seller would pick.
@@ -20,7 +22,7 @@ import {InvariantBase} from "./InvariantBase.sol";
 /// Both are asserted for every state except `Graduated`, and that exclusion is a finding
 /// rather than a convenience. `docs/SPEC.md` states Invariant 1 "for every launch in every
 /// state", but `graduate` deposits the whole reserve into the two locked positions and
-/// sets `ethReserve` to zero (section 8.2 step 7, Invariant 43), which leaves the product
+/// sets `ethReserve` to zero (section 8.2 step 6, Invariant 43), which leaves the product
 /// at `vE0 * (vT0 - CURVE_SUPPLY) == vE0 * vT0 / 9`. The invariant cannot hold there and
 /// does not need to: graduation closes both sides of the book in the same transaction, so
 /// there is no sell left to be solvent against. The reports note the wording.

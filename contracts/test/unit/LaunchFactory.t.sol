@@ -3,6 +3,7 @@ pragma solidity 0.8.38;
 
 import {Vm} from "forge-std/Vm.sol";
 
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
@@ -420,6 +421,82 @@ contract LaunchFactoryTest is PledrinTestBase {
         vm.expectRevert(ILaunchFactory.InvalidTreasury.selector);
         timelock.execute(address(factory), data, bytes32(0));
         assertEq(factory.protocolTreasury(), TREASURY, "unchanged");
+    }
+
+    /// @notice **Section 14's fourth power, and the one the factory does not have.**
+    /// `transferOwnership` reverts `OwnershipTransferDisabled` for every caller and every
+    /// argument, including through the timelock that owns the factory.
+    /// @dev This is what makes "the factory's owner is the timelock, permanently" a property
+    /// of the code. The override is `pure`, so it refuses before `Ownable`'s own owner check
+    /// ever runs — a non-owner gets this error rather than `OwnableUnauthorizedAccount`,
+    /// which is asserted below because the two are easy to confuse when reading a trace.
+    /// The path that matters is the timelock one: a transfer executed through the timelock
+    /// could seat an EOA as owner, and every later configuration change would then skip the
+    /// `TIMELOCK_DELAY` that Invariant 51 promises.
+    function test_ownershipCanNeverBeTransferred() public {
+        assertEq(factory.owner(), address(timelock), "the timelock owns the factory");
+
+        vm.prank(OTHER);
+        vm.expectRevert(ILaunchFactory.OwnershipTransferDisabled.selector);
+        factory.transferOwnership(OTHER);
+
+        vm.prank(address(timelock));
+        vm.expectRevert(ILaunchFactory.OwnershipTransferDisabled.selector);
+        factory.transferOwnership(ADMIN);
+
+        vm.prank(ADMIN);
+        vm.expectRevert(ILaunchFactory.OwnershipTransferDisabled.selector);
+        factory.transferOwnership(address(0));
+
+        // Through the timelock, with the delay served: the inner revert is what the
+        // execution bubbles, so the operation is spent and ownership has not moved.
+        bytes memory data = abi.encodeCall(Ownable.transferOwnership, (ADMIN));
+        vm.prank(ADMIN);
+        bytes32 id = timelock.propose(address(factory), data, bytes32("transfer"));
+        vm.warp(timelock.readyAt(id));
+        vm.prank(ADMIN);
+        vm.expectRevert(ILaunchFactory.OwnershipTransferDisabled.selector);
+        timelock.execute(address(factory), data, bytes32("transfer"));
+
+        assertEq(factory.owner(), address(timelock), "ownership never moved");
+    }
+
+    /// @notice `renounceOwnership` is deliberately left working, because it only ever
+    /// reduces power: it is how decision 3 option C — no owner at all — is taken after
+    /// deployment, and it is irreversible once taken.
+    /// @dev The two halves are both asserted: it is reachable only through the timelock and
+    /// its delay, and after it the three configuration powers are gone for good while every
+    /// launch keeps trading. `transferOwnership` still reverts with its own error rather
+    /// than becoming a way back in.
+    function test_renouncingOwnershipWorksOnceAndEndsEveryConfigPower() public {
+        (BondingCurve curve,) = createDefaultLaunch();
+
+        vm.prank(OTHER);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, OTHER));
+        factory.renounceOwnership();
+
+        executeAfterDelay(
+            address(factory), abi.encodeCall(Ownable.renounceOwnership, ()), bytes32("renounce")
+        );
+        assertEq(factory.owner(), address(0), "the factory has no owner");
+
+        bytes memory pause = abi.encodeCall(LaunchFactory.setLaunchesPaused, (true));
+        vm.prank(ADMIN);
+        bytes32 id = timelock.propose(address(factory), pause, bytes32("after"));
+        vm.warp(timelock.readyAt(id));
+        vm.prank(ADMIN);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(timelock))
+        );
+        timelock.execute(address(factory), pause, bytes32("after"));
+        assertFalse(factory.launchesPaused(), "the pause never took effect");
+
+        vm.prank(ADMIN);
+        vm.expectRevert(ILaunchFactory.OwnershipTransferDisabled.selector);
+        factory.transferOwnership(ADMIN);
+
+        // Invariant 52: losing the owner costs a launch nothing.
+        assertGt(buy(curve, TRADER, 1 ether), 0, "the launches trade on regardless");
     }
 
     /// @notice The constructor refuses a zero dependency and a zero treasury.

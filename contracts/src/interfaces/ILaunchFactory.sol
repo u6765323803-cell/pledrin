@@ -157,6 +157,8 @@ interface ILaunchFactory {
     error InvalidDependency();
     /// @notice Only a curve this factory deployed may call this.
     error NotLaunch();
+    /// @notice Ownership of the factory can only be renounced, never transferred.
+    error OwnershipTransferDisabled();
     /// @notice Creates a launch: token, curve, pool and optional bond and first buy.
     /// @param params The creator's choices for this launch.
     /// @return launch The launch's bonding curve.

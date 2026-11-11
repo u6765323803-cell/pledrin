@@ -238,6 +238,18 @@ contract LaunchFactory is ILaunchFactory, Ownable, ReentrancyGuardTransient {
         _setProtocolTreasury(treasury);
     }
 
+    /// @notice Disabled: this factory's ownership can never move to another address.
+    /// @dev `Ownable` declares this function and the four configuration powers of
+    /// `docs/SPEC.md` section 14 sit behind a timelock. A `transferOwnership` executed
+    /// through that timelock could put ownership in an EOA, which would remove the delay
+    /// from every subsequent configuration change and quietly void the guarantee section 14
+    /// exists to make. Overriding it to revert makes "the owner is the timelock,
+    /// permanently" a property of the code rather than a promise. `renounceOwnership` is
+    /// deliberately left working, because it only ever reduces power.
+    function transferOwnership(address) public pure override {
+        revert OwnershipTransferDisabled();
+    }
+
     /// @inheritdoc ILaunchFactory
     function feeConfig() external view returns (FeeConfig memory config) {
         return _feeConfig;

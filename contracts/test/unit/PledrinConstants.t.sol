@@ -141,7 +141,7 @@ contract PledrinConstantsTest is Test {
     }
 
     /// @notice The same bound by fuzz, including the headroom the floor position needs
-    /// above the terminal tick. This is the assertion in section 8.2 step 6 that
+    /// above the terminal tick. This is the assertion in section 8.2 step 8 that
     /// `tickUpper <= alignDown(MAX_TICK, tickSpacing)` can never fire.
     function testFuzz_terminalTickLeavesRoomForTheFloorBand(uint128 vE0) public pure {
         vE0 = uint128(
@@ -207,7 +207,7 @@ contract PledrinConstantsTest is Test {
         assertEq(PledrinConstants.POOL_FEE, 10_000, "POOL_FEE");
         assertEq(PledrinConstants.POOL_TICK_SPACING, 200, "POOL_TICK_SPACING");
         assertEq(PledrinConstants.ALT_TICK_SPACING_MIN, 10, "ALT_TICK_SPACING_MIN");
-        assertEq(PledrinConstants.ALT_TICK_SPACING_MAX, 200, "ALT_TICK_SPACING_MAX");
+        assertEq(PledrinConstants.ALT_TICK_SPACING_MAX, 199, "ALT_TICK_SPACING_MAX");
         assertEq(PledrinConstants.FLOOR_RANGE_TICKS, 13_800, "FLOOR_RANGE_TICKS");
         assertEq(PledrinConstants.MIN_FLOOR_WEI, 10 ** 12, "MIN_FLOOR_WEI");
         assertEq(PledrinConstants.MIN_BOND_WEI, 10 ** 16, "MIN_BOND_WEI");
@@ -223,6 +223,36 @@ contract PledrinConstantsTest is Test {
         assertEq(PledrinConstants.MAX_VEST_DURATION, 126_144_000, "MAX_VEST_DURATION");
         assertEq(PledrinConstants.MAX_NAME_BYTES, 64, "MAX_NAME_BYTES");
         assertEq(PledrinConstants.MAX_SYMBOL_BYTES, 16, "MAX_SYMBOL_BYTES");
+    }
+
+    /// @notice The alternate tick-spacing window is a band strictly below the canonical
+    /// spacing, which is the property that makes `graduateAlt` an escape hatch rather than
+    /// a second route to the pool `graduate` owns.
+    /// @dev Pinning the relationship, not just the literal 199: a pool key is identified by
+    /// its currencies, fee and tick spacing, so an alternate spacing equal to
+    /// `POOL_TICK_SPACING` would produce the canonical key the launch transaction already
+    /// initialised. `graduateAlt`'s own purpose — reaching a *different*, uninitialised key
+    /// when the canonical one has been griefed — would then be unreachable through it, and
+    /// the call would fail later on the pool-state check instead of the range check. The
+    /// window must also be non-empty and lie wholly in the positive range Uniswap v4
+    /// accepts.
+    function test_theAlternateTickSpacingWindowSitsStrictlyBelowTheCanonicalSpacing() public pure {
+        assertLt(
+            PledrinConstants.ALT_TICK_SPACING_MAX,
+            PledrinConstants.POOL_TICK_SPACING,
+            "the alternate key must never be able to be the canonical key"
+        );
+        assertEq(
+            PledrinConstants.ALT_TICK_SPACING_MAX,
+            PledrinConstants.POOL_TICK_SPACING - 1,
+            "and it is the largest spacing that is still strictly below it"
+        );
+        assertLe(
+            PledrinConstants.ALT_TICK_SPACING_MIN,
+            PledrinConstants.ALT_TICK_SPACING_MAX,
+            "the window is non-empty"
+        );
+        assertGt(PledrinConstants.ALT_TICK_SPACING_MIN, 0, "and strictly positive");
     }
 
     /// @notice Section 4.1's creator first-buy ceiling, 18,000,000 whole tokens.

@@ -46,15 +46,34 @@ interface IPositionManagerPermit2 {
 /// `contracts/lib/v4-periphery/lib/v4-core/src`, and every number is read back off
 /// the forked chain.
 ///
-/// Results: assumptions 1, 2, 5 and 6 hold. Assumption 3 is refuted — the tick
-/// direction in spec 8.2 step 6, spec 10.1 and Invariant 42 is inverted. Assumption 4
-/// is half refuted — "at most `R_target`" holds, "exactly `LP_SUPPLY`" cannot. And spec
-/// 8.2 step 2's phrase "zero-input swap" is not literally executable, though the
-/// property the appendix states for it is.
+/// Results: assumptions 1, 2, 5 and 6 held as stated. Three were refuted, and **all three
+/// refutations have since been accepted into the specification**, so nothing in this file
+/// is an open disagreement — each `_refuted_` test is the measurement the current
+/// specification now states:
 ///
-/// Every test that documents something the spec gets wrong is named `_refuted_` and
-/// asserts the behaviour v4 actually has, so this file is the record of what must
-/// change in the spec rather than a suite that was bent until it went green.
+/// - **Assumption 3, refuted.** The floor position's tick direction was inverted. The
+///   range the specification gave was below the current tick, which v4 funds in
+///   `currency1`, so it would have minted a sell wall out of the token instead of a
+///   standing ETH bid. The specification was corrected to the range this test measured —
+///   `tickLower = alignDown(currentTick, tickSpacing) + tickSpacing`, strictly above the
+///   current tick — and that range is now what spec 8.2 step 8, spec 10.1 and Invariant 42
+///   say. Spec 10.1 quotes this test's numbers. This was the most consequential defect
+///   found in the project, and it was found here.
+/// - **Assumption 4, half refuted.** "At most `R_target`" held; "exactly `LP_SUPPLY`"
+///   cannot, because `MINT_POSITION` is parameterised by liquidity and the `currency1` it
+///   owes is a step function of that. The specification was corrected to "at most `S_LP`",
+///   records the shortfall this test measured at the three reserve points, and bounds it
+///   by `LP_DUST_MAX` in Invariant 39 instead of assuming exactness.
+/// - **The "zero-input swap" of the restoring step, refuted as a phrase.** Literally zero
+///   is not a swap v4 accepts. The specification was corrected: step 2 nominates one unit
+///   of exact input and "zero cost" now describes what the swap settles rather than the
+///   size it names, which is the property the appendix always meant.
+///
+/// Every test that measures something the specification got wrong keeps its `_refuted_`
+/// name, because the name records what the test did. Where a comment below quotes the
+/// wording that was refuted, it says which revision it is quoting and where the corrected
+/// text now lives; a citation that was renumbered to the current step while still quoting
+/// the old content would read as a correction and be a lie.
 ///
 /// @dev The fork is not pinned to a block. The Robinhood Chain mainnet RPC prunes
 /// historical state after a few thousand blocks (verified: `eth_call` at head-2000
@@ -223,7 +242,9 @@ contract V4AssumptionsForkTest is Test {
     }
 
     // =====================================================================
-    // Assumption 5 — the approval path. Resolves spec 8.2 step 3.
+    // Assumption 5 — the approval path. Resolves the two approval legs inside spec 8.2
+    // step 4, which is the core mint; the approvals are part of that step rather than a
+    // step of their own.
     // =====================================================================
 
     function test_assumption5_approvalPathIsTokenToPermit2ThenPermit2ToPositionManager() public {
@@ -285,7 +306,7 @@ contract V4AssumptionsForkTest is Test {
             "Permit2 did not fail inside the ERC-20 transfer"
         );
 
-        // (e) Both legs, and nothing else: the exact sequence of spec 8.2 step 3.
+        // (e) Both legs, and nothing else: the exact approval sequence of spec 8.2 step 4.
         token.approve(address(PERMIT2), LP_SUPPLY);
         (ok, ret) = _tryModify(mintData, R_TARGET);
         assertTrue(ok, "the specified two-leg approval path did not work");
@@ -462,7 +483,8 @@ contract V4AssumptionsForkTest is Test {
 
     // =====================================================================
     // Assumption 3 — single-sided native-ETH floor position.
-    // Resolves spec 8.2 step 6, spec 10.1 and Invariant 42.
+    // Resolves spec 8.2 step 8, spec 10.1 and Invariant 42, all three of which now state
+    // the range the second test below measured rather than the one the first refutes.
     // =====================================================================
 
     function test_assumption3_refuted_rangeBelowCurrentTickIsFundedInCurrency1NotCurrency0()
@@ -471,7 +493,13 @@ contract V4AssumptionsForkTest is Test {
         POOL_MANAGER.initialize(poolKey, sqrtPriceTerminal);
         (, int24 currentTick,,) = POOL_MANAGER.getSlot0(poolId);
 
-        // The range spec 8.2 step 6 specifies, verbatim.
+        // The range a superseded revision of section 8.2 specified, verbatim: at the time
+        // this test was written the floor was given as a band *below* the current tick, and
+        // the step was numbered 6. What follows refuted it, and the specification was
+        // corrected to the range the next test measures, which is above the current tick
+        // and now lives in step 8. The old range is kept here, attributed to the revision
+        // that contained it, because this test's whole value is showing what it would have
+        // minted.
         int24 tickUpper = _alignDown(currentTick, POOL_TICK_SPACING) - POOL_TICK_SPACING;
         int24 tickLower = tickUpper - _alignDown(FLOOR_RANGE_TICKS, POOL_TICK_SPACING);
         assertLt(
@@ -491,8 +519,11 @@ contract V4AssumptionsForkTest is Test {
         emit log_named_uint("currency1 the pool requires for this range", needs1);
 
         // v4 geometry: a range entirely below the current tick is composed of currency1.
-        // Spec 10.1's claim that `tickUpper < currentTick` "guarantees the position is
-        // single-sided in currency0" is backwards; it guarantees the opposite.
+        // The superseded section 10.1 claimed that `tickUpper < currentTick` "guarantees
+        // the position is single-sided in currency0". It guarantees the opposite, which is
+        // what the two assertions below measure. The current 10.1 states the direction in
+        // both vocabularies — tick terms and price terms — and says explicitly that a range
+        // below the current tick would mint a sell wall out of the token.
         assertEq(needs0, 0, "a range below the current tick wants currency0");
         assertGt(needs1, 0, "a range below the current tick does not want currency1");
 
@@ -780,9 +811,12 @@ contract V4AssumptionsForkTest is Test {
         assertEq(address(swapper).balance, 0, "the restoring swap took ETH from the caller");
     }
 
-    /// @notice Spec 8.2 step 2 says "zero-input swap". Literally zero is not a swap v4
-    /// will accept, so the restoring call must nominate a non-zero `amountSpecified`
-    /// and rely on the empty pool consuming none of it.
+    /// @notice A superseded revision of spec 8.2 step 2 called this a "zero-input swap".
+    /// Literally zero is not a swap v4 will accept, so the restoring call must nominate a
+    /// non-zero `amountSpecified` and rely on the empty pool consuming none of it.
+    /// @dev The specification was corrected to match: step 2 now nominates one unit of
+    /// exact input, and its prose states that "zero cost" describes what the swap settles
+    /// rather than the size it names. `BondingCurve._restorePrice` nominates one unit.
     function test_assumption1_refuted_amountSpecifiedZeroIsRejectedByPoolManager() public {
         POOL_MANAGER.initialize(poolKey, sqrtPriceTerminal);
 
@@ -1328,7 +1362,7 @@ contract V4AssumptionsForkTest is Test {
         );
     }
 
-    /// @dev The approval path of spec 8.2 step 3, and nothing else.
+    /// @dev The two approval legs of spec 8.2 step 4, and nothing else.
     function _approvePositionManager(uint256 amount) internal {
         token.approve(address(PERMIT2), amount);
         PERMIT2.approve(

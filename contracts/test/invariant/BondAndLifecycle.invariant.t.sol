@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity 0.8.38;
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 import {BondingCurve} from "src/BondingCurve.sol";
 import {IBondingCurve} from "src/interfaces/IBondingCurve.sol";
 import {ILaunchFactory} from "src/interfaces/ILaunchFactory.sol";
@@ -9,8 +11,10 @@ import {PledrinConstants} from "src/libraries/PledrinConstants.sol";
 import {InvariantBase} from "./InvariantBase.sol";
 
 /// @title The bond and the lifecycle, as invariants
-/// @notice **Invariant 25, the third of the three the specification marks mandatory**,
-/// plus Invariants 26, 29, 30, 31, 36, 48 and 49.
+/// @notice **Invariant 25, the last of the four the specification marks mandatory** — the
+/// four are 1, 2, 14 and 25, and `CurveSolvency.invariant.t.sol` covers 1 and 2 while
+/// `FeeSplit.invariant.t.sol` covers 14 — plus Invariants 26, 29, 30, 31, 36, 48, 49
+/// and 61.
 /// @dev Invariant 25 has four terms and all four are tracked: what the bond account still
 /// holds, what has been credited to the creator, what has been paid to them, and what was
 /// moved into the reserve on expiry. Their sum has to be the immutable `bondWei` at every
@@ -203,6 +207,47 @@ contract BondAndLifecycleInvariant is InvariantBase {
             );
             assertEq(curve.factory(), address(factory), "the factory never changes");
             assertTrue(curve.protocolTreasury() != address(0), "the treasury is never zeroed");
+        }
+    }
+
+    /// @notice **Invariant 61's second clause, in the form that covers a path nobody
+    /// listed.** No launch ever holds an outstanding allowance on its own token, to Permit2
+    /// or to anyone else the protocol approves, between one call and the next.
+    /// @dev The clause is a statement about reachability, and the campaign is the only test
+    /// shape that can address it without enumerating the surface by hand: the handler drives
+    /// every externally reachable function, in a random interleaving, across every state a
+    /// launch passes through, and this is checked after each call. The two grants a launch
+    /// does make — `LP_SUPPLY` to Permit2 for the core mint and the first-buy allocation to
+    /// `CreatorVesting` — are both revoked or consumed inside the transaction that makes
+    /// them, so between calls there is nothing to see. An `_approve` added anywhere
+    /// reachable, and not undone in the same transaction, fails here.
+    ///
+    /// What this cannot see is a grant made and revoked within one call; that case is
+    /// covered from inside the window by
+    /// `test/unit/BondingCurveApprovals.t.sol::test_theApprovalExistsOnlyInsideTheCoreMintWindow`,
+    /// and it is harmless in any event, because the curve holds a reentrancy guard and the
+    /// only Pledrin code a mint enters is the curve's own `receive()`.
+    function invariant_noLaunchEverHoldsAnOutstandingTokenApproval() public view {
+        uint256 count = handler.launchCount();
+        for (uint256 i = 0; i < count; i++) {
+            BondingCurve curve = handler.launchAt(i);
+            IERC20 token = curve.token();
+
+            assertEq(
+                token.allowance(address(curve), address(permit2)),
+                0,
+                "Invariant 61: no Permit2 allowance outlives the call that granted it"
+            );
+            assertEq(
+                token.allowance(address(curve), address(vesting)),
+                0,
+                "Invariant 61: nor the creator-vesting allowance"
+            );
+            assertEq(
+                token.allowance(address(curve), address(positionManager)),
+                0,
+                "and the curve never approves PositionManager directly"
+            );
         }
     }
 

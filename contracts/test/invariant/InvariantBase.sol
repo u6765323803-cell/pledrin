@@ -84,6 +84,7 @@ abstract contract InvariantBase is PledrinTestBase {
     function logHandlerActivity() internal view {
         console2.log("buys", handler.buys());
         console2.log("sells", handler.sells());
+        console2.log("sells in a terminal state", handler.postTerminalSells());
         console2.log("donations", handler.donations());
         console2.log("graduations", handler.graduations());
         console2.log("stalls", handler.stalls());

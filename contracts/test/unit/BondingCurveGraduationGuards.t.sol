@@ -54,7 +54,16 @@ contract BondingCurveGraduationGuardsTest is PledrinTestBase {
 
     /// @notice **Invariant 38's first half.** Only a tick spacing inside
     /// `[ALT_TICK_SPACING_MIN, ALT_TICK_SPACING_MAX]` is accepted: one outside on each side
-    /// is rejected, and both bounds themselves work.
+    /// is rejected, and both bounds themselves graduate.
+    /// @dev `ALT_TICK_SPACING_MAX` is 199, one below `POOL_TICK_SPACING`, so the top of the
+    /// window is an ordinary alternate key: uninitialised, and graduation there is a
+    /// complete graduation rather than a revert. 200 is therefore *outside* the window and
+    /// the range check rejects it before the pool-state check is ever reached, which is why
+    /// the error here is `InvalidTickSpacing(200)` and not `AltPoolInitialized`. The
+    /// distinction is load-bearing: the range check is what guarantees the alternate key
+    /// can never be the canonical key, so a caller cannot reach `graduate`'s pool through
+    /// `graduateAlt` even on a launch whose canonical pool was never initialised.
+    /// `test_graduateAltRequiresAnUninitialisedPool` covers `AltPoolInitialized` itself.
     function test_graduateAltAcceptsOnlyThePermittedTickSpacings() public {
         (BondingCurve curve,) = createLaunchAtCap();
         vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
@@ -63,18 +72,31 @@ contract BondingCurveGraduationGuardsTest is PledrinTestBase {
         curve.graduateAlt(0);
         vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 9));
         curve.graduateAlt(9);
+        // One above the window, and the canonical spacing itself, which is the first value
+        // above it. Both fail on the range check.
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 200));
+        curve.graduateAlt(uint24(int24(PledrinConstants.POOL_TICK_SPACING)));
         vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 201));
         curve.graduateAlt(201);
 
         curve.graduateAlt(uint24(int24(PledrinConstants.ALT_TICK_SPACING_MIN)));
         assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "the lower bound");
 
-        (BondingCurve other,) = createLaunchAtCap();
+        (BondingCurve other, IERC20 otherToken) = createLaunchAtCap();
         vm.warp(other.capReachedAt() + PledrinConstants.ALT_DELAY);
-        // The upper bound is the primary spacing, whose pool is already initialised, so
-        // the bound passes and the pool check is what rejects it.
-        vm.expectRevert(IBondingCurve.AltPoolInitialized.selector);
         other.graduateAlt(uint24(int24(PledrinConstants.ALT_TICK_SPACING_MAX)));
+        assertEq(uint8(other.state()), uint8(IBondingCurve.State.Graduated), "the upper bound");
+
+        // The upper bound graduated onto its own key, and left the canonical key, which the
+        // launch transaction initialised, untouched at the terminal price.
+        PoolKey memory altKey = _key(address(otherToken), PledrinConstants.ALT_TICK_SPACING_MAX);
+        (uint160 altPrice,) = poolManager.slot0(altKey.toId());
+        assertEq(altPrice, other.sqrtPriceTerminal(), "the 199 key opened at the terminal price");
+        assertNotEq(
+            PoolId.unwrap(altKey.toId()),
+            PoolId.unwrap(other.poolId()),
+            "and it is not the canonical key"
+        );
     }
 
     /// @notice **Invariant 38's second half.** `graduateAlt` requires the alternate pool to
@@ -238,7 +260,7 @@ contract BondingCurveGraduationGuardsTest is PledrinTestBase {
     // The floor range's assertion
     // ------------------------------------------------------------------
 
-    /// @notice The floor band must fit below the aligned maximum tick. Section 8.2 step 6
+    /// @notice The floor band must fit below the aligned maximum tick. Section 8.2 step 8
     /// says this cannot fire at any permitted parameter set, which
     /// `test/unit/PledrinConstants.t.sol` proves across the whole reserve range; here the
     /// pool reports a tick no `sqrtPriceTerminal` can produce, and the assertion fires.

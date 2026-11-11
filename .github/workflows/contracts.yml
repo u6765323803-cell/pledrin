@@ -85,6 +85,14 @@ jobs:
   coverage:
     name: coverage
     runs-on: ubuntu-latest
+    # Coverage is measured at the default profile rather than the `ci` one. It is a
+    # reachability measure, not a search: 1,024 fuzz runs reach the same lines 10,000
+    # would, and `forge coverage` compiles with the optimizer and the IR pipeline off, so
+    # the heavier profile costs a great deal of time and buys no coverage. The `test` job
+    # above is where the `ci` profile's run counts earn their keep. Both profiles set
+    # `deny = "warnings"`, so nothing is relaxed here.
+    env:
+      FOUNDRY_PROFILE: default
     steps:
       - uses: actions/checkout@v5
         with:
@@ -106,9 +114,15 @@ jobs:
             echo "No Solidity sources under contracts/src yet; skipping coverage."
           fi
 
+      # The fork tests are excluded for the same reason the `test` job excludes them,
+      # and here it matters more: this is a hard gate, and a gate that a flaky public
+      # RPC can fail is a gate people learn to ignore. The bar is therefore cleared by
+      # the deterministic suite alone, which is also the number quoted in review.
       - name: Measure coverage
         if: steps.sources.outputs.present == 'true'
-        run: forge coverage --exclude-tests --report lcov --report-file lcov.info --report summary
+        run: |
+          forge coverage --no-match-path "test/fork/*" --exclude-tests \
+            --report lcov --report-file lcov.info --report summary
 
       - name: Enforce minimum coverage
         if: steps.sources.outputs.present == 'true'

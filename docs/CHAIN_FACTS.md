@@ -86,6 +86,59 @@ The lags are also not a safety claim about this chain's finality. They are what
 the endpoint reported at one moment; a sequencer or batch-posting change moves
 them, and nothing in the protocol depends on them.
 
+## Gas accounting and what actually limits an attacker — measured, mainnet
+
+```
+cast block latest --field gasLimit        # 1125899906842624   (2**50)
+cast block latest --field gasUsed         # 2362448
+cast call 0x...006C "getGasAccountingParams()(uint256,uint256,uint256)"
+# 7000000     speed limit, gas per second
+# 32000000    gas pool maximum
+# 32000000    maximum gas for one transaction
+cast gas-price                            # 20030000 wei   (0.02003 gwei)
+cast call 0x...006C "getMinimumGasPrice()(uint256)"
+# 20000000 wei   (0.02 gwei)
+```
+
+**The block gas limit is a sentinel, not a bound.** `2**50` is not a real cap and
+blocks run far below it, so block space is not the scarce resource on this chain.
+The two figures that do bind are the **32,000,000 gas ceiling on a single
+transaction** and the **7,000,000 gas per second speed limit**, the latter
+enforced by the price rising rather than by transactions being rejected.
+
+This is what makes a key-space argument quantitative rather than rhetorical. Using
+the Phase 1 review's measured 47,027 gas to initialise a pool key, and the
+`fee` x `tickSpacing` key space of 1,337,190 keys that `docs/OPEN_DECISIONS.md`
+decision 22 adopts:
+
+| Per key | Keys per transaction | Total gas | At 7M gas/s | At the minimum price |
+|---|---|---|---|---|
+| 47,027 — initialise only | 680 | 6.29e10 | 2.5 h of the chain's entire capacity | 1.26 ETH |
+| ~250,000 — initialise and mint dust | 128 | 3.34e11 | 13.3 h of the chain's entire capacity | 6.69 ETH |
+
+Both rows understate the cost, because sustained demand at that rate raises the
+price well above the minimum, and because the work has to be repeated **per
+launch**: the key includes the launch token's address, so seizing the space for
+one launch seizes nothing for the next. The second row is the one that matters,
+since after decision 22 a bare `initialize` is tolerated and only liquidity
+blocks a key — and its dust is stranded.
+
+## Not measured, and needed
+
+- **Whether a pending transaction is observable before it executes, and whether
+  ordering is first-come-first-served.** `txpool_content` and
+  `eth_newPendingTransactionFilter` are both absent from this endpoint
+  (`error -32601`), while a `pending` block tag is served. That is a fact about
+  this endpoint, not about the sequencer: another endpoint or the sequencer's own
+  feed may expose what this one does not. No claim about mempool privacy or
+  ordering may rest on it. This is the fact `docs/OPEN_DECISIONS.md` decision 23
+  needs.
+- **Whether `blockhash` is usable here.** Cannot be answered with `cast` alone;
+  it needs a fork test that calls it from a contract.
+- **The gas cost of a minimal Uniswap v4 position mint on this chain.** The
+  47,027 to initialise is measured; the larger half of the table above is an
+  estimate.
+
 ## Uniswap v4 — present on BOTH mainnet and testnet
 
 This is the graduation target. The full v4 stack is deployed at the same

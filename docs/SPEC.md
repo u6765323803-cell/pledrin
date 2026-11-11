@@ -289,7 +289,7 @@ silently charging more.
 ### 5.5 Sell
 
 `sell(uint256 dT, uint256 minEthOut, uint256 deadline)`. Requires
-`state ∈ {Live, Expired, Stalled}`, `block.timestamp <= deadline`, and
+`state in {Live, Expired, Stalled}`, `block.timestamp <= deadline`, and
 `dT >= 1`. The caller must have approved or the contract must pull via
 `transferFrom`.
 
@@ -341,7 +341,7 @@ thousand wei of accumulated rounding.
 
 ### 5.7 Donate
 
-`donate()`, payable. Requires `state ∈ {Live, Graduating, Expired, Stalled}`
+`donate()`, payable. Requires `state in {Live, Graduating, Expired, Stalled}`
 and `msg.value >= 1`. Effect: `r += msg.value`. It does not change `s`, `vT`,
 any fee bucket, or any lifecycle state, and it never mints tokens.
 
@@ -419,9 +419,10 @@ the treasury.
 
 | Function | Caller | Precondition | Destination |
 |---|---|---|---|
-| `claimCreatorFees()` | anyone | `state ∈ {Graduated, Stalled}` | `creator` |
+| `claimCreatorFees()` | anyone | `state in {Graduated, Stalled}` | `creator` |
 | `claimProtocolFees()` | anyone | any state | `protocolTreasury` |
-| `claimBounty()` | the recorded bounty earner | after graduation | that earner |
+| `claimBond()` | anyone | `bondState == Returned` | `creator` |
+| `claimBounty()` | anyone | `pendingBountyWei > 0` | the recorded bounty earner |
 
 `claimCreatorFees` reverting before graduation is load-bearing: **the creator
 cannot withdraw a single wei from a launch until that launch has delivered.**
@@ -513,7 +514,7 @@ sqrtPriceTerminal = sqrt( mulDiv(S_LP, 2**192, R_target) )      // round down
 The multiplication must use a 512-bit intermediate; `S_LP * 2**192` overflows
 256 bits. At the default `vE0 = 0.5 ether` this evaluates to exactly
 `5000 * 2**96` with no remainder, tick 170352. Over the permitted `vE0` range
-the tick runs from 115135 to 207243, comfortably inside v4's `±887272`, and
+the tick runs from 115135 to 207243, comfortably inside v4's `+/-887272`, and
 `sqrtPriceTerminal` is always above `MIN_SQRT_PRICE`.
 
 Initialising at launch is the primary anti-grief measure. The token address does
@@ -558,10 +559,10 @@ Permissionless. Requires `state == Graduating`. One transaction, no window.
 7.  r = 0
 8.  bounty = floor(protocolFeeEth * GRAD_BOUNTY_BPS / 10000)
     protocolFeeEth -= bounty
-    record bounty as claimable by msg.sender                // credited, not pushed
-9.  if bondWei > 0:
+    pendingBountyWei[msg.sender] += bounty                  // credited, not pushed
+9.  if bondHeldWei > 0:
         bondState = Returned
-        record bondWei as claimable by creator               // credited, not pushed
+        pendingBondWei = bondHeldWei; bondHeldWei = 0        // credited, not pushed
 10. CreatorVesting.start(launch, block.timestamp)
 11. factory.recordGraduation(creator, R_target)
 12. emit Graduated
@@ -746,6 +747,12 @@ Bounds: `bondWei` is 0, or at least `max(MIN_BOND_WEI, R_target / 10)` and at
 most `MAX_BOND_WEI`. The proportional floor means a bond is always meaningful
 relative to the raise it backs; a flat minimum would be trivial on a large launch.
 
+Two fields, deliberately distinct: `bondWei` is the immutable amount posted at
+launch and is what `pledged()`, the fee-share selection and the reputation
+counters read. `bondHeldWei` is the mutable ETH balance still held on the bond
+account. Exactly one transition moves `bondHeldWei` to zero, and it is the same
+transition that moves `bondState` out of `Bonded`.
+
 ### 11.2 Prevention first
 
 Three constraints do the actual work, and none of them is a punishment:
@@ -771,8 +778,8 @@ one-enum assertion rather than a balance argument.
 
 | Transition | Condition | Effect |
 |---|---|---|
-| `Bonded -> Returned` | `graduate()` or `graduateAlt()` or `abortGraduation()` | `bondWei` credited to `creator` as claimable; `bondsReturned++` |
-| `Bonded -> Forfeited` | `expire()`: `state == Live && block.timestamp >= gradDeadline && s < C` | `r += bondWei`; `bondsForfeited++`; `bondWeiForfeited += bondWei` |
+| `Bonded -> Returned` | `graduate()`, `graduateAlt()` or `abortGraduation()` | `pendingBondWei = bondHeldWei`; `bondHeldWei = 0`; `bondsReturned++` |
+| `Bonded -> Forfeited` | `expire()`: `state == Live && block.timestamp >= gradDeadline && s < C` | `ethReserve += bondHeldWei`; `bondHeldWei = 0`; `bondsForfeited++`; `bondWeiForfeited += bondWei` |
 
 ### 11.4 Automatic payout to holders
 
@@ -781,11 +788,13 @@ The only trigger is expiry: the cap was not reached before the deadline.
 
 ```
 state = Expired
-if bondWei > 0: bondState = Forfeited
-r += bondWei + creatorFeeEth + protectionEth
-bondWei = 0; creatorFeeEth = 0; protectionEth = 0
+forfeited = bondHeldWei + creatorFeeEth + protectionEth
+if bondHeldWei > 0: bondState = Forfeited
+r += forfeited
+bondHeldWei = 0; creatorFeeEth = 0; protectionEth = 0
 CreatorVesting.void(launch)
 factory.recordExpiry(creator, bondWei)
+emit Expired(...)
 ```
 
 The forfeited ETH is donated into the curve reserve, which raises the exit price
@@ -967,7 +976,7 @@ how much ETH it raises.
 2.  deploy PledrinToken, minting TOTAL_SUPPLY to the new BondingCurve
 3.  deploy BondingCurve with all immutables
 4.  PoolManager.initialize(poolKey, sqrtPriceTerminal)
-5.  if bondWei > 0: transfer bondWei to the curve; bondState = Bonded
+5.  if bondWei > 0: bondHeldWei = bondWei; bondState = Bonded
 6.  if creatorFirstBuyWei > 0:
         execute buy(creatorFirstBuyWei) on the curve
         require tokens out <= CREATOR_FIRST_BUY_MAX
@@ -995,7 +1004,7 @@ creator, by trader.
 | `Graduated` | `launch*`, `poolId*`, `positionIdCore`, `positionIdFloor`, `ethToCore`, `ethToFloor`, `tokensToCore`, `bounty`, `caller*` |
 | `GraduationStalled` | `launch*`, `caller*` |
 | `Expired` | `launch*`, `bondForfeited`, `creatorFeesForfeited`, `protectionForfeited`, `ethReserve` |
-| `BondStateChanged` | `launch*`, `creator*`, `oldState`, `newState`, `amount` |
+| `BondStateChanged` | `launch*`, `creator*`, `oldState`, `newState`, `amount`, `destination` |
 | `FeesClaimed` | `launch*`, `recipient*`, `kind`, `amount` |
 | `VestingStarted` | `launch*`, `creator*`, `allocation`, `start`, `cliff`, `duration` |
 | `VestingReleased` | `launch*`, `creator*`, `amount`, `cumulative` |
@@ -1079,17 +1088,19 @@ invariant suite.
 ### Bond
 
 25. **Mandatory.** For every launch, `bondState` leaves `Bonded` at most once,
-    and the total ETH ever credited or transferred on that launch's bond account
-    is at most `bondWei`. A bond is never paid twice.
-26. `bondState == Returned` implies `state ∈ {Graduated, Stalled}`;
+    and `bondHeldWei + pendingBondWei + (ETH ever paid out on the bond account)
+    + (ETH ever moved from the bond account into `ethReserve`) == bondWei` at
+    every point in time. A bond is never paid twice, and no wei of it is ever
+    paid to both the creator and the reserve.
+26. `bondState == Returned` implies `state in {Graduated, Stalled}`;
     `bondState == Forfeited` implies `state == Expired`.
-27. On `expire()`, `bondWei + creatorFeeEth + protectionEth` is added to
+27. On `expire()`, `bondHeldWei + creatorFeeEth + protectionEth` is added to
     `ethReserve` in full, those three fields become zero, and nothing is sent or
     credited to `creator`.
 28. `bondWei > 0` implies `bondWei >= max(MIN_BOND_WEI, R_target / 10)` and
     `bondWei <= MAX_BOND_WEI`.
-29. `pledged()` is a pure function of `bondWei` and `bondState` and has no
-    setter.
+29. `pledged()` is a pure function of the immutable `bondWei` and has no setter,
+    and is therefore unchanged by any bond transition.
 
 ### Lifecycle
 

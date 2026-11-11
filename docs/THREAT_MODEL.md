@@ -433,19 +433,21 @@ is an open decision.
 These are not Pledrin vulnerabilities. They are disclosed because graduated
 liquidity depends on them.
 
-**Uniswap protocol fees.** `PoolManager.protocolFeeController()` is
-`0x6d0009504D129CF5002Dba61D9Ae8575AA79314c` on mainnet 4663 and the zero address
-on testnet 46630, both verified with `cast`. Where a controller is set, Uniswap
-governance can enable a protocol fee on any v4 pool, bounded by a constant in the
-v4 code, which diverts part of the swap fee away from liquidity providers — here,
-away from the permanently locked positions. Pledrin cannot prevent this and does
-not promise a fee rate on graduated pools.
+**Uniswap protocol fees.** `PoolManager.protocolFeeController()` returns a
+non-zero address on mainnet 4663 and the zero address on testnet 46630, verified
+with `cast` against the PoolManager address in `docs/CHAIN_FACTS.md`. Where a
+controller is set, Uniswap governance can enable a protocol fee on any v4 pool,
+bounded by a constant in the v4 code, which diverts part of the swap fee away
+from liquidity providers — here, away from the permanently locked positions.
+Pledrin cannot prevent this and does not promise a fee rate on graduated pools.
+The two controller values are not reproduced here because no address may appear
+outside `docs/CHAIN_FACTS.md`; see the note at the end of
+`docs/OPEN_DECISIONS.md`.
 
-**PoolManager ownership.** `PoolManager.owner()` is
-`0x2BAD8182C09F50c8318d769245beA52C32Be46CD` on mainnet and
-`0x9701fb0aDe1E269c8f64Ec0C7b3cfADB31A13A52` on testnet. Pledrin inherits
-whatever powers that role holds over v4 pools. Graduated liquidity is custodied
-by the Uniswap v4 contracts, not by Pledrin.
+**PoolManager ownership.** `PoolManager.owner()` returns a different non-zero
+address on each network, also verified with `cast`. Pledrin inherits whatever
+powers that role holds over v4 pools. Graduated liquidity is custodied by the
+Uniswap v4 contracts, not by Pledrin.
 
 **Chain operation.** Robinhood Chain is an Arbitrum Nitro chain operated by a
 third party. Sequencer censorship, a chain halt or a reorg beyond the protocol's

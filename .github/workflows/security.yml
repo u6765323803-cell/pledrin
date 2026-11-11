@@ -56,10 +56,59 @@ jobs:
             echo "No Solidity sources under contracts/src yet; skipping Slither."
           fi
 
-      - uses: crytic/slither-action@v0.4.1
+      - uses: foundry-rs/foundry-toolchain@v1
         if: steps.sources.outputs.present == 'true'
         with:
-          target: contracts/
-          slither-config: contracts/slither.config.json
-          slither-args: --fail-high
-          fail-on: high
+          version: v1.9.0
+
+      - uses: actions/setup-python@v5
+        if: steps.sources.outputs.present == 'true'
+        with:
+          python-version: '3.12'
+
+      # Slither is installed and pinned here rather than taken from
+      # crytic/slither-action, so the version CI runs is the version a reviewer
+      # runs locally. A static analyser that disagrees with itself between the
+      # two is worse than one that is merely strict.
+      - name: Install Slither
+        if: steps.sources.outputs.present == 'true'
+        env:
+          SLITHER_VERSION: 0.11.6
+        run: |
+          pip install --disable-pip-version-check "slither-analyzer==${SLITHER_VERSION}"
+          slither --version
+
+      - name: Run Slither
+        if: steps.sources.outputs.present == 'true'
+        working-directory: contracts
+        run: |
+          set +e
+          slither . --config-file slither.config.json --fail-high \
+            > "${RUNNER_TEMP}/slither.log" 2>&1
+          status=$?
+          set -e
+          cat "${RUNNER_TEMP}/slither.log"
+
+          # Slither reports any function whose intermediate representation it
+          # could not build, then runs every detector over the incomplete model
+          # without changing its exit code: on this repository
+          # `--no-fail-pedantic` returns 0 even with six function bodies missing
+          # from the analysis. An analysis that silently covers less than the
+          # whole program is worse than no analysis at all, because it reads as a
+          # clean run and its absent findings look like their absence was
+          # measured. Nothing in the exit code catches this, so catch it here.
+          if grep -q 'ERROR:ContractSolcParsing' "${RUNNER_TEMP}/slither.log"; then
+            echo "::error::Slither could not analyse one or more function bodies, so its findings cover less than the whole program. See docs/SECURITY_NOTES.md."
+            grep 'ERROR:ContractSolcParsing' "${RUNNER_TEMP}/slither.log"
+            exit 1
+          fi
+
+          exit "$status"
+
+      - name: Upload Slither log
+        if: always() && steps.sources.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: slither-log
+          path: ${{ runner.temp }}/slither.log
+          if-no-files-found: ignore

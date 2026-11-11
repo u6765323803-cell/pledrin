@@ -691,7 +691,9 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
     /// largest value that fits and asserts the remainder is dust (Invariant 39).
     /// `amount0Max` is exactly `R_target` and must not be tightened; the ETH headroom is
     /// not monotone in `virtualEthReserve`, and anything unspent flows into the floor
-    /// position rather than being stranded.
+    /// position rather than being stranded. The ETH cost is computed from the position's
+    /// parameters and the token cost is a delta across the call: both choices are forced,
+    /// and by opposite considerations, which the body states at each site.
     function _mintCore(PoolKey memory key, int24 tickSpacing)
         private
         returns (uint256 positionId, uint256 ethUsed, uint256 tokensUsed)
@@ -702,11 +704,26 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
             TickMath.getSqrtPriceAtTick(tickLower), sqrtPriceTerminal, PledrinConstants.LP_SUPPLY
         );
 
+        // What the mint costs in ETH, computed from the position's own parameters and
+        // computed before the call, so nothing the call reaches can alter it. For a
+        // position whose range contains the current tick, v4-core charges exactly this
+        // much `currency0` (`Pool.modifyLiquidity`), and `_settle` asserted the price
+        // equals `sqrtPriceTerminal` immediately above, so this is the amount
+        // PositionManager settles below — and at most `target`, because `amount0Max` is
+        // `target` and the mint reverts rather than exceed it. A balance delta would not
+        // measure this: the batch's closing `SWEEP` sends PositionManager's entire native
+        // balance here rather than this mint's unspent remainder, so any balance a third
+        // party parked there beforehand arrives inside the call and subtracts from the
+        // reading. Finding 1 of
+        // `docs/security/REVIEW-2026-11-11-phase1-contracts.md`.
+        ethUsed = SqrtPriceMath.getAmount0Delta(
+            sqrtPriceTerminal, TickMath.getSqrtPriceAtTick(tickUpper), liquidity, true
+        );
+
         uint128 target = ethTarget;
         _approvePositionManager(PledrinConstants.LP_SUPPLY);
 
         positionId = positionManager.nextTokenId();
-        uint256 ethBefore = address(this).balance;
         uint256 tokensBefore = token.balanceOf(address(this));
 
         positionManager.modifyLiquidities{value: target}(
@@ -716,7 +733,6 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
             block.timestamp
         );
 
-        ethUsed = ethBefore - address(this).balance;
         tokensUsed = tokensBefore - token.balanceOf(address(this));
 
         uint256 remainder = PledrinConstants.LP_SUPPLY - tokensUsed;
@@ -774,6 +790,10 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
         }
 
         positionId = positionManager.nextTokenId();
+        // This delta is sound where the core mint's was not. The core mint's own `SWEEP`
+        // ran first and left PositionManager holding no native balance, and nothing
+        // between the two calls can give it one, so what the sweep below returns is this
+        // mint's unspent `currency0` and nothing else.
         uint256 ethBefore = address(this).balance;
 
         positionManager.modifyLiquidities{value: floorEth}(mintData, block.timestamp);

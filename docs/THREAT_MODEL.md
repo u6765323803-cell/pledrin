@@ -184,10 +184,15 @@ An attacker can therefore shift a pre-initialised Pledrin pool away from
 `sqrtPriceTerminal` at near-zero cost at any time during the curve phase.
 
 `graduate()` reads `slot0` and, if the price has moved, restores it with a swap
-whose `sqrtPriceLimitX96` is `sqrtPriceTerminal`, then asserts both that the
-swap's net deltas in both currencies were zero and that the restored price is
-exactly `sqrtPriceTerminal` (section 8.2, Invariants 40 and 41). In an empty pool
-this reset is free. The attack costs the attacker gas and achieves nothing.
+whose `sqrtPriceLimitX96` is `sqrtPriceTerminal` and whose direction follows from
+comparing the two, then asserts both that the swap's net deltas in both
+currencies were zero and that the restored price is exactly `sqrtPriceTerminal`
+(section 8.2, Invariants 40 and 41). In an empty pool this reset settles for
+nothing in either currency, verified in both directions on a fork against the
+deployed PoolManager. It is not a literally zero-sized swap: `PoolManager.swap`
+rejects `amountSpecified == 0`, so the restoring call nominates one unit of exact
+input and relies on an empty pool consuming none of it. The attack costs the
+attacker gas and achieves nothing.
 
 ### 4.3 Adding liquidity so that the reset is not free
 
@@ -235,6 +240,21 @@ initialised at `sqrtPriceTerminal` with no prior liquidity (Invariant 38). An
 attacker must therefore pre-initialise and hold hostile liquidity on every
 permitted spacing in that range, continuously, for as long as the launch exists,
 and re-do it after every failed attempt. Each instance is a losing position.
+
+The uninitialised requirement is load-bearing in a second way that is easy to
+miss, and must not be relaxed. Restoring a griefed price is free in both
+currencies but not in gas: the restoring swap walks the tick bitmap in proportion
+to the tick distance divided by the tick spacing. Measured on a fork against the
+deployed PoolManager, restoring from the extreme tick cost 173k gas of EVM
+execution at `tickSpacing = 200` and 2.33M at `ALT_TICK_SPACING_MIN = 10`, the
+latter alone exceeding the two-million-gas graduation the bounty is sized
+against. Because `graduateAlt` opens the alternate pool itself at
+`sqrtPriceTerminal`, that cost never enters the graduation path. Allowing an
+already-initialised alt pool would import it and would hand an attacker a
+gas-exhaustion grief on the one path that exists to defeat griefing. The figures
+are EVM execution gas under a forked EVM; Nitro's gas accounting differs
+(`docs/CHAIN_FACTS.md`), so they describe the relative cost of the loop and not a
+chain gas quote.
 
 `ALT_DELAY` exists so the honest primary key wins when it is available; without
 it, a caller could fragment the canonical pool onto an odd spacing for no reason.
@@ -308,12 +328,19 @@ value — only the free price-shift of 4.2, which `graduate()` undoes.
 
 ### 5.3 The floor position cannot create a gap
 
-Position B is single-sided `currency0` with `tickUpper` strictly below the
-aligned current tick (Invariant 42). Minting it cannot move the price and cannot
-open a gap upward. The naive alternative — adding the protection pool's ETH into
-the core position — would raise the opening price above the curve's terminal
-price and hand the difference to the first seller. That is why the protection
-pool funds a separate below-spot position rather than being added to the core.
+Position B is single-sided `currency0` with `tickLower` strictly **above** the
+current tick (Invariant 42). Because `currency0` is ETH and `currency1` is the
+token, the tick axis runs opposite to the token's ETH price (spec 8.1), so that
+range is the band immediately *below* the opening price in price terms and is the
+side v4 funds in ETH alone. Minting it moves neither the price nor the tick, adds
+nothing to active liquidity, holds no token, and opens no gap upward; all four
+were measured on the fork. Had the range been specified below the current tick,
+as an earlier draft of spec 10.1 did, the position would have been funded in the
+token and would have been a sell wall rather than a bid. The naive alternative —
+adding the protection pool's ETH into the core position — would raise the opening
+price above the curve's terminal price and hand the difference to the first
+seller. That is why the protection pool funds a separate bid position rather than
+being added to the core.
 
 ### 5.4 What is not prevented
 
@@ -360,6 +387,12 @@ Forced tokens sit in the curve and, since `buy` transfers out exactly the comput
 `tokensOut` and nothing reads `balanceOf`, they are inert — and after `Expired`,
 `Stalled` or `Graduated` they can never leave.
 
+The graduation remainder joins them. The core position is parameterised by
+liquidity, so it consumes at most `LP_SUPPLY` and leaves a few hundred base units
+behind (spec 8.2, Invariant 39), and those are stranded in the curve forever. At
+roughly `10**-15` whole tokens this changes no quantity anyone can observe, and
+it is recorded here rather than claimed away.
+
 ### 6.4 First depositor on the Uniswap pool
 
 Removed by initialising the pool at launch at a price the protocol chooses
@@ -367,9 +400,10 @@ Removed by initialising the pool at launch at a price the protocol chooses
 
 ### 6.5 Donation to the locked position
 
-Anyone may mint additional liquidity into the graduated pool, including
-single-sided ETH below spot. That deepens the floor for every holder and the
-depositor keeps their own position. Nothing about it harms the protocol or
+Anyone may mint additional liquidity into the graduated pool, including a
+single-sided ETH bid in the band below spot in price terms, which per spec 8.1 is
+the tick range above the current tick. That deepens the floor for every holder
+and the depositor keeps their own position. Nothing about it harms the protocol or
 holders, and nothing about it gives the depositor access to the locked positions.
 
 ---

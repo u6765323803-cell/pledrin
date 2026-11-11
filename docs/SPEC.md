@@ -33,10 +33,10 @@ code size:
 
 | Role | Address |
 |---|---|
-| Uniswap v4 PoolManager | `0x8366a39cc670b4001a1121b8f6a443a643e40951` |
-| Uniswap v4 PositionManager | `0x58daec3116aae6d93017baaea7749052e8a04fa7` |
+| Uniswap v4 PoolManager | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
+| Uniswap v4 PositionManager | `0x58daec3116aae6D93017bAAea7749052E8a04fA7` |
 | Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
-| Uniswap v4 StateView (reads only) | `0xf3334192d15450cdd385c8b70e03f9a6bd9e673b` |
+| Uniswap v4 StateView (reads only) | `0xF3334192D15450CdD385c8B70e03f9A6bD9E673b` |
 
 ### 1.1 Graduation venue: Uniswap v4, decided
 
@@ -67,7 +67,7 @@ mainnet. Two further v4 properties are load-bearing:
 
 The cost of this choice: v4 liquidity on Robinhood Chain is younger than v2
 liquidity, and routing to a v4 pool depends on UniversalRouter
-(`0x8876789976decbfcbbbe364623c63652db8c0904`) rather than the better-known v2
+(`0x8876789976dEcBfCbBbe364623C63652db8C0904`) rather than the better-known v2
 routers. That is accepted.
 
 ---
@@ -515,7 +515,25 @@ The multiplication must use a 512-bit intermediate; `S_LP * 2**192` overflows
 256 bits. At the default `vE0 = 0.5 ether` this evaluates to exactly
 `5000 * 2**96` with no remainder, tick 170352. Over the permitted `vE0` range
 the tick runs from 115135 to 207243, comfortably inside v4's `+/-887272`, and
-`sqrtPriceTerminal` is always above `MIN_SQRT_PRICE`.
+`sqrtPriceTerminal` is always above `MIN_SQRT_PRICE`. All three ticks are
+confirmed against the deployed PoolManager.
+
+**Pool orientation. Sections 8.2, 8.5 and 10 depend on this and read as
+contradictory without it.** `currency0` is native ETH and `currency1` is the
+launch token, so the pool's price is token per ETH and the tick axis runs
+opposite to the token's ETH price: **the token getting cheaper in ETH moves the
+tick up.** Two consequences are normative. A range lying entirely above the
+current tick is funded in `currency0`, that is in ETH alone; a range lying
+entirely below it is funded in `currency1`, that is in the token alone. A
+standing ETH bid under the token's price is therefore a tick range *above* the
+current tick, and the token-denominated side of the book is below it. Every tick
+comparison in this document is in tick terms unless it says "in price terms".
+
+Wherever graduation needs the pool's current tick it reads `slot0.tick` and must
+not derive it from `slot0.sqrtPriceX96`. `Pool.swap` can leave `slot0.tick` one
+tick below `TickMath.getTickAtSqrtPrice(slot0.sqrtPriceX96)` when a `zeroForOne`
+swap ends exactly on an initialised tick boundary, and the two values then
+disagree by one tick.
 
 Initialising at launch is the primary anti-grief measure. The token address does
 not exist before the launch transaction, so no attacker can reach the pool key
@@ -536,7 +554,8 @@ Permissionless. Requires `state == Graduating`. One transaction, no window.
 ```
 1.  state = Graduated; graduatedAt = block.timestamp      // before any call out
 2.  if slot0(poolKey).sqrtPriceX96 != sqrtPriceTerminal:
-        perform a zero-input swap with sqrtPriceLimitX96 = sqrtPriceTerminal
+        zeroForOne = slot0(poolKey).sqrtPriceX96 > sqrtPriceTerminal
+        swap(zeroForOne, amountSpecified = -1, sqrtPriceLimitX96 = sqrtPriceTerminal)
         require the swap's net currency0 and currency1 deltas are both zero
         require slot0(poolKey).sqrtPriceX96 == sqrtPriceTerminal
 3.  token.approve(PERMIT2, S_LP)
@@ -544,16 +563,18 @@ Permissionless. Requires `state == Graduating`. One transaction, no window.
 4.  mint position A (core):
         tickLower = alignUp(MIN_TICK, tickSpacing)
         tickUpper = alignDown(MAX_TICK, tickSpacing)       // -887200 / 887200
-        token amount: exactly S_LP
-        ETH amount:   at most R_target
+        liquidity:    the largest value whose currency1 requirement is <= S_LP
+        token amount: at most S_LP; require S_LP - consumed <= LP_DUST_MAX
+        ETH amount:   amount0Max = R_target exactly
         recipient:    LiquidityLock
 5.  floorEth = protectionEth + (r - R_target) + (R_target - ETH used by A)
     protectionEth = 0
 6.  if floorEth >= MIN_FLOOR_WEI:
-        mint position B (floor):
-            tickUpper = alignDown(currentTick, tickSpacing) - tickSpacing
-            tickLower = tickUpper - alignDown(FLOOR_RANGE_TICKS, tickSpacing)
-            require tickLower >= alignUp(MIN_TICK, tickSpacing)
+        mint position B (floor), with currentTick read from slot0.tick:
+            tickLower = alignDown(currentTick, tickSpacing) + tickSpacing
+            tickUpper = tickLower + alignDown(FLOOR_RANGE_TICKS, tickSpacing)
+            require tickLower > currentTick
+            require tickUpper <= alignDown(MAX_TICK, tickSpacing)
             ETH amount:   floorEth, single-sided (currency0 only)
             recipient:    LiquidityLock
 7.  r = 0
@@ -568,11 +589,52 @@ Permissionless. Requires `state == Graduating`. One transaction, no window.
 12. emit Graduated
 ```
 
-Position A is minted **token-exact**: it consumes exactly `S_LP` base units and
-at most `R_target` wei. Any unused ETH flows into the floor position in step 5,
-so nothing is stranded and no token dust is immobilised. Because the pool opens
-at exactly the curve's terminal price, the ETH consumed equals `R_target` to
-within the `sqrtPriceTerminal` rounding-down error.
+Step 2's restoring swap nominates a non-zero `amountSpecified`.
+`PoolManager.swap` rejects `amountSpecified == 0` with
+`SwapAmountCannotBeZero()`, so "zero cost" describes what the swap settles, not
+the size it names: in a pool with no liquidity the net deltas are zero in both
+currencies at any nominal size, measured in both directions and at sizes from
+one unit to `1e18`, and step 2 nominates one unit of exact input. The `if` guard
+is equally load-bearing, because a swap whose `sqrtPriceLimitX96` equals the
+pool's current price reverts with `PriceLimitAlreadyExceeded`: a launch whose
+pool price was never moved must skip the swap rather than perform a no-op one.
+The direction is decided by the comparison and follows the orientation of
+section 8.1 — a pool price above `sqrtPriceTerminal` is restored by a
+`zeroForOne` swap, a pool price below it by the other direction.
+
+Position A is sized by liquidity, not by amounts. `MINT_POSITION` is
+parameterised by a liquidity value and the `currency1` owed for a given
+liquidity is a step function of it, so no liquidity value lands on `S_LP`
+exactly. Position A therefore consumes **at most** `S_LP` base units and at most
+`R_target` wei, and the liquidity minted is the largest value that fits: one more
+unit of liquidity would require more than `S_LP`. Measured against the deployed
+PositionManager the token shortfall is 28,428 base units at `vE0 = 1.25e16`,
+1,088 at the default `vE0 = 5e17`, and 240 at `vE0 = 1.25e20`. It is irreducible,
+and Invariant 39 bounds it by `LP_DUST_MAX` as an explicit assertion rather than
+assuming exactness.
+
+That remainder is immobilised. The unspent token never leaves the curve, and
+after graduation the curve has no withdrawal path of any kind, so a few hundred
+base units — on the order of `10**-15` whole tokens — stay there permanently. The
+amount is harmless, but it is not zero: the earlier claim that no token dust is
+immobilised was false and is withdrawn.
+
+`amount0Max` for position A is exactly `R_target` and must not be tightened. An
+`amount0Max` one wei below the amount the mint actually requires is rejected with
+`MaximumAmountExceeded`, `amount0Max = R_target` is accepted, and the ETH
+headroom between the two is **not monotone** in `virtualEthReserve`, so no
+tighter closed-form bound is safe across the permitted range. Any unused ETH
+flows into the floor position in step 5, so no ETH is stranded. Because the pool
+opens at exactly the curve's terminal price, the ETH consumed equals `R_target`
+to within the `sqrtPriceTerminal` rounding-down error.
+
+Step 6's `tickUpper <= alignDown(MAX_TICK, tickSpacing)` requirement cannot fire
+at any permitted parameter set: step 2 has just asserted the price is
+`sqrtPriceTerminal`, whose tick is at most 207243 across the permitted
+`virtualEthReserve` range (section 8.1), and 207243 plus `FLOOR_RANGE_TICKS` is
+far inside the aligned maximum tick at every permitted spacing. It is an
+assertion, not a branch: a graduation that could not place the floor position
+would be a bug rather than a case to handle.
 
 Steps 8 and 9 **credit** rather than send. A creator or bounty earner whose
 address reverts on receiving ETH would otherwise be able to make `graduate()`
@@ -601,7 +663,7 @@ there is always an economic actor willing to call it.
 | Vector | Why it fails |
 |---|---|
 | Pre-initialise the pool at a wrong price | Impossible. The pool is initialised in the launch transaction, before the token address is public. |
-| Move the price of the zero-liquidity pool before graduation | `graduate()` restores it with a zero-input limit swap, which costs nothing in a pool with no liquidity, and asserts the restored price. |
+| Move the price of the zero-liquidity pool before graduation | `graduate()` restores it with a limit swap that nominates one unit of input, settles for nothing in a pool with no liquidity, and asserts both zero net deltas and the restored price. |
 | Add liquidity to the pool so the price reset is not free | The reset is required to have zero net cost, so `graduate()` reverts rather than spending curve ETH. State stays frozen and `graduate()` is retryable forever. |
 | Block the primary pool key permanently | After `ALT_DELAY = 1 hour` in `Graduating`, `graduateAlt(uint24 tickSpacing)` runs the identical procedure on a caller-chosen `tickSpacing` in `[10, 200]`, requiring that pool to be uninitialised so it is initialised at `sqrtPriceTerminal` with no prior liquidity. An attacker would have to pre-block the whole permitted spacing range and keep doing so. |
 | Sell at the cap to prevent graduation | `Graduating` freezes `s`. |
@@ -612,6 +674,21 @@ there is always an economic actor willing to call it.
 `ALT_DELAY` exists so that the honest primary key wins when it is available and
 a caller cannot fragment the canonical pool onto an odd tick spacing for no
 reason.
+
+`graduateAlt`'s requirement that the alternate pool be **uninitialised**
+(Invariant 38) is load-bearing and must not be relaxed, in particular not to
+"uninitialised, or initialised at `sqrtPriceTerminal`" and not to any variant in
+which `graduateAlt` restores a price. Restoring a griefed price costs nothing in
+either currency, but it costs gas in proportion to the tick distance divided by
+the tick spacing, because the swap walks the tick bitmap one word at a time.
+Measured against the deployed PoolManager, restoring from the extreme tick costs
+173k gas of EVM execution at `POOL_TICK_SPACING = 200` and 2.33M at
+`ALT_TICK_SPACING_MIN = 10` — on its own more than the two-million-gas
+graduation that section 8.3 sizes the bounty against. The alt path stays clear of
+that cost only because it opens the pool itself, at `sqrtPriceTerminal`, with
+nothing to restore. Those figures are EVM execution gas under a forked EVM; per
+`docs/CHAIN_FACTS.md` Nitro's `gasleft()` and L1 data costs differ, so treat them
+as the relative cost of the loop and not as a chain gas quote.
 
 `abortGraduation()` returns rather than forfeits the bond because the creator
 met the only condition the bond encodes — reaching the cap before the deadline —
@@ -629,8 +706,10 @@ Three structural mitigations, and one honest admission.
    the first post-graduation block there is no price gap to arbitrage. A
    mis-sized pool price is the usual source of migration sandwich profit and it
    is removed arithmetically, not by a slippage parameter.
-3. The floor position is entirely below spot, so adding it cannot move the
-   price up and cannot create a gap.
+3. The floor position lies entirely on one side of spot — strictly above the
+   current tick, which by the orientation of section 8.1 is the direction of a
+   falling token price — so it holds no token when minted, cannot move the price
+   or the tick, and cannot create a gap.
 
 What remains: the first swap in the new pool is ordinary MEV and is not
 prevented. Whoever wins it captures ordinary price impact, not a protocol
@@ -647,11 +726,18 @@ decreases liquidity or burns a position. There is no owner, no rescue function,
 no sweep, no timelock, no escape hatch. `ownerOf` for a locked position is the
 lock, forever.
 
-Trading fees accruing to a locked position are an open decision (whether the
-lock ships with a permissionless compound-only path from day one, since it
-cannot be added later without weakening the lock). `docs/OPEN_DECISIONS.md`
-records it as blocking Phase 1. Either way, no path exists by which a locked
-position's principal or fees reach any address.
+Trading fees accruing to a locked position are settled by decision 1 of
+`docs/OPEN_DECISIONS.md`: the lock ships with one permissionless compound-only
+function, and the fork test has confirmed that collecting the fees and
+increasing liquidity on the same `tokenId` execute as a single
+`modifyLiquidities` call with no intermediate recipient, so decision 1's
+fallback is not needed. The ratio residual of each compounding is **retained**
+by the lock and accumulates there. It is not reinvested on a later call and the
+lock cannot spend it, because the v4 actions involved work off the PoolManager
+delta of the current call and not off the lock's own balance. Which pair of v4
+actions expresses the compounding is decision 12 and blocks nothing else. Either
+way, no path exists by which a locked position's principal or fees reach any
+address.
 
 ---
 
@@ -661,29 +747,57 @@ position's principal or fees reach any address.
 
 The holder-protection share of every trading fee accrues as `protectionEth` and
 is deposited at graduation as **position B: a single-sided, ETH-only, permanently
-locked Uniswap v4 position occupying the tick range immediately below the
-opening price.**
+locked Uniswap v4 position occupying the band immediately below the opening
+price in price terms, which by the orientation of section 8.1 is the tick range
+immediately above the current tick.**
 
-That is a standing bid. If the price falls into the range, the position buys
-tokens from sellers with the protection pool's ETH, which is exactly the
-support a floor is supposed to be. The tokens it acquires become sell-side
-depth on the way back up. The position is locked, so neither the ETH nor the
-tokens nor the fees ever leave it.
+That is a standing bid. If the token's ETH price falls into the band, the
+position buys tokens from sellers with the protection pool's ETH, which is
+exactly the support a floor is supposed to be. The tokens it acquires become
+sell-side depth on the way back up. The position is locked, so neither the ETH
+nor the tokens nor the fees ever leave it.
 
 The range is `FLOOR_RANGE_TICKS = 13800` ticks wide, which is a price factor of
-`1.0001^13800 = 3.97`. The bid therefore spans from just below the opening
-price down to about 25% of it, concentrating the protection across the drawdown
-band where it matters rather than spreading it thinly to zero.
+`1.0001^13800 = 3.97`. The bid therefore spans from just below the opening price
+down to about 25% of it — the token falling to `1/3.97` of its opening ETH price
+— concentrating the protection across the drawdown band where it matters rather
+than spreading it thinly to zero. Those 13800 ticks are counted *upward* in tick
+terms, which is downward in price terms; the next paragraph gives the range
+explicitly, because the two vocabularies read as contradictory otherwise.
 
-`tickUpper` is `alignDown(currentTick, tickSpacing) - tickSpacing`, which is
-strictly below the current tick's aligned boundary. This guarantees the position
-is single-sided in `currency0` and therefore mintable with ETH alone and
-incapable of moving the opening price.
+The tick direction is the part that is easy to get wrong, so it is stated in both
+vocabularies. `tickLower` is `alignDown(currentTick, tickSpacing) + tickSpacing`,
+which is **strictly greater** than `currentTick`; `tickUpper` is
+`tickLower + alignDown(FLOOR_RANGE_TICKS, tickSpacing)`, which is at most
+`alignDown(MAX_TICK, tickSpacing)`. In price terms that is the band from just
+below the token's opening ETH price down to `1/3.97` of it. A range strictly
+above the current tick is the range v4 funds in `currency0` alone, so position B
+is mintable with ETH and no token approval, holds no token at the moment it is
+minted, and cannot move the opening price. A range below the current tick is
+funded in `currency1`: specifying the floor on that side would make the
+protection pool mint **a sell wall out of the token** instead of a standing ETH
+bid, which is the opposite of this section's purpose.
 
-If `floorEth < MIN_FLOOR_WEI = 1e12` the position is not minted, because v4
-would round the liquidity to zero. That ETH stays in the curve contract, which
-after graduation has no withdrawal path of any kind: it is permanently removed
-from circulation. The amount is bounded above by `1e12` wei, 0.000001 ETH.
+Measured against the deployed PoolManager and PositionManager at the default
+parameters (`currentTick = 170352`, `tickSpacing = 200`), with a 1 ETH probe in
+place of `floorEth`: the range `[170400, 184200]` consumed exactly
+`1_000_000_000_000_000_000` wei and zero base units of the token, with no token
+approval present at all, and a seller crossing the whole range received
+`999_999_999_999_999_999` wei while the position accumulated
+`50_079_062_227_699_919_545_122_979` base units. The mirrored range
+`[156200, 170000]` requires zero `currency0` and
+`12_105_670_708_310_857_288_856_074` base units of `currency1` for the same
+liquidity, and an ETH-only mint of it reverts with `MaximumAmountExceeded`.
+
+If `floorEth < MIN_FLOOR_WEI = 1e12` the position is not minted. The reason is
+de-minimis and not arithmetic: over a range this wide one wei of `floorEth`
+already yields non-zero liquidity and mints successfully, so the earlier
+justification — that v4 would round the liquidity to zero — is false and is
+withdrawn. The constant exists so that graduation does not spend a mint's gas and
+a permanent position NFT on a bid worth less than a millionth of an ETH. The
+skipped ETH stays in the curve contract, which after graduation has no withdrawal
+path of any kind: it is permanently removed from circulation. The amount is
+bounded above by `1e12` wei, 0.000001 ETH.
 
 ### 10.2 Why not snapshot and claim
 
@@ -937,6 +1051,7 @@ creation, so a launch's rules are fixed the moment it exists.
 | `ALT_TICK_SPACING_MIN` / `MAX` | `10` / `200` | ticks |
 | `FLOOR_RANGE_TICKS` | `13800` | ticks |
 | `MIN_FLOOR_WEI` | `10**12` | wei |
+| `LP_DUST_MAX` | `10**5` | base units |
 | `MIN_BOND_WEI` | `10**16` | wei |
 | `MAX_BOND_WEI` | `1000 * 10**18` | wei |
 | `BOND_MIN_BPS_OF_TARGET` | `1000` | bps of `R_target` |
@@ -1123,17 +1238,29 @@ invariant suite.
 
 ### Graduation and liquidity
 
-39. The core position consumes exactly `LP_SUPPLY` base units of the token and at
-    most `8 * vE0` wei.
+39. The core position consumes **at most** `LP_SUPPLY` base units of the token and
+    at most `8 * vE0` wei. The token remainder, `LP_SUPPLY` minus the amount
+    consumed, is at most `LP_DUST_MAX`, and graduation asserts that bound
+    explicitly rather than assuming the amount is exact. The liquidity minted is
+    the largest value whose `currency1` requirement does not exceed `LP_SUPPLY`:
+    one more unit of liquidity would require more than `LP_SUPPLY`.
 40. The pool's `sqrtPriceX96` equals `sqrtPriceTerminal` immediately before the
     core position is minted.
-41. Any price-restoring swap performed by `graduate` has zero net currency0 and
-    zero net currency1 delta. The curve never spends ETH or tokens on a swap.
+41. Any price-restoring swap performed by `graduate` or `graduateAlt` has zero net
+    currency0 and zero net currency1 delta, whatever non-zero `amountSpecified`
+    it nominates. The curve never spends ETH or tokens on a swap.
 42. The floor position, when minted, has
-    `tickUpper < alignDown(currentTick, tickSpacing)` and is funded in
-    `currency0` only.
-43. After graduation, `ethReserve == 0` and the curve's remaining ETH balance is
-    at most `MIN_FLOOR_WEI` plus the unclaimed fee, bounty and bond buckets.
+    `tickLower == alignDown(currentTick, tickSpacing) + tickSpacing` and therefore
+    `tickLower > currentTick`, with `currentTick` read from `slot0.tick` and not
+    derived from `slot0.sqrtPriceX96`; it has
+    `tickUpper == tickLower + alignDown(FLOOR_RANGE_TICKS, tickSpacing)` and
+    `tickUpper <= alignDown(MAX_TICK, tickSpacing)`; and it is funded in
+    `currency0` only, consuming zero base units of the token and requiring no
+    token approval.
+43. After graduation, `ethReserve == 0`, the curve's remaining ETH balance is
+    at most `MIN_FLOOR_WEI` plus the unclaimed fee, bounty and bond buckets, and
+    the curve's remaining token balance is at most `LP_DUST_MAX` plus any tokens
+    force-sent to it.
 44. The graduation bounty is at most `protocolFeeEth` at the time of graduation,
     and is never drawn from `ethReserve`, `protectionEth`, `creatorFeeEth` or
     `bondWei`.
@@ -1143,7 +1270,11 @@ invariant suite.
 46. Every position NFT minted by graduation is owned by `LiquidityLock`
     immediately after the transaction, and `LiquidityLock` contains no code path
     that calls `transferFrom`, `safeTransferFrom`, `approve`, `setApprovalForAll`
-    or any liquidity-decreasing or position-burning PositionManager action.
+    or any liquidity-decreasing or position-burning PositionManager action. If
+    decision 12 of `docs/OPEN_DECISIONS.md` settles on the compounding encoding
+    that credits fees with a zero-liquidity `DECREASE_LIQUIDITY`, the final
+    clause reads instead: no such call with a non-zero liquidity argument, the
+    zero being a hard-coded literal in the encoding and not a parameter.
 47. After graduation the protocol charges no fee on any trade. All post-graduation
     trading fees accrue inside the locked positions.
 

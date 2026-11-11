@@ -13,18 +13,21 @@ and whether it blocks Phase 1 (the Solidity implementation).
 
 ## 1. Trading fees accruing to the permanently locked positions
 
-**RESOLVED 2026-11-11 by the founder: permissionless compound-only.**
+**RESOLVED 2026-11-11 by the founder: permissionless compound-only.
+CONFIRMED BY FORK TEST 2026-11-11: the condition below is met, the fallback is
+not needed, and the implementation facts are recorded at the end of this
+entry.**
 
 `LiquidityLock` gets a single permissionless function that collects the
 position's accrued fees and reinvests them into that same position. No
 recipient parameter, no withdrawal path, no transfer path. Every wei stays
 inside the lock and the position can only grow.
 
-This is conditional on the fork test named in the appendix proving that
+This was conditional on the fork test named in the appendix proving that
 collect and increase execute as one `modifyLiquidities` call with no
-intermediate recipient. If they cannot, the fallback is **no collection at
-all** — not a two-step version that holds funds between calls. That fallback
-is pre-approved and needs no further decision.
+intermediate recipient. They do, in two different encodings, so the fallback —
+**no collection at all**, never a two-step version that holds funds between
+calls — is not taken. Which encoding ships is decision 12.
 
 Because the lock is not upgradeable, this function must be written and
 reviewed as the riskiest code in the repository: it is the only code with a
@@ -51,9 +54,11 @@ the position's economic value.
 
 **B. Permissionless compound-only.** One function, callable by anyone, that in a
 single `modifyLiquidities` call collects the accrued fees and increases liquidity
-on the same `tokenId`, with any ratio residual left in the lock and re-used on the
-next call. The lock still has no transfer, decrease or burn path, and no address
-can receive value from it. Cost: real contract surface — the lock now encodes v4
+on the same `tokenId`, with any ratio residual left in the lock, where it
+accumulates permanently and is never reinvested (fact 3 below; the phrase
+"re-used on the next call" that stood here was wrong). The lock still has no
+transfer path, no burn path and no liquidity-decreasing path — subject to the one
+qualification in decision 12 — and no address can receive value from it. Cost: real contract surface — the lock now encodes v4
 action sequences, holds transient balances within a transaction, and holds a
 permanent residual it cannot spend. Each of those is a line of attack that option
 A does not have.
@@ -79,14 +84,48 @@ and the claim "fees stay in the position" is strictly stronger than "fees are
 stranded". Conditional on the Phase 1 fork test demonstrating that collect plus
 increase on the same `tokenId` can be expressed as one `modifyLiquidities` call
 with no intermediate recipient. If that is not achievable, fall back to A rather
-than building a two-step version that holds funds across calls.
+than building a two-step version that holds funds across calls. That test has
+since been run: the condition is met, so the conditional is discharged and the
+facts below replace it.
+
+### Implementation facts measured on the fork
+
+Measured 2026-11-11 against the deployed PoolManager and PositionManager on
+chain 4663. These are the facts the lock's author needs and must not re-derive
+from memory.
+
+1. **Collect and increase are one call.** `INCREASE_LIQUIDITY` with a non-zero
+   liquidity issues a single `PoolManager.modifyLiquidity`, and its returned
+   delta already nets the collected fees against the cost of the new liquidity;
+   two `CLOSE_CURRENCY` actions then settle both sides. No recipient parameter
+   names any address at any point: `CLOSE_CURRENCY` pays to `msgSender()`, which
+   for a call the lock makes is the lock, which is also the position's owner.
+2. **The one call collects every wei.** The position's accrued fees are zero in
+   both currencies immediately afterwards, so nothing is left in PoolManager for
+   a later caller to find or race for.
+3. **The ratio residual is retained, not reinvested.** Both
+   `INCREASE_LIQUIDITY_FROM_DELTAS` and `CLOSE_CURRENCY` work off the
+   PoolManager delta of the current call, not off the lock's own balance, so a
+   residual left by an earlier compounding is invisible to a later one. It
+   accumulates in the lock. Folding it back in would require the lock to forward
+   ETH as `msg.value` and to hold a Permit2 approval for its own token, which is
+   exactly the lock surface this decision is trying not to add. Compounding is
+   nonetheless repeatable: a second round after further trading grew the position
+   again and left the first round's residual untouched.
+4. **No third party can collect or redirect the fees.** `PositionManager` reverts
+   `NotApproved` when a non-owner submits a collect for the locked `tokenId`, and
+   the only recipient the compounding encoding can name is the lock itself.
 
 ---
 
 ## 2. Fallback if the free v4 price reset is not achievable
 
 **RESOLVED 2026-11-11 by the tech lead: ship as specified if the fork test
-passes, otherwise the committed fallback.**
+passes, otherwise the committed fallback. CONFIRMED BY FORK TEST 2026-11-11: the
+zero-net-delta reset holds in both directions and at any nominal size, so the
+specification ships and the fallback is not taken. The one wording change the
+test forced — a swap of literally zero is not executable — is recorded in the
+appendix and corrected in spec 8.2 step 2.**
 
 The first fork test Phase 1 writes answers this. If a zero-net-delta swap
 restores the price of a zero-liquidity v4 pool, the specification ships
@@ -104,7 +143,7 @@ Section 8.2 of the spec requires `graduate()` to restore a manipulated
 zero-liquidity pool to `sqrtPriceTerminal` with a swap whose net deltas in both
 currencies are zero, and to revert otherwise. The design assumes v4 permits such
 a swap. This must be confirmed by fork test against
-`0x8366a39cc670b4001a1121b8f6a443a643e40951`. If it reverts, or if it cannot be
+`0x8366a39CC670B4001A1121B8F6A443A643e40951`. If it reverts, or if it cannot be
 made to produce exactly zero deltas, the specified anti-grief path does not work
 and section 8.4 needs a different primary answer.
 
@@ -303,15 +342,17 @@ Does not block Phase 1.
 
 ### Question
 
-The floor position spans `FLOOR_RANGE_TICKS = 13800` ticks below spot, a price
-factor of 3.97. Is that the right width?
+The floor position spans `FLOOR_RANGE_TICKS = 13800` ticks below spot in price
+terms — which per spec 8.1 and 10.1 is the tick range *above* the current tick,
+because `currency0` is ETH — a price factor of 3.97. Is that the right width?
 
 ### Options
 
 **A. 13800 ticks (about 4x, specified).** Concentrates the protection pool across
 a 75% drawdown.
 
-**B. Full range to the minimum tick.** Catches any decline, however deep.
+**B. Full range to the deepest price, that is to the aligned maximum tick.**
+Catches any decline, however deep.
 Spreads the same ETH so thinly that it provides almost no support in the band
 where most of the selling happens.
 
@@ -485,21 +526,95 @@ hypothetical self-grief that A permits and that gains nobody anything.
 
 ---
 
+## 12. Which v4 action pair the lock's compounding path uses
+
+Does not block Phase 1. This is for the contracts engineer; decision 1 has
+already settled *that* the lock compounds, and the fork test has shown both
+candidate encodings work as one `modifyLiquidities` call with no intermediate
+recipient.
+
+### Question
+
+Which action sequence does `LiquidityLock`'s single permissionless function
+encode?
+
+### Options
+
+**A. `INCREASE_LIQUIDITY` + `CLOSE_CURRENCY` + `CLOSE_CURRENCY`.** The caller
+passes the liquidity to add. One `PoolManager.modifyLiquidity` whose delta
+already nets the collected fees against the cost of the new liquidity; the two
+`CLOSE_CURRENCY` actions route the residual back to `msgSender()`, the lock
+itself. The lock's bytecode then contains no liquidity-decreasing action id at
+all, so Invariant 46 holds in its strongest literal form.
+
+**B. `DECREASE_LIQUIDITY`(liquidity 0) + `INCREASE_LIQUIDITY_FROM_DELTAS` +
+`CLOSE_CURRENCY` + `CLOSE_CURRENCY`.** A decrease of zero liquidity credits the
+accrued fees, and `INCREASE_LIQUIDITY_FROM_DELTAS` with `type(uint128).max` for
+both amounts spends exactly that credit. The caller passes no amount of any kind.
+
+### Trade-offs
+
+A takes a caller-supplied number into the riskiest function in the repository. An
+overstated number cannot make the lock pay out of its retained residual — the
+lock forwards no `msg.value` and holds no Permit2 approval for its own token, so
+the settle leg reverts — but an understated one is a permanent griefing vector:
+anyone may call with a liquidity of 1, which collects the entire accrued fee and
+compounds almost none of it, pushing the rest into the residual that nobody,
+including the lock, can ever spend. That destroys value rather than stealing it,
+and the fees so diverted can never be collected again. Repeated cheaply after
+every accrual, it reduces option B of decision 1 to option A of decision 1 at an
+attacker's choice.
+
+B removes the parameter and with it that grief: the amount is the position's own
+fee delta and nothing else. The cost is that the lock's action list contains
+`DECREASE_LIQUIDITY`, with a hard-coded zero. Nothing can make that zero
+non-zero — it is a literal in the encoding, not an argument — but an auditor must
+verify a constant rather than observe an absence, and Invariant 46's literal form
+becomes "no liquidity-decreasing action with a non-zero liquidity argument".
+
+### Recommendation
+
+**B.** Removing the only caller-controlled input from the only function that ever
+touches a position that must otherwise never move is worth more than the stronger
+reading of Invariant 46, and the grief A permits is cheap, repeatable and
+irreversible. `docs/SPEC.md` Invariant 46 already carries the qualified wording
+conditioned on this choice, so picking B needs no further spec change and picking
+A lets the qualification be deleted. A third variant — A, but with the lock
+computing the liquidity on-chain from the position's own fee growth instead of
+accepting it as an argument — closes the grief as well, and is rejected because
+it puts more arithmetic in the lock than B's hard-coded zero does.
+
+---
+
 ## Verification prerequisites for Phase 1
 
-Not decisions. These are v4 behaviours the spec assumes and that must be
-confirmed by fork test against the addresses in `docs/CHAIN_FACTS.md` before the
-corresponding part of the spec is treated as final. Each names the decision or
-spec section it resolves.
+Not decisions. These were v4 behaviours the spec assumed. All six were tested on
+2026-11-11 by `contracts/test/fork/V4Assumptions.t.sol` against the addresses in
+`docs/CHAIN_FACTS.md`. Four held, two were refuted, and `docs/SPEC.md` and
+`docs/THREAT_MODEL.md` have been corrected accordingly. Each row below states the
+assumption in its **corrected** form, the part of the spec it resolves, and the
+result.
 
-| Assumption | Resolves |
-|---|---|
-| A zero-liquidity pool's price can be restored with a swap whose net deltas in both currencies are zero. | Decision 2; spec 8.2, Invariant 41 |
-| `collect` and `increaseLiquidity` on the same `tokenId` can be expressed as one `modifyLiquidities` call with no intermediate recipient. | Decision 1 |
-| A single-sided native-ETH position with `tickUpper` strictly below the current tick can be minted through PositionManager, funded in `currency0` only. | Spec 8.2 step 6, section 10.1, Invariant 42 |
-| Minting with an exact `currency1` amount and a bounded `currency0` amount consumes exactly `LP_SUPPLY` and at most `R_target`, and the residual is recoverable to the curve. | Spec 8.2 step 4, Invariant 39 |
-| The token approval path for PositionManager requires `token.approve(PERMIT2, ...)` followed by `PERMIT2.approve(token, POSITION_MANAGER, ...)`, and nothing else. | Spec 8.2 step 3 |
-| `PoolManager.initialize` with `hooks = address(0)` succeeds and leaves the pool with zero liquidity. | Spec 8.1 |
+| Assumption | Resolves | Result |
+|---|---|---|
+| A zero-liquidity pool's price can be restored with a swap whose net deltas in both currencies are zero, for any non-zero nominal `amountSpecified`. | Decision 2; spec 8.2, Invariant 41 | Holds, in both directions and at sizes from 1 to `1e18`. The *phrasing* "zero-input swap" was refuted: `amountSpecified == 0` reverts `SwapAmountCannotBeZero()`, and a limit equal to the current price reverts `PriceLimitAlreadyExceeded`, so spec 8.2 step 2 now nominates one unit of input, keeps its `if` guard and picks direction by comparison. Restoration stops being free as soon as anyone adds liquidity, which is the mitigation threat model 4.3 claims. |
+| `collect` and `increaseLiquidity` on the same `tokenId` can be expressed as one `modifyLiquidities` call with no intermediate recipient. | Decision 1 | Holds, in two encodings. See decision 1's implementation facts and decision 12. |
+| A single-sided native-ETH position with `tickLower` strictly **above** the current tick can be minted through PositionManager, funded in `currency0` only. | Spec 8.2 step 6, section 10.1, Invariant 42 | **Refuted as originally written.** The original read "`tickUpper` strictly below the current tick", which v4 funds in `currency1`: as specified, the holder-protection pool would have minted a token-funded sell wall instead of a standing ETH bid. The corrected direction holds and is now specified. |
+| Minting with a bounded `currency1` amount and a bounded `currency0` amount consumes at most `LP_SUPPLY` with a remainder under `LP_DUST_MAX`, at most `R_target`, and the ETH residual is recoverable to the curve. | Spec 8.2 step 4, Invariant 39 | **Half refuted.** "At most `R_target`" holds and `R_target` is the exact bound; ETH headroom is not monotone in `virtualEthReserve`, so `amount0Max` must be `R_target`. "Exactly `LP_SUPPLY`" is unachievable: `MINT_POSITION` is parameterised by liquidity and the `currency1` owed is a step function of it, leaving an irreducible 28,428 / 1,088 / 240 base units across the permitted range. The ETH residual is recoverable; the token remainder is stranded in the curve. |
+| The token approval path for PositionManager requires `token.approve(PERMIT2, ...)` followed by `PERMIT2.approve(token, POSITION_MANAGER, ...)`, and nothing else. | Spec 8.2 step 3 | Holds, and both legs are necessary. A direct `token.approve(POSITION_MANAGER, ...)` is not the path; either leg alone fails, on `AllowanceExpired` or inside the ERC-20 transfer. |
+| `PoolManager.initialize` with `hooks = address(0)` succeeds and leaves the pool with zero liquidity. | Spec 8.1 | Holds. `sqrtPriceTerminal` is exactly `5000 * 2**96` at the default and ticks 170352, 115135 and 207243 were reproduced; a second `initialize` on the same key reverts `PoolAlreadyInitialized`, which is what makes initialising at launch an anti-grief measure. |
+
+Two further measured facts, neither among the six, for whoever writes the
+graduation path and the lock:
+
+- `Pool.swap` can leave `slot0.tick` one tick below
+  `TickMath.getTickAtSqrtPrice(slot0.sqrtPriceX96)` when a `zeroForOne` swap ends
+  exactly on an initialised tick boundary. The floor range's `currentTick` must
+  therefore be read from `slot0.tick` and never derived from the price. Now
+  stated in spec 8.1 and asserted by Invariant 42.
+- One wei of floor ETH mints non-zero liquidity over a 13800-tick range and the
+  mint succeeds, so `MIN_FLOOR_WEI` is a de-minimis threshold and not a rounding
+  guard. Spec 10.1's justification has been restated; the constant is kept.
 
 ### Addresses that belong in `docs/CHAIN_FACTS.md`
 

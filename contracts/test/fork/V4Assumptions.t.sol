@@ -81,6 +81,11 @@ contract V4AssumptionsForkTest is Test {
     // ---------------------------------------------------------------------
 
     uint256 internal constant TOTAL_SUPPLY = 1_000_000_000e18;
+
+    /// @dev Spec 15.1. The bound Invariant 39 asserts on the graduation mint's
+    /// token remainder. Kept identical to the specification so the test fails if
+    /// either side drifts; the largest measured shortfall is 28,428.
+    uint256 internal constant LP_DUST_MAX = 10 ** 5;
     uint256 internal constant LP_SUPPLY = 100_000_000e18;
     uint256 internal constant VE0 = 5e17;
     uint256 internal constant R_TARGET = 8 * VE0; // ETH_TARGET_MULTIPLE * vE0 = 4 ether
@@ -436,8 +441,9 @@ contract V4AssumptionsForkTest is Test {
     }
 
     /// @notice The size of the shortfall, across the whole permitted `virtualEthReserve`
-    /// range. It is a few hundred base units — dust, but never zero, so the spec's
-    /// "token-exact" claim and Invariant 39's "exactly LP_SUPPLY" need a tolerance.
+    /// range. It is a few hundred base units — dust, but never zero, which is why
+    /// spec 8.2 and Invariant 39 bound the remainder by `LP_DUST_MAX` instead of
+    /// claiming the mint is token-exact.
     function test_assumption4_currency1ShortfallAcrossThePermittedRange() public {
         uint256[3] memory reserves = [uint256(1.25e16), uint256(5e17), uint256(1.25e20)];
         for (uint256 i = 0; i < reserves.length; i++) {
@@ -446,8 +452,11 @@ contract V4AssumptionsForkTest is Test {
             emit log_named_uint("  currency0 left unspent of R_target (wei)", short0);
             emit log_named_uint("  currency1 left unspent of LP_SUPPLY (base units)", short1);
             assertGt(short1, 0, "currency1 was consumed exactly");
-            assertLt(short1, 1e6, "the currency1 shortfall is larger than dust");
-            assertLt(short0, 1e6, "the currency0 shortfall is larger than dust");
+            assertLe(short1, LP_DUST_MAX, "the currency1 shortfall exceeds LP_DUST_MAX");
+            // The currency0 side has no spec constant: it is bounded by amount0Max,
+            // which graduation sets to R_target. Asserted against the same dust bound
+            // only to catch a gross regression, not because the spec requires it.
+            assertLt(short0, LP_DUST_MAX, "the currency0 shortfall is larger than dust");
         }
     }
 

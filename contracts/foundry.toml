@@ -7,8 +7,18 @@ libs = ["lib"]
 solc_version = "0.8.38"
 evm_version = "cancun"
 optimizer = true
-optimizer_runs = 1_000_000
-via_ir = false
+# `BondingCurve` is a full per-launch deployment, so the contract that carries its
+# creation code has to fit under EIP-170's 24,576-byte limit with it. At 1,000,000 runs it
+# does not: the optimizer trades size for execution gas, and per docs/CHAIN_FACTS.md the
+# cost on this chain is dominated by L1 data posting rather than L2 execution, so that is
+# the wrong trade here as well as an undeployable one. 200 runs with the IR pipeline keeps
+# every contract inside the limit; `forge build --sizes` is the check that holds this.
+optimizer_runs = 200
+# One consequence for test authors: with the IR pipeline the optimizer may rematerialise a
+# `block.timestamp` read across an external call, so a value cached in a local before a
+# `vm.warp` is not reliable afterwards. Derive warp targets from contract state — a
+# schedule's `start`, a timelock's `readyAt` — rather than from a cached timestamp.
+via_ir = true
 bytecode_hash = "none"
 cbor_metadata = false
 
@@ -46,6 +56,22 @@ runs = 10_000
 [profile.ci.invariant]
 runs = 1_000
 depth = 150
+
+# The Solidity linter runs as part of `forge build`, and `deny = "warnings"` makes any
+# finding fatal. Two lints are excluded project-wide because they are inapplicable to this
+# codebase by construction rather than case by case. Every other finding is either fixed
+# or carries an inline suppression stating why that specific line is intended.
+#
+# block-timestamp    docs/CHAIN_FACTS.md rules out `block.number` on this Nitro chain and
+#                    docs/SPEC.md section 1 requires `block.timestamp` for all time logic,
+#                    so every deadline, vesting and timelock comparison is deliberate.
+# reentrancy-events  the detector treats an internal library call such as
+#                    `CurveMath.sellQuote` as an external call, so it fires on events
+#                    emitted before a function's only real external call. Every function
+#                    it reports holds a reentrancy guard, so no reentrant call can
+#                    reorder or fabricate a log.
+[lint]
+exclude_lints = ["block-timestamp", "reentrancy-events"]
 
 [fmt]
 line_length = 100

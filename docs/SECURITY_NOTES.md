@@ -69,9 +69,33 @@ and fails the job itself, because no flag does it.
 
 Slither 0.11.6 is the current release, so there is no upgrade to take. The
 failure does not depend on the IR pipeline: `via_ir = false` produces the same
-six errors and the same 35 findings. A minimal reproduction of the most obvious
-suspect — a chained `using SafeCast for uint256` call — does **not** reproduce
-it, so the triggering construct is not yet identified.
+six errors and the same 35 findings.
+
+The triggering construct is not yet identified. Three hypotheses have been
+eliminated by minimal reproduction, recorded so that nobody spends the time
+again — none of the following reproduces the error in isolation against the same
+solc and the same Slither:
+
+- **SafeCast through a `using` directive.** The correlation looked strong: every
+  failing function uses a SafeCast method other than `toUint128`, and `sell`,
+  which parses cleanly, uses only `toUint128`. A contract exercising `toUint8`,
+  `toUint64`, `toUint160` and a chained `toInt256().toInt24()`, with `using
+  SafeCast` attached to both `uint256` and `int256`, analyses cleanly. The
+  correlation is coincidence.
+- **Errors and events declared in an interface and used in the implementation.**
+  `sell` parses cleanly while reverting with four interface-declared errors and
+  emitting an interface-declared event, and `_mintData` and
+  `_compoundData` fail while containing no `revert` and no `emit` at all.
+- **`bytes("")`, a string-literal conversion.** It occurs in exactly two places
+  in the codebase and both are inside failing functions, which made it the best
+  positional fit of the three. A contract using `bytes("")`, a bare `""`, a named
+  `bytes` constant and `hex""` in an `abi.encode` analyses cleanly.
+
+What the two smallest failing functions still have in common, and what the next
+reproduction should isolate, is that both take a `PoolKey` and read a `Currency`
+from it while indexing a library of `uint256` action constants — that is, the
+Uniswap v4 type and library surface, which none of the reproductions above
+imported.
 
 **Status: open, and a gate on closing the contracts phase.** Until it is fixed,
 treat static analysis of `BondingCurve` and `LiquidityLock.compound` as not

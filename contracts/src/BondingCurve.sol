@@ -331,9 +331,6 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
             spacing < PledrinConstants.ALT_TICK_SPACING_MIN
                 || spacing > PledrinConstants.ALT_TICK_SPACING_MAX
         ) revert InvalidTickSpacing(tickSpacing);
-        if (block.timestamp < uint256(capReachedAt) + PledrinConstants.ALT_DELAY) {
-            revert AltDelayNotElapsed();
-        }
         _settle(spacing, true);
     }
 
@@ -601,6 +598,13 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
     /// and the bounty are credited, not pushed (Invariant 45).
     function _settle(int24 tickSpacing, bool alternate) private {
         if (state != State.Graduating) revert WrongState(state);
+        // The alternate path's delay is checked here rather than in `graduateAlt`, so that
+        // the state check runs first: a launch that has already graduated answers
+        // `WrongState` instead of telling the caller to wait out a delay that is not what
+        // stands in their way.
+        if (alternate && block.timestamp < uint256(capReachedAt) + PledrinConstants.ALT_DELAY) {
+            revert AltDelayNotElapsed();
+        }
 
         state = State.Graduated;
         graduatedAt = block.timestamp.toUint64();

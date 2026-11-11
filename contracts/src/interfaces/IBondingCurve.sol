@@ -193,8 +193,16 @@ interface IBondingCurve {
     error FirstBuyTooLarge(uint256 tokensOut);
     /// @notice The bucket is empty.
     error NothingToClaim();
-    /// @notice The bond has not been returned, so there is nothing to claim.
+    /// @notice The bond is still posted against a launch that has not settled, so it is
+    /// not claimable yet.
     error BondNotReturned();
+    /// @notice This launch posted no dev bond, so it has none to pay.
+    error NoBondPosted();
+    /// @notice The bond was forfeited to this launch's holders and will never be paid to
+    /// the creator.
+    error BondForfeitedToHolders();
+    /// @notice The returned bond has already been paid to the creator.
+    error BondAlreadyClaimed();
     /// @notice An ETH transfer out of the curve failed.
     error EthTransferFailed(address to, uint256 amount);
     /// @notice A launch token transfer failed.
@@ -283,6 +291,12 @@ interface IBondingCurve {
     function claimProtocolFees() external returns (uint256 amount);
 
     /// @notice Pays a returned bond to the creator.
+    /// @dev Every refusal names the truth rather than an empty bucket. Three come from the
+    /// bond state: `NoBondPosted` for a launch that never posted one,
+    /// `BondForfeitedToHolders` for a bond already donated into the reserve, and
+    /// `BondNotReturned` only while the bond is still held and the launch can still
+    /// settle. The fourth, `BondAlreadyClaimed`, is the `Returned` state with an empty
+    /// credit, which is reachable only after a successful claim.
     /// @return amount Wei transferred.
     function claimBond() external returns (uint256 amount);
 

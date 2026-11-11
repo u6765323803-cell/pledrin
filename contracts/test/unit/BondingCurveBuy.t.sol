@@ -128,6 +128,9 @@ contract BondingCurveBuyTest is PledrinTestBase {
     }
 
     /// @notice Invariant 32: the buy window closes at `gradDeadline`, exactly.
+    /// @dev Both calls carry a live deadline, so this is the window boundary on its own and
+    /// says nothing about which refusal wins when the caller's deadline has also passed.
+    /// That is `test_buyAnswersTheWindowBeforeTheCallersOwnDeadline`.
     function test_buyRevertsAtTheGraduationDeadlineAndSucceedsOneSecondBefore() public {
         (BondingCurve curve,) = createDefaultLaunch();
 
@@ -139,6 +142,69 @@ contract BondingCurveBuyTest is PledrinTestBase {
         vm.prank(TRADER);
         vm.expectRevert(IBondingCurve.BuyWindowClosed.selector);
         curve.buy{value: 1 ether}(0, vm.getBlockTimestamp());
+    }
+
+    /// @notice **Invariant 32's order**, which is `WrongState`, `BuyWindowClosed`,
+    /// `DeadlinePassed`, `BuyTooSmall`. A call that is both stale and past `gradDeadline`
+    /// answers `BuyWindowClosed`, the refusal no later call can clear, and a stale call
+    /// inside the window still answers `DeadlinePassed`.
+    /// @dev Both directions are required to pin the order, and neither alone does it: the
+    /// first distinguishes this order from the reverse, and the second is what makes the
+    /// first free rather than a trade of one misleading refusal for another — while the
+    /// window is open the window check cannot fire, so a buy that merely sat in the mempool
+    /// is still told to resubmit, and the resubmission is shown succeeding.
+    ///
+    /// The launch is deliberately left `Live` past its deadline, which is the only way both
+    /// conditions can hold at once: nobody has called `expire()`, and `buy` does not call
+    /// it. The two ends of the order are asserted alongside the middle, so that the
+    /// sequence is pinned as a whole — a value below `MIN_BUY_WEI` does not displace the
+    /// deadline, and an expired launch answers for its state before any of the three.
+    function test_buyAnswersTheWindowBeforeTheCallersOwnDeadline() public {
+        (BondingCurve curve,) = createDefaultLaunch();
+
+        // Inside the window with a stale deadline: the clearable refusal, and it really
+        // does clear on resubmission.
+        vm.warp(curve.gradDeadline() - 1);
+        vm.prank(TRADER);
+        vm.expectRevert(IBondingCurve.DeadlinePassed.selector);
+        curve.buy{value: 1 ether}(0, vm.getBlockTimestamp() - 1);
+        vm.prank(TRADER);
+        assertGt(
+            curve.buy{value: 1 ether}(0, vm.getBlockTimestamp()), 0, "the resubmission succeeds"
+        );
+
+        // A stale deadline still outranks a value below the minimum, so the deadline is
+        // reported to a caller who can act on both.
+        vm.prank(TRADER);
+        vm.expectRevert(IBondingCurve.DeadlinePassed.selector);
+        curve.buy{value: PledrinConstants.MIN_BUY_WEI - 1}(0, vm.getBlockTimestamp() - 1);
+
+        // At the deadline, stale as well, with the launch still `Live` because nobody has
+        // expired it: the permanent refusal is the one the caller is given.
+        vm.warp(curve.gradDeadline());
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Live), "nobody has expired it");
+        vm.prank(TRADER);
+        vm.expectRevert(IBondingCurve.BuyWindowClosed.selector);
+        curve.buy{value: 1 ether}(0, vm.getBlockTimestamp() - 1);
+
+        // And resubmitting with a fresh deadline gets the same answer, which is what makes
+        // the previous one the right one: there was nothing to come back for.
+        vm.prank(TRADER);
+        vm.expectRevert(IBondingCurve.BuyWindowClosed.selector);
+        curve.buy{value: 1 ether}(0, vm.getBlockTimestamp());
+
+        // Past the window and below the minimum: still the window.
+        vm.prank(TRADER);
+        vm.expectRevert(IBondingCurve.BuyWindowClosed.selector);
+        curve.buy{value: PledrinConstants.MIN_BUY_WEI - 1}(0, vm.getBlockTimestamp() - 1);
+
+        // Once somebody does expire the launch, the state answers before all three.
+        curve.expire();
+        vm.prank(TRADER);
+        vm.expectRevert(
+            abi.encodeWithSelector(IBondingCurve.WrongState.selector, IBondingCurve.State.Expired)
+        );
+        curve.buy{value: PledrinConstants.MIN_BUY_WEI - 1}(0, vm.getBlockTimestamp() - 1);
     }
 
     /// @notice `MIN_BUY_WEI`, one wei below and exactly at.

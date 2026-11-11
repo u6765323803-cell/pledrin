@@ -413,10 +413,20 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
 
     /// @inheritdoc IBondingCurve
     function claimBond() external nonReentrant returns (uint256 amount) {
-        if (bondState != BondState.Returned) revert BondNotReturned();
+        BondState bond = bondState;
+        if (bond != BondState.Returned) {
+            if (bond == BondState.None) revert NoBondPosted();
+            if (bond == BondState.Forfeited) revert BondForfeitedToHolders();
+            // `BondState` has four values and is only ever written to one of them, so the
+            // case left here is `Bonded`: the bond is posted against a launch that has not
+            // settled, and that is the one refusal a later call can turn into a payment.
+            revert BondNotReturned();
+        }
 
         amount = pendingBondWei;
-        if (amount == 0) revert NothingToClaim();
+        // The credit is written once, by the transition that set `Returned`, and nothing
+        // ever adds to it, so an empty credit in this state means the bond has been paid.
+        if (amount == 0) revert BondAlreadyClaimed();
         pendingBondWei = 0;
 
         emit FeesClaimed(address(this), creator, FeeKind.Bond, amount);
@@ -514,8 +524,13 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
         returns (uint256 tokensOut, uint256 refund)
     {
         if (state != State.Live) revert WrongState(state);
-        if (block.timestamp > deadline) revert DeadlinePassed();
+        // The launch's window is consulted before the caller's own deadline. A call that is
+        // both stale and past `gradDeadline`, on a launch nobody has yet moved out of
+        // `Live` with `expire()`, would otherwise be told to resubmit against a window no
+        // later call can reopen. While the window is open this check cannot fire, so a
+        // stale call still answers `DeadlinePassed`.
         if (block.timestamp >= gradDeadline) revert BuyWindowClosed();
+        if (block.timestamp > deadline) revert DeadlinePassed();
         if (value < PledrinConstants.MIN_BUY_WEI) revert BuyTooSmall();
 
         uint128 sold = tokensSold;

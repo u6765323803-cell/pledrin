@@ -458,8 +458,10 @@ contract BondingCurveLifecycleTest is PledrinTestBase {
         vm.expectRevert(wrongState);
         curve.graduate();
 
-        uint256 altReady = uint256(curve.capReachedAt()) + PledrinConstants.ALT_DELAY;
-        if (altReady > vm.getBlockTimestamp()) vm.warp(altReady);
+        // No warp past `ALT_DELAY` is needed to reach this refusal: `graduateAlt` checks
+        // the state before the delay, so a terminal launch answers `WrongState` wherever
+        // the clock stands. Not warping is also what keeps this helper's own claim exact —
+        // the state it asserts at the end is the state every call above it saw.
         vm.expectRevert(wrongState);
         curve.graduateAlt(100);
 

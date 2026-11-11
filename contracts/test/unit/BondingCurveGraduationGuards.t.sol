@@ -52,6 +52,48 @@ contract BondingCurveGraduationGuardsTest is PledrinTestBase {
         assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "Graduated");
     }
 
+    /// @notice **Invariant 37's second half and section 16.2's check order.** The state
+    /// check precedes the alternate-delay check, so a launch that has already graduated is
+    /// told which state refused it rather than told to wait out a delay that is not what
+    /// stands in its caller's way.
+    /// @dev Both launches are inspected at the same instant, inside `ALT_DELAY`, and
+    /// differ only in state. That is what makes this a test of the order of the two checks
+    /// rather than of either check alone: with the delay checked first, the graduated
+    /// launch would answer `AltDelayNotElapsed` and this would fail. The launch that is
+    /// genuinely waiting is asserted alongside it, so the test also shows the delay check
+    /// still fires where it is the real blocker, and the calldata verdict is shown
+    /// preceding both in either state.
+    function test_aGraduatedLaunchIsRefusedForItsStateAndNotForTheAltDelay() public {
+        (BondingCurve graduated,) = createLaunchAtCap();
+        (BondingCurve graduating,) = createLaunchAtCap();
+
+        vm.prank(GRADUATOR);
+        graduated.graduate();
+
+        assertEq(graduated.capReachedAt(), graduating.capReachedAt(), "one clock for both");
+        assertLt(
+            vm.getBlockTimestamp(),
+            uint256(graduated.capReachedAt()) + PledrinConstants.ALT_DELAY,
+            "and the delay has elapsed for neither, which is where the checks disagree"
+        );
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IBondingCurve.WrongState.selector, IBondingCurve.State.Graduated)
+        );
+        graduated.graduateAlt(100);
+
+        vm.expectRevert(IBondingCurve.AltDelayNotElapsed.selector);
+        graduating.graduateAlt(100);
+
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 201));
+        graduated.graduateAlt(201);
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 201));
+        graduating.graduateAlt(201);
+
+        assertEq(uint8(graduated.state()), uint8(IBondingCurve.State.Graduated), "unmoved");
+        assertEq(uint8(graduating.state()), uint8(IBondingCurve.State.Graduating), "and unmoved");
+    }
+
     /// @notice **Invariant 38's first half.** Only a tick spacing inside
     /// `[ALT_TICK_SPACING_MIN, ALT_TICK_SPACING_MAX]` is accepted: one outside on each side
     /// is rejected, and both bounds themselves graduate.

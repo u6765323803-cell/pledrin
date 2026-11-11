@@ -80,6 +80,28 @@ Two properties matter for Pledrin:
 2. v4 liquidity positions minted through PositionManager are **ERC-721 tokens**,
    so a position can be transferred to a lock contract and made permanent.
 
+### v4 governance surface
+
+Neither value is referenced by any Pledrin contract. Both are recorded so the
+external governance exposure in `docs/THREAT_MODEL.md` section 9 is auditable
+against a named source rather than an assertion.
+
+| | Mainnet 4663 | Testnet 46630 |
+|---|---|---|
+| `PoolManager.protocolFeeController()` | `0x6d0009504D129CF5002Dba61D9Ae8575AA79314c` | `0x0000000000000000000000000000000000000000` |
+| `PoolManager.owner()` | `0x2BAD8182C09F50c8318d769245beA52C32Be46CD` | `0x9701fb0aDe1E269c8f64Ec0C7b3cfADB31A13A52` |
+
+```
+cast call 0x8366a39cc670b4001a1121b8f6a443a643e40951 "protocolFeeController()(address)" --rpc-url <rpc>
+cast call 0x8366a39cc670b4001a1121b8f6a443a643e40951 "owner()(address)" --rpc-url <rpc>
+```
+
+A protocol fee on a v4 pool is set by the controller and is capped by the
+protocol at a fraction of the pool's swap fee. It reduces what a locked
+position earns; it cannot touch the position itself. The mainnet controller is
+live, so Pledrin's locked positions are exposed to a Uniswap governance
+decision on fee switching, and nothing in Pledrin can or should prevent that.
+
 ## Uniswap v3 — mainnet only
 
 | Contract | Address |

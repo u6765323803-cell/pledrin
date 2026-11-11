@@ -4,6 +4,9 @@ Every address and parameter here was verified directly against the chain with
 `cast` on 2026-11-11, and cross-checked against the official Uniswap deployment
 pages. Nothing in this file is from memory.
 
+All addresses here are EIP-55 checksummed, which is the form
+Solidity requires in a literal.
+
 **Rule for the whole team: never introduce an external address that is not in
 this file. If you need one, verify it on-chain first and add it here with the
 command you used.**
@@ -54,22 +57,22 @@ testnet.
 
 | Contract | Address |
 |---|---|
-| PoolManager | `0x8366a39cc670b4001a1121b8f6a443a643e40951` |
-| PositionManager | `0x58daec3116aae6d93017baaea7749052e8a04fa7` |
-| Quoter | `0x8dc178efb8111bb0973dd9d722ebeff267c98f94` |
-| StateView | `0xf3334192d15450cdd385c8b70e03f9a6bd9e673b` |
-| PositionDescriptor | `0x9639443158e8c5efa35bd45287bf2effd3d8dc06` |
+| PoolManager | `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
+| PositionManager | `0x58daec3116aae6D93017bAAea7749052E8a04fA7` |
+| Quoter | `0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94` |
+| StateView | `0xF3334192D15450CdD385c8B70e03f9A6bD9E673b` |
+| PositionDescriptor | `0x9639443158E8C5efa35Bd45287bf2EFfd3D8dC06` |
 | Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
-| UniversalRouter | `0x8876789976decbfcbbbe364623c63652db8c0904` |
+| UniversalRouter | `0x8876789976dEcBfCbBbe364623C63652db8C0904` |
 
 Wiring verified on mainnet and testnet:
 
 ```
-cast call 0x58daec3116aae6d93017baaea7749052e8a04fa7 "poolManager()(address)" --rpc-url <rpc>
+cast call 0x58daec3116aae6D93017bAAea7749052E8a04fA7 "poolManager()(address)" --rpc-url <rpc>
 # 0x8366a39CC670B4001A1121B8F6A443A643e40951   (both networks)
-cast call 0x58daec3116aae6d93017baaea7749052e8a04fa7 "permit2()(address)" --rpc-url <mainnet>
+cast call 0x58daec3116aae6D93017bAAea7749052E8a04fA7 "permit2()(address)" --rpc-url <mainnet>
 # 0x000000000022D473030F116dDEE9F6B43aC78BA3
-cast call 0x58daec3116aae6d93017baaea7749052e8a04fa7 "name()(string)" --rpc-url <mainnet>
+cast call 0x58daec3116aae6D93017bAAea7749052E8a04fA7 "name()(string)" --rpc-url <mainnet>
 # "Uniswap v4 Positions NFT"
 ```
 
@@ -92,8 +95,8 @@ against a named source rather than an assertion.
 | `PoolManager.owner()` | `0x2BAD8182C09F50c8318d769245beA52C32Be46CD` | `0x9701fb0aDe1E269c8f64Ec0C7b3cfADB31A13A52` |
 
 ```
-cast call 0x8366a39cc670b4001a1121b8f6a443a643e40951 "protocolFeeController()(address)" --rpc-url <rpc>
-cast call 0x8366a39cc670b4001a1121b8f6a443a643e40951 "owner()(address)" --rpc-url <rpc>
+cast call 0x8366a39CC670B4001A1121B8F6A443A643e40951 "protocolFeeController()(address)" --rpc-url <rpc>
+cast call 0x8366a39CC670B4001A1121B8F6A443A643e40951 "owner()(address)" --rpc-url <rpc>
 ```
 
 A protocol fee on a v4 pool is set by the controller and is capped by the
@@ -106,14 +109,14 @@ decision on fee switching, and nothing in Pledrin can or should prevent that.
 
 | Contract | Address |
 |---|---|
-| UniswapV3Factory | `0x1f7d7550b1b028f7571e69a784071f0205fd2efa` |
-| NonfungiblePositionManager | `0x73991a25c818bf1f1128deaab1492d45638de0d3` |
-| SwapRouter02 | `0xcaf681a66d020601342297493863e78c959e5cb2` |
-| QuoterV2 | `0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7` |
-| TickLens | `0x7dfd4f31be6814d2906bde155c3e1b146eac1468` |
-| UniswapInterfaceMulticall | `0x282a3c4d320cc7f0d5eaf56b8029e4b88338f0a3` |
-| NonfungibleTokenPositionDescriptor | `0x6f84dae9c064ff453e5c8af51efb819f8f610225` |
-| NFTDescriptor | `0x2e9d45bb7b30549f5216813ada9a6b7982c5b3ed` |
+| UniswapV3Factory | `0x1f7d7550B1b028f7571E69A784071F0205FD2EfA` |
+| NonfungiblePositionManager | `0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3` |
+| SwapRouter02 | `0xCaf681a66D020601342297493863E78C959E5cb2` |
+| QuoterV2 | `0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7` |
+| TickLens | `0x7DfD4F31be6814D2906BDE155c3e1B146EAc1468` |
+| UniswapInterfaceMulticall | `0x282A3C4D320Cc7f0d5eaf56B8029e4B88338f0a3` |
+| NonfungibleTokenPositionDescriptor | `0x6F84dAE9c064ff453E5C8af51EfB819f8f610225` |
+| NFTDescriptor | `0x2E9D45Bb7b30549F5216813aDA9a6b7982C5B3ED` |
 
 Factory identity confirmed by its canonical fee tiers:
 
@@ -132,7 +135,7 @@ testnet.
 ### Wrapped native (v3 only)
 
 ```
-cast call 0x73991a25c818bf1f1128deaab1492d45638de0d3 "WETH9()(address)" --rpc-url <mainnet>
+cast call 0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3 "WETH9()(address)" --rpc-url <mainnet>
 # 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73
 ```
 

@@ -1229,6 +1229,16 @@
   },
   {
     "inputs": [],
+    "name": "BondAlreadyClaimed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BondForfeitedToHolders",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "BondNotReturned",
     "type": "error"
   },
@@ -1371,6 +1381,11 @@
       }
     ],
     "name": "LpDustTooHigh",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NoBondPosted",
     "type": "error"
   },
   {

@@ -410,6 +410,15 @@ contract BondingCurveGraduationTest is PledrinTestBase {
         );
         curve.graduate();
 
+        // The alternate entry point is refused on both sides of its delay. Since the state
+        // check runs before the delay check, neither call needs the warp to reach the
+        // refusal; the warp is here to show that no passage of time opens a second
+        // graduation, which is the part of Invariant 36 a single call cannot state.
+        vm.expectRevert(
+            abi.encodeWithSelector(IBondingCurve.WrongState.selector, IBondingCurve.State.Graduated)
+        );
+        curve.graduateAlt(100);
+
         vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
         vm.expectRevert(
             abi.encodeWithSelector(IBondingCurve.WrongState.selector, IBondingCurve.State.Graduated)

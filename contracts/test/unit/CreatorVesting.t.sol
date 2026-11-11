@@ -192,6 +192,11 @@ contract CreatorVestingTest is PledrinTestBase {
 
     /// @notice **Invariant 21's second half.** A voided schedule releases nothing, ever,
     /// and the allocation is irrecoverable by anyone.
+    /// @dev The refusal is `ScheduleVoided` and not `NothingToRelease`, which is Invariant
+    /// 62 on the one path a real launch can reach it from: `expire()` voided this schedule,
+    /// so the creator is told the allocation is gone rather than told to come back later.
+    /// `test_releaseSeparatesAVoidedScheduleFromOneThatIsNotDueYet` asserts that against
+    /// the three refusals a later call really can clear.
     function test_aVoidedScheduleIsIrrecoverable() public {
         (BondingCurve curve, IERC20 token) = createPledgedLaunch();
         address launch = address(curve);
@@ -204,11 +209,83 @@ contract CreatorVestingTest is PledrinTestBase {
         assertEq(vesting.releasable(launch), 0, "nothing releasable");
         vm.warp(vm.getBlockTimestamp() + 10 * 365 days);
         assertEq(vesting.releasable(launch), 0, "a decade later, nothing");
-        vm.expectRevert(ICreatorVesting.NothingToRelease.selector);
+        vm.expectRevert(ICreatorVesting.ScheduleVoided.selector);
         vesting.release(launch);
 
         assertEq(token.balanceOf(address(vesting)), allocation, "the tokens are stranded there");
         assertEq(token.totalSupply(), PledrinConstants.TOTAL_SUPPLY, "with no burn and no change");
+    }
+
+    /// @notice **Invariant 62.** `release` separates the one permanent refusal from the
+    /// clearable ones: `ScheduleVoided` for a voided schedule, and `NothingToRelease` for
+    /// each of the three conditions a later call can clear. The four are asserted together,
+    /// because the distinction between them is the whole content of the invariant: a
+    /// collapse of the voided case back into `NothingToRelease` fails here.
+    /// @dev `NoSchedule`, the fourth row of section 12's table, is asserted in
+    /// `test_releaseOnAnUnknownLaunchReverts`.
+    ///
+    /// The voided schedule here is started and fully vested, so `releasable` would be the
+    /// entire allocation were it not voided. That is deliberate: the voided check runs
+    /// before the amount is computed, and a schedule with nothing accrued could not tell
+    /// the two orderings apart. No real launch reaches this combination — `expire()` is the
+    /// only caller of `void()` and it can only fire while the launch is `Live`, which is
+    /// before anything calls `start()` — so the stand-in launch of `test/mocks` is what
+    /// constructs it. `test_aVoidedScheduleIsIrrecoverable` covers the real path.
+    function test_releaseSeparatesAVoidedScheduleFromOneThatIsNotDueYet() public {
+        // Clearable, one: the launch has not settled, so the clock has not started. A
+        // graduation or a stall turns this same call into a payment.
+        (BondingCurve curve,) = createPledgedLaunch();
+        address launch = address(curve);
+        assertEq(vesting.scheduleOf(launch).start, 0, "the clock has not started");
+        vm.expectRevert(ICreatorVesting.NothingToRelease.selector);
+        vesting.release(launch);
+
+        // Clearable, two: started, one second inside the cliff.
+        buyToCap(curve);
+        vm.prank(GRADUATOR);
+        curve.graduate();
+        uint64 start = vesting.scheduleOf(launch).start;
+        vm.warp(uint256(start) + DEFAULT_CLIFF - 1);
+        vm.expectRevert(ICreatorVesting.NothingToRelease.selector);
+        vesting.release(launch);
+
+        // Clearable, three: past the cliff and paid, with nothing further accrued since.
+        // The second call is in the same block as the release that emptied it.
+        vm.warp(uint256(start) + DEFAULT_CLIFF + DEFAULT_VEST_DURATION / 4);
+        assertGt(vesting.release(launch), 0, "the quarter point paid");
+        assertLt(vesting.scheduleOf(launch).released, vesting.scheduleOf(launch).allocation, "part");
+        vm.expectRevert(ICreatorVesting.NothingToRelease.selector);
+        vesting.release(launch);
+
+        // The same condition with the clock moving rather than standing still: at this
+        // allocation and duration a second accrues less than one base unit, so a schedule
+        // that has never paid anything still has nothing to pay.
+        FakeLaunch slow = new FakeLaunch();
+        (BondingCurve slowCurve, IERC20 slowToken) = createDefaultLaunch();
+        _fundSchedule(slowCurve, slowToken, slow, 1000, 0, PledrinConstants.MAX_VEST_DURATION);
+        slow.start(vesting);
+        vm.warp(uint256(vesting.scheduleOf(address(slow)).start) + 1);
+        assertEq(vesting.releasable(address(slow)), 0, "a second buys no base unit");
+        assertEq(vesting.scheduleOf(address(slow)).released, 0, "and nothing has been paid");
+        vm.expectRevert(ICreatorVesting.NothingToRelease.selector);
+        vesting.release(address(slow));
+
+        // Permanent: voided, with the whole allocation due by the clock.
+        FakeLaunch voided = new FakeLaunch();
+        (BondingCurve voidedCurve, IERC20 voidedToken) = createDefaultLaunch();
+        _fundSchedule(voidedCurve, voidedToken, voided, 1e18, 0, PledrinConstants.MIN_VEST_DURATION);
+        voided.start(vesting);
+        vm.warp(
+            uint256(vesting.scheduleOf(address(voided)).start) + PledrinConstants.MIN_VEST_DURATION
+        );
+        assertEq(vesting.releasable(address(voided)), 1e18, "the whole allocation is due");
+
+        uint256 creatorBalance = voidedToken.balanceOf(CREATOR);
+        voided.voidSchedule(vesting);
+        assertEq(vesting.releasable(address(voided)), 0, "voiding took it back off the clock");
+        vm.expectRevert(ICreatorVesting.ScheduleVoided.selector);
+        vesting.release(address(voided));
+        assertEq(voidedToken.balanceOf(CREATOR), creatorBalance, "and no release ever succeeds");
     }
 
     /// @notice A voided schedule can never be started, so expiry closes the door for good.

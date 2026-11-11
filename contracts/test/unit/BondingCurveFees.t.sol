@@ -261,7 +261,10 @@ contract BondingCurveFeesTest is PledrinTestBase {
 
     /// @notice A bond that has already been claimed cannot be claimed again: `bondState`
     /// stays `Returned` forever, so the emptiness of the credit is what refuses the second
-    /// claim. This is the other half of Invariant 25.
+    /// claim, and it refuses it as `BondAlreadyClaimed`. This is the other half of
+    /// Invariant 25, and the fourth row of Invariant 63's table: `Returned` with an empty
+    /// credit can only mean a claim that already paid, which is why the refusal says so
+    /// rather than telling the creator the bond has not been returned.
     function test_aReturnedBondCanOnlyBeClaimedOnce() public {
         (BondingCurve curve,) = createPledgedLaunch();
         buyToCap(curve);
@@ -276,23 +279,141 @@ contract BondingCurveFeesTest is PledrinTestBase {
             "the state stays Returned"
         );
 
-        vm.expectRevert(IBondingCurve.NothingToClaim.selector);
+        vm.expectRevert(IBondingCurve.BondAlreadyClaimed.selector);
         curve.claimBond();
         assertEq(CREATOR.balance, 20_000 ether - 0.409 ether + 0.4 ether, "paid exactly once");
     }
 
     /// @notice An empty bucket reverts rather than emitting a zero payment.
-    function test_everyClaimRevertsOnAnEmptyBucket() public {
+    /// @dev The bond is deliberately not one of these buckets. `claimBond` refuses by
+    /// `bondState` and not by emptiness — a launch that never posted a bond has an empty
+    /// credit but is not an empty bucket — so its four refusals are asserted together in
+    /// `test_claimBondNamesTheBondStateThatRefusedIt` instead of here.
+    function test_everyFeeClaimRevertsOnAnEmptyBucket() public {
         (BondingCurve curve,) = createDefaultLaunch();
 
         vm.expectRevert(IBondingCurve.NothingToClaim.selector);
         curve.claimProtocolFees();
 
-        vm.expectRevert(IBondingCurve.BondNotReturned.selector);
-        curve.claimBond();
-
         vm.expectRevert(IBondingCurve.NothingToClaim.selector);
         curve.claimBounty(OTHER);
+    }
+
+    /// @notice **Invariant 63.** `claimBond` gives exactly the refusal section 11.3's table
+    /// assigns to the launch's `bondState`, and the four are asserted as one set so that a
+    /// later collapse of any two of them back into a single error fails here.
+    /// @dev Only one of the four is clearable, and the difference is what the caller acts
+    /// on: `BondNotReturned` tells a creator to come back once the launch settles, while
+    /// the other three tell them that no call they ever make will pay this bond. The
+    /// clearable one is shown clearing on the same launch that gave it, so the test states
+    /// which refusal is temporary rather than only which error each state returns.
+    function test_claimBondNamesTheBondStateThatRefusedIt() public {
+        // `None`: this launch posted no bond, and no path creates one afterwards.
+        (BondingCurve unbonded,) = createDefaultLaunch();
+        assertEq(
+            uint8(unbonded.bondState()), uint8(IBondingCurve.BondState.None), "no bond was posted"
+        );
+        vm.expectRevert(IBondingCurve.NoBondPosted.selector);
+        unbonded.claimBond();
+
+        // `Bonded`: the bond is held against a launch that has not settled.
+        (BondingCurve held,) = createPledgedLaunch();
+        assertEq(uint8(held.bondState()), uint8(IBondingCurve.BondState.Bonded), "the bond is held");
+        assertEq(held.bondHeldWei(), 0.4 ether, "and the ETH is on the bond account");
+        vm.expectRevert(IBondingCurve.BondNotReturned.selector);
+        held.claimBond();
+
+        // The same launch, settled: the one clearable refusal becomes a payment.
+        buyToCap(held);
+        vm.prank(GRADUATOR);
+        held.graduate();
+        assertEq(held.claimBond(), 0.4 ether, "the clearable refusal cleared");
+
+        // `Returned` with an empty credit: the bond has been paid, once.
+        assertEq(uint8(held.bondState()), uint8(IBondingCurve.BondState.Returned), "still Returned");
+        vm.expectRevert(IBondingCurve.BondAlreadyClaimed.selector);
+        held.claimBond();
+
+        // `Forfeited`: expiry moved the bond into the reserve. This launch is created last
+        // because reaching the refusal needs the clock past its deadline, which would close
+        // the buy window of every launch above it.
+        (BondingCurve forfeited,) = createPledgedLaunch();
+        vm.warp(forfeited.gradDeadline());
+        forfeited.expire();
+        assertEq(
+            uint8(forfeited.bondState()),
+            uint8(IBondingCurve.BondState.Forfeited),
+            "the bond was forfeited"
+        );
+        vm.expectRevert(IBondingCurve.BondForfeitedToHolders.selector);
+        forfeited.claimBond();
+        assertEq(forfeited.pendingBondWei(), 0, "a forfeited bond is never credited");
+    }
+
+    /// @notice **Section 11.4 and Invariant 63's `Forfeited` row, end to end.** A launch
+    /// that misses its deadline forfeits the bond to its holders: the creator's claim is
+    /// refused permanently, the wei is in `ethReserve`, and the exit price every holder
+    /// sells at is higher because of it.
+    /// @dev The refusal alone would be a test of an error string. What makes the bond the
+    /// thing this protocol is for is the other half: the forfeited ETH is in the reserve
+    /// and a holder can take it out. The counterfactual quote is the reserve as it would
+    /// have been had everything *except* the bond been forfeited, so the final comparison
+    /// isolates the bond's own contribution to the exit price from the creator fees and the
+    /// protection pool that expiry donates alongside it.
+    function test_anExpiredLaunchPaysTheBondToHoldersAndRefusesTheClaimForever() public {
+        (BondingCurve curve,) = createPledgedLaunch();
+        uint256 holding = buy(curve, TRADER, 1 ether);
+
+        uint256 bond = curve.bondHeldWei();
+        uint256 reserveBefore = curve.ethReserve();
+        uint256 creatorFees = curve.creatorFeeEth();
+        uint256 protection = curve.protectionEth();
+        uint256 creatorBalance = CREATOR.balance;
+        assertEq(bond, 0.4 ether, "the launch posted a bond");
+        assertGt(creatorFees, 0, "and the creator had accrued fees to lose as well");
+
+        (,, uint256 exitBefore) = curve.quoteSell(holding);
+        (,, uint256 exitWithoutTheBond) = CurveMath.sellQuote(
+            uint256(curve.virtualEthReserve()) + reserveBefore + creatorFees + protection,
+            PledrinConstants.VIRTUAL_TOKEN_RESERVE - curve.tokensSold(),
+            curve.totalFeeBps(),
+            holding
+        );
+
+        vm.warp(curve.gradDeadline());
+        vm.prank(OTHER);
+        curve.expire();
+
+        // The creator's own claim is refused, and the refusal is permanent: the same
+        // answer a decade later, with no state in between that can change it.
+        vm.prank(CREATOR);
+        vm.expectRevert(IBondingCurve.BondForfeitedToHolders.selector);
+        curve.claimBond();
+        vm.warp(vm.getBlockTimestamp() + 10 * 365 days);
+        vm.expectRevert(IBondingCurve.BondForfeitedToHolders.selector);
+        curve.claimBond();
+
+        // Every wei of the bond is in the reserve, and none of it anywhere else.
+        assertEq(
+            curve.ethReserve(),
+            reserveBefore + bond + creatorFees + protection,
+            "the bond, the creator fees and the protection pool all reached the reserve"
+        );
+        assertEq(curve.bondHeldWei(), 0, "nothing is still held on the bond account");
+        assertEq(curve.pendingBondWei(), 0, "and nothing was credited to the creator");
+        assertEq(CREATOR.balance, creatorBalance, "who received not one wei");
+
+        // And it reached the holders, which is the point: the exit price rose, by more than
+        // the forfeited fees and protection pool alone would have raised it.
+        (,, uint256 exitAfter) = curve.quoteSell(holding);
+        assertGt(exitAfter, exitBefore, "expiry raised the exit price");
+        assertGt(exitAfter, exitWithoutTheBond, "and the bond is part of what raised it");
+
+        uint256 traderBefore = TRADER.balance;
+        uint256 received = sell(curve, TRADER, holding);
+        assertEq(received, exitAfter, "the holder exits at the raised price");
+        assertEq(TRADER.balance - traderBefore, received, "and is paid it in full");
+        assertGt(received, exitWithoutTheBond, "including the wei the creator forfeited");
     }
 
     /// @notice **Invariant 44.** The graduation bounty comes out of the protocol's own

@@ -329,6 +329,11 @@
   },
   {
     "inputs": [],
+    "name": "ScheduleFullyReleased",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "ScheduleVoided",
     "type": "error"
   },

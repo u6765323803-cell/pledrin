@@ -95,9 +95,11 @@ contract BondingCurveApprovalsTest is PledrinTestBase {
         );
         vm.prank(GRADUATOR);
         curve.graduate();
-        // Past the alternate delay as well, so it is the state check that refuses rather
-        // than `graduateAlt`'s own earlier guard.
-        vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
+        // And through the alternate entry point, which needs no warp to reach the state
+        // check: `graduateAlt` checks the state before the alternate delay, so a graduated
+        // launch answers `WrongState` at any point on the clock. The ordering itself is
+        // pinned in `test/unit/BondingCurveGraduationGuards.t.sol`; what matters here is
+        // only that the call is refused and grants nothing.
         vm.expectRevert(
             abi.encodeWithSelector(IBondingCurve.WrongState.selector, IBondingCurve.State.Graduated)
         );

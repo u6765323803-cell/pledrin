@@ -515,6 +515,12 @@ contract GraduationForkTest is ForkBase {
         );
         curve.claimCreatorFees();
 
+        // And the bond itself: the refusal names the forfeiture, which is permanent, rather
+        // than a return that has not happened yet (Invariant 63).
+        vm.prank(CREATOR);
+        vm.expectRevert(IBondingCurve.BondForfeitedToHolders.selector);
+        curve.claimBond();
+
         vm.prank(TRADER);
         token.approve(address(curve), type(uint256).max);
         vm.prank(TRADER);

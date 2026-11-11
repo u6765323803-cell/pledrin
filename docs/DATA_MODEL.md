@@ -152,6 +152,10 @@ contracts and are re-asserted by every curve's constructor.
 | `MIN_BUY_WEI` | `10**12` | the buy form's lower bound |
 | `ALT_DELAY` | `3600` seconds | `graduateAlt` availability |
 | `GRAD_GRACE` | `604800` seconds | `abortGraduation` availability |
+| `POOL_FEE` | `10000` pips | the canonical pool key, and the default in any alternate-key form |
+| `POOL_TICK_SPACING` | `200` | the same |
+| `ALT_POOL_FEE_MIN` / `MAX` | `3000` / `10000` pips | bounds on `graduateAlt`'s `fee` |
+| `ALT_TICK_SPACING_MIN` / `MAX` | `10` / `200` | bounds on `graduateAlt`'s `tickSpacing`; the pair `(POOL_FEE, POOL_TICK_SPACING)` is refused |
 | `TIMELOCK_DELAY` | `172800` seconds | governance display |
 
 `TOTAL_SUPPLY` is never read per launch. Every launch's token asserts it in the
@@ -169,13 +173,42 @@ Every parameter the read side introduces, with type, units, bounds and default.
 | `PAGE_LIMIT_DEFAULT` | integer | rows | `25` | `1` to `PAGE_LIMIT_MAX` | both |
 | `PAGE_LIMIT_MAX` | integer | rows | `100` | `25` to `500` | both |
 | `TOP_HOLDERS_N` | integer | addresses | `10` | `5` to `50` | indexer |
-| `STALENESS_WARN_SECONDS` | integer | seconds | `30` | `5` to `600` | application |
-| `STALENESS_BLOCK_WARN` | integer | blocks | `50` | `5` to `10000` | application |
+| `STALENESS_WARN_SECONDS` | integer | seconds | `10` | `2` to `QUOTE_TTL_SECONDS - 1` | application |
 | `QUOTE_TTL_SECONDS` | integer | seconds | `15` | `3` to `60` | application |
 
 `METADATA_MAX_BYTES` is a defence, not a preference: `createLaunch` applies no
 length bound and no validation to `params.metadata`, and `LaunchMetadata` emits
 it verbatim (IDX-20).
+
+**There is one staleness threshold and it is measured in seconds.** A second
+parameter, `STALENESS_BLOCK_WARN`, defaulted to 50 blocks beside a
+`STALENESS_WARN_SECONDS` of 30, and the two were in different units with no
+relation stated. At the 0.104 s block time in `docs/CHAIN_FACTS.md`, 50 blocks is
+5.2 seconds and 30 seconds is 288 blocks, so the block threshold fired roughly
+six times earlier and the seconds threshold could never be reached. It is
+removed, and the reason is not that its default was wrong.
+
+Two thresholds measuring one quantity in two units cannot be made to agree once.
+They have to be re-agreed after every change to the conversion factor, and
+`docs/CHAIN_FACTS.md` is explicit that 0.104 s is an observation with a date on
+it rather than a bound: a sequencer or batch-posting change moves it. When they
+drift, the tighter one silently becomes the only one that fires while the looser
+one still reads like a second safety net, and a reader who tunes the dead one
+changes nothing and has no way to find out. One threshold cannot disagree with
+itself. Seconds is also the unit a reader has an opinion about — how old the
+number on the screen is — and blocks is the unit that is not stable on this
+chain, which is why the contracts refuse it for time logic as well.
+`blocksBehind` remains a displayed field of `IndexerStatus` (section 3.13); what
+is gone is its threshold. `docs/OPEN_DECISIONS.md` decision 24 records the
+argument.
+
+The default is 10 seconds and the upper bound is tied to `QUOTE_TTL_SECONDS`
+rather than chosen freely. A threshold at or above the quote's life would let a
+page display an unwarned price older than the life of a quote shown next to it,
+which is the one relation between these two parameters that is not a matter of
+taste. A healthy indexer's lag on a chain producing roughly ten blocks a second
+is far below either number, so 10 seconds warns on a real fault and not on normal
+operation.
 
 ---
 
@@ -198,7 +231,8 @@ consumes it. "None" is a real answer and is stated where it applies.
 | `FeeAccrued` | `BondingCurve` | the four-way destination of one trade's fee | `FeeAccrual`, `Launch` |
 | `Donated` | `BondingCurve` | a donation and the resulting `ethReserve` | `Donation`, `Launch`, `Candle` |
 | `CapReached` | `BondingCurve` | the `Live -> Graduating` transition | `Launch` (state and `capReachedAt` only; IDX-4) |
-| `Graduated` | `BondingCurve` | the graduation outcome, including the pool actually used | `Launch`, `LockedPosition`, `Payout` basis |
+| `PoolPreInitialized` | `BondingCurve` | that the launch found its canonical pool key already open, and the price it was opened at | `Launch` (one flag; IDX-28) |
+| `Graduated` | `BondingCurve` | the graduation outcome, including the pool actually used and its `fee` and `tickSpacing` | `Launch`, `LockedPosition`, `Payout` basis |
 | `GraduationStalled` | `BondingCurve` | the `Graduating -> Stalled` transition | `Launch` |
 | `Expired` | `BondingCurve` | the `Live -> Expired` transition and all three forfeited amounts | `Launch` |
 | `BondStateChanged` | `BondingCurve` | every bond transition, with its destination | `Launch` (bond fields) |
@@ -254,9 +288,9 @@ is no entity for the launch token: it is one field on `Launch` plus the
 
 ### 3.1 `Launch`
 
-Created by `LaunchCreated`. Mutated by `LaunchMetadata`, `Bought`, `Sold`,
-`Donated`, `FeeAccrued`, `CapReached`, `Graduated`, `GraduationStalled`,
-`Expired`, `BondStateChanged`, `FeesClaimed`.
+Created by `LaunchCreated`. Mutated by `LaunchMetadata`, `PoolPreInitialized`,
+`Bought`, `Sold`, `Donated`, `FeeAccrued`, `CapReached`, `Graduated`,
+`GraduationStalled`, `Expired`, `BondStateChanged`, `FeesClaimed`.
 
 | Field | Type | Source |
 |---|---|---|
@@ -272,6 +306,8 @@ Created by `LaunchCreated`. Mutated by `LaunchMetadata`, `Bought`, `Sold`,
 | `bondWei` | `Uint` (wei) | `LaunchCreated.bondWei` |
 | `gradDeadline` | `Timestamp` | `LaunchCreated.gradDeadline` |
 | `initialPoolId` | `Hash32` | `LaunchCreated.poolId` |
+| `poolPreInitialized` | boolean | **derived**: whether a `PoolPreInitialized` log exists for this launch. `false` is the normal case (IDX-28) |
+| `poolPreInitializedPriceX96` | `Uint` or null | `PoolPreInitialized.sqrtPriceX96`, the foreign price the canonical key was opened at |
 | `createdAt` | `Timestamp` | block timestamp of `LaunchCreated` |
 | `createdAtBlock` | `BlockNumber` | block number of `LaunchCreated` |
 | `createdTx` | `Hash32` | transaction hash of `LaunchCreated` |
@@ -290,6 +326,8 @@ Created by `LaunchCreated`. Mutated by `LaunchMetadata`, `Bought`, `Sold`,
 | `expiredAt` | `Timestamp` or null | block timestamp of `Expired` |
 | `settledAt` | `Timestamp` or null | **derived**: whichever of the three above is set |
 | `graduationPoolId` | `Hash32` or null | `Graduated.poolId` (IDX-18) |
+| `graduationPoolFee` | number or null | `Graduated.fee`, in pips. Equals `POOL_FEE` unless the launch graduated on an alternate key |
+| `graduationPoolTickSpacing` | number or null | `Graduated.tickSpacing`. Equals `POOL_TICK_SPACING` unless the launch graduated on an alternate key |
 | `graduationCaller` | `Address` or null | `Graduated.caller` |
 | `positionIdCore` | `Uint` or null | `Graduated.positionIdCore` |
 | `positionIdFloor` | `Uint` or null | `Graduated.positionIdFloor`, **null when the event carries `0`** (IDX-17) |
@@ -585,9 +623,10 @@ Derived, not event-sourced. One row.
 | `backfillComplete` | boolean | whether the historical range is finished |
 
 Every page reads this. The application shows a staleness warning when
-`secondsBehind > STALENESS_WARN_SECONDS` or `blocksBehind >
-STALENESS_BLOCK_WARN`, and must not present a backfilling index as complete
-data (APP-13).
+`secondsBehind > STALENESS_WARN_SECONDS`, and on no other condition, and must not
+present a backfilling index as complete data (APP-13). `blocksBehind` is
+displayed and is not a threshold; section 1.7 says why there is one threshold and
+why it is in seconds.
 
 ---
 
@@ -1152,7 +1191,7 @@ Writes, all against `BondingCurve` at the launch's own address:
 | `sell(tokensIn, minEthOut, deadline)` | `effectiveState` allows sells; allowance covers `tokensIn` |
 | `PledrinToken.approve(curve, tokensIn)` | only when the allowance is short; exact amount (APP-8) |
 | `donate()` payable | `effectiveState` allows donations |
-| `graduate()` / `graduateAlt(tickSpacing)` | section 4.5's windows |
+| `graduate()` / `graduateAlt(fee, tickSpacing)` | section 4.5's windows |
 | `abortGraduation()` | `now >= abortAvailableAt` |
 | `expire()` | `effectiveState == ExpiryPending` |
 | the four claim functions | section 4.5 |
@@ -1212,12 +1251,16 @@ buy — that is the ETH reaching the curve, fee excluded. The cap on
 `9141185611773846` wei, about 0.00914 ETH. Agreement with section 4.1 on the
 first figure is a checkable test of the form's arithmetic.
 
-**The launch's address is not knowable before the transaction lands.** The curve
-is deployed with plain `CREATE` from `CurveDeployer` (`docs/SPEC.md` section
-2.1), so its address is a function of that deployer's nonce and of nothing in
-the parameters. A simulation of `createLaunch` returns an address that another
-launch landing first invalidates. The page takes the address from the receipt's
-`LaunchCreated` log and from nowhere else (APP-5).
+**The launch's address is predictable and is not reserved.** The curve is
+deployed with plain `CREATE` from `CurveDeployer` (`docs/SPEC.md` section 2.1),
+so its address is a function of that deployer's nonce and of nothing in the
+parameters: computable by anyone in advance, and claimed by whichever launch
+lands on that nonce. A simulation of `createLaunch` therefore returns an address
+that another launch landing first invalidates, and the page takes the address
+from the receipt's `LaunchCreated` log and from nowhere else (APP-5). This
+paragraph previously said the address is not knowable before the transaction
+lands, which is false and was the read-side copy of the premise
+`docs/THREAT_MODEL.md` 4.1 withdraws.
 
 ### 6.4 Creator profile
 
@@ -1416,8 +1459,11 @@ check.
 
 **IDX-18. A graduated launch's pool is `Graduated.poolId`, which may not be
 `LaunchCreated.poolId`.** `graduateAlt` runs the whole procedure on a
-caller-chosen `tickSpacing` in `[10, 199]`, which is a different pool key and a
-different `poolId` (`docs/SPEC.md` section 8.4 and Invariant 38). Both must be
+caller-chosen `fee` in `[3000, 10000]` and `tickSpacing` in `[10, 200]`, which is
+a different pool key and a different `poolId` (`docs/SPEC.md` section 8.4 and
+Invariant 67). `Graduated` carries both fields, so the full key is
+reconstructible from that log and `token()` alone and must not be rebuilt from
+`POOL_FEE` and `POOL_TICK_SPACING` (Invariant 69). Both must be
 stored. A link or a post-graduation read built on `initialPoolId` points at an
 empty, zero-liquidity pool after an alternative graduation. It also follows that
 one token can have several pools, only one of which is the launch's.
@@ -1475,6 +1521,20 @@ the reserve. It belongs in the reserve cursor and must be excluded from
 genesis, and not at a block number derived from a timestamp. Child sources start
 at the block of the `LaunchCreated` that announced them.
 
+**IDX-28. `PoolPreInitialized` is not a protocol action and is not a user
+action.** It is emitted in a launch transaction when the launch found its
+canonical Uniswap pool key already open, which anybody can arrange in advance for
+the cost of gas (`docs/SPEC.md` section 8.1). Three rules follow. It sets one flag
+and one price on the `Launch` row and touches no reserve, no balance, no price
+series and no candle: the price it carries belongs to a foreign pool and must
+never enter any Pledrin price formula, all of which read the curve. Its absence
+is the normal case, so a null flag means "not observed" and never "unknown". And
+it is the only signal the read side has for a launch whose canonical pool carries
+a price the protocol did not choose, which may mean the launch needs the recovery
+path of `docs/SPEC.md` section 8.6 at graduation; presenting it to a user is a
+product decision, counting it is not, because the count is what resolves decision
+23.
+
 ---
 
 ## 8. What the application must never do
@@ -1507,6 +1567,17 @@ from an on-chain read in the same session. Indexer prices are for display.
 address.** It depends on `CurveDeployer`'s nonce and changes if any other launch
 lands first. The address comes from the receipt's `LaunchCreated` log
 (section 6.3).
+
+The rule is unchanged and the reason given for it was wrong. This item read that
+the address is not knowable before the transaction lands. It is knowable: a
+`CREATE` address is `keccak256(rlp([deployer, nonce]))[12:]`, both deployers are
+singletons at fixed addresses, and a nonce is one `eth_getTransactionCount` call
+away, so anyone can compute the address the next launch will take. **The address
+is predictable but not reserved**, which is the property the rule actually needs:
+a simulation's answer is correct only for the nonce it was simulated against, and
+any launch landing first invalidates it with no warning. `docs/SPEC.md` 8.1 and
+`docs/THREAT_MODEL.md` 4.1 record what the same mistake cost on the contract
+side.
 
 **APP-6. `minTokensOut` on a buy is mandatory and never zero.** A donation can
 be used to front-run a buy and reduce its yield, and `minTokensOut` is the
@@ -1580,13 +1651,14 @@ they cannot recover are marked.
 
 | Call | The explanation must contain |
 |---|---|
-| `createLaunch` **(unrecoverable)** | the total ETH leaving the wallet, itemised into the bond and the first buy; that the bond is returned only if the launch reaches the cap before the deadline and is otherwise **paid to holders and lost**, with the deadline as an absolute date and time; that the first buy's tokens go to `CreatorVesting` and cannot be sold before the cliff, with the cliff and the end of vesting as absolute dates; that the creator can claim no fee from the launch until it graduates or stalls; that the fee split is fixed at this launch forever; that the token has no mint, no owner and no pause; that the creator address is the signing wallet and cannot be changed afterwards; and that the launch address will be known only once the transaction lands |
+| `createLaunch` **(unrecoverable)** | the total ETH leaving the wallet, itemised into the bond and the first buy; that the bond is returned only if the launch reaches the cap before the deadline and is otherwise **paid to holders and lost**, with the deadline as an absolute date and time; that the first buy's tokens go to `CreatorVesting` and cannot be sold before the cliff, with the cliff and the end of vesting as absolute dates; that the creator can claim no fee from the launch until it graduates or stalls; that the fee split is fixed at this launch forever; that the token has no mint, no owner and no pause; that the creator address is the signing wallet and cannot be changed afterwards; and that the launch address is taken from the receipt rather than predicted, because a launch landing first takes the address a simulation named (APP-5) |
 | `buy` | the tokens expected and the `minTokensOut` floor; the fee in ETH; that the price moves with every trade and with any donation. **When the quote is clipped at the cap** (`refund > 0`): the exact ETH that will be consumed, the exact refund, that the fee is charged only on the consumed part, and that this buy ends the curve phase — trading stops until somebody graduates the launch |
 | `creatorFirstBuy` | not callable by the application. It is `factory`-only and reachable solely inside `createLaunch`. The application must not expose it |
 | `sell` | the ETH expected net of fee and the `minEthOut` floor; in `Expired` or `Stalled`, that part of the fee goes into the reserve rather than to a bucket, which raises the exit price for the remaining holders |
 | `approve` | the exact amount and the spender; that it grants only the ability to pull that amount when the user sells |
 | `donate` **(unrecoverable)** | that this ETH is a gift to current holders, buys no tokens, cannot be refunded, raises the price for everyone including the donor's own future buys, and reduces the tokens every later buyer receives |
-| `graduate` / `graduateAlt` | the bounty amount and that it is credited, not sent, so a second transaction is needed to claim it; that the migration is permanent and the resulting liquidity position can never be withdrawn by anyone; for `graduateAlt`, that it uses a different pool than the one the launch initialised |
+| `graduate` / `graduateAlt` | the bounty amount and that it is credited, not sent, so a second transaction is needed to claim it; that the migration is permanent and the resulting liquidity position can never be withdrawn by anyone; for `graduateAlt`, the `fee` and `tickSpacing` being named and that the pool is therefore not the one `LaunchCreated.poolId` identifies |
+| `GraduationHelper.graduateVia` | that the ETH sent and the token allowance granted are both spent at the pool's prices and are the caller's entire exposure; which candidate key the call will try first; that the graduation bounty and every unspent amount come back in the same transaction; and that the contract is not named by any Pledrin contract and holds no privilege, so a caller who does not trust it can graduate the launch directly (`docs/SPEC.md` section 8.6) |
 | `abortGraduation` **(unrecoverable for the launch, not for the signer)** | that it is irreversible, that the launch becomes `Stalled` permanently, that buys never reopen, that sells reopen forever, and that the creator's bond is returned because the cap was delivered |
 | `expire` | that it is irreversible; that it forfeits the creator's bond, the creator's accrued fees and the creator's entire token allocation to holders; and that the caller is paid nothing (APP-15) |
 | the four claim functions | the amount, the recipient address, and that the recipient is fixed by the contract and is not the signer unless they happen to be the same address; that the signer pays gas either way |
@@ -1628,11 +1700,10 @@ Stated here so that no page implies a completeness the data does not have.
 
 ## 10. Open decisions this document raises
 
-Recorded in `docs/OPEN_DECISIONS.md` as entries 16 to 21, each with options and
-a recommendation. They block Phase 2 rather than Phase 1, and the first two
-block it at the start rather than at the end. Decision 19 has since been
-resolved by measurement, and its row states the answer rather than the
-question.
+Recorded in `docs/OPEN_DECISIONS.md` as entries 16 to 21 and 24, each with
+options and a recommendation. They block Phase 2 rather than Phase 1, and the
+first two block it at the start rather than at the end. Decisions 19 and 24 have
+since been resolved, and their rows state the answer rather than the question.
 
 | # | Question |
 |---|---|
@@ -1642,3 +1713,4 @@ question.
 | 19 | **Resolved**: the indexer follows `latest` with no confirmation depth, because the measurement now in `docs/CHAIN_FACTS.md` shows that no depth is both safe and usable (IDX-14) |
 | 20 | Whether ERC-20 `Transfer` is indexed for every launch token, which is what `holderCount` and `marketCapWei` cost |
 | 21 | The API transport, which must be chosen once before either half starts |
+| 24 | **Resolved**: one staleness threshold, measured in seconds, because two thresholds in two units for one quantity cannot be held in agreement against a block time that is an observation rather than a bound (section 1.7) |

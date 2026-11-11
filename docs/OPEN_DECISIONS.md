@@ -9,7 +9,9 @@ holders pro rata. Those are settled with their reasoning in the spec.
 Each entry states the question, the options, the trade-offs, a recommendation,
 and whether it blocks Phase 1 (the Solidity implementation) or Phase 2 (the
 Ponder indexer and the Next.js application). Entries 1 to 15 are Phase 1's;
-entries 16 to 21 are Phase 2's and were raised by `docs/DATA_MODEL.md`.
+entries 16 to 21 are Phase 2's and were raised by `docs/DATA_MODEL.md`; entries
+22 and 23 are Phase 1's and were raised by the security review of 2026-11-11, and
+entry 24 is Phase 2's.
 
 ---
 
@@ -139,6 +141,18 @@ immediately on a wrong pool price, graduation proceeds through
 Explicitly not on the table: a bounded reset budget, or a tolerance band
 around the terminal price. Both trade away properties the specification
 currently states cleanly, and neither is worth the trade.
+
+**Addendum, 2026-11-11: the bounded reset budget was re-raised and refused
+again, on a stronger ground than the one recorded here.** The objection above is
+that the budget becomes a number an attacker optimises against, which is true and
+is not the worst of it. Every wei the curve would spend crossing hostile
+liquidity is a wei the attacker collects as the liquidity provider on the other
+side of that trade. A budget therefore does not convert the grief into a
+quantified cost; it converts a grief with no payoff into a grief with a capped
+payoff, while leaving the key blocked by any attacker who posts the liquidity that
+requires the budget plus one wei to clear. Decision 22 records the argument in
+full and takes a different route to the same goal: the restore is paid for by
+whoever wants the graduation, out of their own funds, in a separate contract.
 
 ### Question
 
@@ -344,6 +358,35 @@ undeployable, at which point option B or splitting the curve stops being
 optional. Spec 2.1 carries the current numbers and is the place to update; this
 addendum exists so that the superseded ones are not read as current.
 
+**Second addendum, later on 2026-11-11: 624 is now 527, across three changes and
+not one.** `CurveDeployer` is 24,049 bytes and `BondingCurve`'s creation code
+23,196 of them at commit `5b86188`. Of the 97 bytes lost since the figures above,
+**69 are the security review's first finding** being fixed in `_mintCore`, and
+the remaining **28 predate the review entirely**: `6421810` moved
+`graduateAlt`'s delay check into `_settle` and saved 33, then `81b8d77` split
+`claimBond` into four refusals and spent 61. Spec 2.1 carries the per-step ledger
+and the margin at each step. Decision 22 adds to the curve as well and estimates
+how much.
+
+Two earlier revisions of this addendum got the attribution wrong in opposite
+directions, and both are left visible because they are the evidence rather than
+embarrassments. One recorded 448 free and charged 176 bytes to finding 1; it had
+measured a variant of that fix that no longer exists, which computed the ETH cost
+after the mint call rather than before it. The other recorded 527 correctly and
+charged the whole 97 to finding 1, because 97 is what you get by subtracting this
+document's own row from a current build.
+
+**A size figure in a document is a measurement of a tree, not a property of the
+design** — and the way the two numbers came to disagree is the proof of it rather
+than an exception to it. The row above had been measured against a tree that
+moved twice before anyone compared against it, so the difference anyone computed
+from it was drift and not the cost of the change they were looking at. The cause
+is procedural and spec 2.1 now states the rule it implies: a commit that changes
+`BondingCurve` updates the size table in the same commit. At 527 bytes the next
+change has to be measured against the commit it lands on, and quoting a figure
+from a document instead is how a contract becomes undeployable in CI rather than
+at review.
+
 Nothing described in this entry has been deployed to any network.
 
 ---
@@ -384,6 +427,17 @@ the locked position.
 **A.** Reject C: a per-launch tier helps nobody and fragments liquidity. Revisit
 A versus B once there is observed volume on graduated pools; the change affects
 only `createLaunch` and `graduate` and does not touch any invariant.
+
+**Addendum, 2026-11-11: A is unchanged for the canonical key and is no longer a
+protocol-wide constant.** Decision 22 makes the `fee` field of the pool key a
+range on the alternate graduation path, `[ALT_POOL_FEE_MIN, ALT_POOL_FEE_MAX] =
+[3000, 10000]`, because the key space reachable at one fee tier is small enough to
+be seized for gas. Every launch that graduates normally still graduates at
+`POOL_FEE = 10000` and `POOL_TICK_SPACING = 200`, so this is not option C: the
+tier is not creator-selectable, it is not a launch parameter, and it appears
+nowhere in `createLaunch`. What changed is that a launch escaping a griefed key
+may end up on a cheaper tier, never a dearer one, and `Graduated` now carries the
+`fee` and `tickSpacing` it used so that the pool is identifiable from the log.
 
 ---
 
@@ -1444,6 +1498,542 @@ once.
 
 ---
 
+## 22. The precondition graduation places on its pool key
+
+**DECIDED 2026-11-11 by the protocol architect, prompted by findings 2 and 3 of
+`docs/security/REVIEW-2026-11-11-phase1-contracts.md`. Not implemented.
+`contracts/src` still carries the design this entry refuses; the four changes in
+the recommendation are the engineer's work and nothing described here has been
+deployed to any network.**
+
+The decision in one statement, and it is normative:
+
+> No Pledrin contract may require a Uniswap v4 pool key to be uninitialised, or
+> to be empty. The only precondition graduation places on a pool is that
+> `slot0.sqrtPriceX96` equals `sqrtPriceTerminal` at the moment the core position
+> is minted. The protocol moves the price for free or not at all; when it cannot,
+> any third party may move it with their own funds in the same transaction; and
+> the alternate key space is wide enough that pre-denying all of it is
+> infeasible.
+
+### Which premise failed, and it was this document's
+
+Three places asserted that a Pledrin pool key cannot be reached before its launch
+transaction: `docs/SPEC.md` 8.1, `docs/THREAT_MODEL.md` 4.1, and
+`docs/DATA_MODEL.md` 6.3 with APP-5. The common sentence was that the token
+address does not exist before the launch transaction, therefore the key is not
+computable, therefore there is no window.
+
+The inference is invalid. A `CREATE` address is `keccak256(rlp([deployer,
+nonce]))[12:]`, `TokenDeployer` is a singleton at a fixed address, and its nonce
+is one `eth_getTransactionCount` call away, so the address of the token the next
+launch will deploy is computable by anyone at any time. **Non-existence is not
+unpredictability**, and the three documents used the first word to claim the
+second. The reviewer executed the consequence rather than arguing it: 47,027 gas
+to seize the canonical key of a launch that does not exist yet, after which
+`createLaunch` reverts `PoolAlreadyInitialized` for whoever lands on that nonce,
+the revert rolls the deployer's nonce back so the next attempt targets the same
+address, and eight future slots fall to one transaction. The factory was bricked
+protocol-wide for the price of a rounding error, and the only clearing move cost
+452,183 gas against the attacker's 47,027.
+
+The same prediction reaches the 190 alternate keys of a launch that does not
+exist yet, which is why findings 2 and 3 are one finding. And 4.5's costing of
+the alternate path — that an attacker "must pre-initialise **and hold hostile
+liquidity** on all 190 keys", each instance "a losing position" — overstated the
+attacker's burden twice over. A bare `initialize` with no capital disqualified a
+spacing outright. On the canonical key the liquidity needed to defeat the
+restoring swap is one wei, placed single-sided in ETH in a range above the
+current tick, so it needs no launch token and nothing had to be bought from the
+curve; and a position that small is not a losing position, it is a rounding
+error that nobody will arbitrage away.
+
+### Question
+
+Given that every key the protocol can name is computable in advance and can be
+initialised, and separately given a dust position, for gas:
+
+1. May `BondingCurve`'s constructor treat an already-initialised canonical key as
+   fatal?
+2. What does graduation do with a key that is initialised **and not empty**, on
+   the canonical key and on every alternate at once?
+
+Question 1 has one answer and it is the phase's blocker. Question 2 is the one
+with a design in it.
+
+### Options
+
+**A. Tolerate an initialised but empty key, canonical and alternate alike**, and
+let the existing restore-and-assert carry the price property. The reviewer's
+recommendation.
+
+**B. Bound the restore's cost instead of requiring it to be zero**, funded from
+a named bucket — the bounty, or the protection share.
+
+**C. Widen the key space along `fee`.** `_poolKeyFor` pins `fee` to `POOL_FEE`
+and `hooks` to zero, so the reachable key space today is one fee tier times the
+tick spacings. With `hooks == address(0)`, v4 accepts any `fee` in
+`[0, 1_000_000]`: `Hooks.isValidHookAddress` returns true for the zero address
+whenever the fee is not the dynamic-fee sentinel, and `LPFeeLibrary.validate`
+rejects only above `MAX_LP_FEE`. The field is free.
+
+**D. Make the token address unpredictable**, with `CREATE2` and a salt an
+attacker cannot precompute.
+
+**E. Accept the grief and document it**, on the basis that an empty pool's price
+is free for anyone to restore and that `graduate()` can be called atomically
+after a restore from a helper contract.
+
+**F. Let the restore spend the caller's money inside the curve.** Not in the
+brief this entry was given, and named here because it is what option E is a cheap
+version of. `graduate()` becomes payable, settles a non-zero restore delta from
+`msg.value` and from tokens pulled from `msg.sender`, refunds the remainder, and
+never touches `ethReserve`.
+
+### Trade-offs
+
+**A is necessary and is not sufficient.** It is the whole answer to question 1
+and it converts the worst defect in the protocol — a permanent, protocol-wide
+brick on the only entry point — into the already-analysed grief of threat model
+4.3. It answers nothing in question 2, because the restoring swap nominates one
+wei of exact input and settles for nothing only in an empty pool: one wei of
+liquidity in the path makes it cost something and `SwapNotFree` reverts. An
+attacker who initialises and adds dust blocks that key whether or not
+initialisation is tolerated.
+
+**B is worse than the brief credits and should not ship.** The brief describes it
+as converting a denial of service into a quantified cost. It does not, on two
+counts that both point the same way.
+
+The first is that the bound does not bound the attacker. The attacker chooses how
+much liquidity to place and reads the bound out of the deployed bytecode, so they
+place the amount that requires the bound plus one wei to clear. The key is
+blocked exactly as before, and the only thing the parameter decides is how much
+dust the attacker has to post. This is decision 2's objection — "the budget
+becomes a number an attacker optimises against" — and it was correct when it was
+a prediction.
+
+The second is new and it is disqualifying. Every wei the curve spends crossing
+hostile liquidity is a wei the attacker collects as the liquidity provider on the
+other side of that trade, plus the pool's fee on it. A bounded budget therefore
+does not merely fail to stop the attack; it pays for it. Today the grief has no
+payoff at all, which is the single best property this part of the design has, and
+a budget trades it for a capped subsidy. The same argument disposes of funding
+the bound from the bounty or from the protection share: the question is not which
+bucket loses the ETH, it is that the attacker gains it.
+
+**C is the one lever whose cost is small and whose benefit is structural.** It is
+easy to read it as "more escape hatches", which would be weak — gas on this chain
+is cheap enough that multiplying 190 by a small factor buys little. Its real
+effect is different: it removes the reason the alternate path had to use a bad
+tick spacing. Threat model 4.5 is right that the restoring swap walks the tick
+bitmap in proportion to tick distance divided by tick spacing, and right that
+173k gas at spacing 200 against 2.33M at spacing 10 is the difference between an
+affordable restore and an unaffordable one. Today the alternate path escapes that
+cost only by refusing initialised keys, which is the refusal finding 3 defeats
+for gas alone. With the `fee` field in play, the alternate key space contains
+keys at the **canonical** spacing, so relaxing the initialised check no longer
+imports the fine-spacing bitmap walk: the caller can always name a coarse key.
+`fee` is also a better dimension than `tickSpacing` on its own terms. A fee of
+9,999 pips and a fee of 10,000 pips are the same pool to a trader and to the
+locked position; a tick spacing of 10 and a tick spacing of 200 are not.
+
+Its cost is that the graduated pool's fee tier stops being a protocol constant,
+which decision 6 chose deliberately. Three things limit the damage. The canonical
+path is unchanged, so the common case is still 1% / 200. The range can be capped
+at `POOL_FEE`, so an alternate pool is never *more* expensive for a trader than
+the canonical one would have been — the escape can only make the graduated pool
+cheaper to trade, never dearer, which is the right direction for a cost imposed
+by a transient attack and permanent for the token. And the pool a launch actually
+graduated on is already not reconstructible from constants after a `graduateAlt`;
+finding 10 says so. That is an existing defect this change makes larger and
+therefore has to fix, by putting `fee` and `tickSpacing` in the `Graduated` log.
+
+**D downgrades a permanent brick to a race, and the brief is right that it cannot
+do better.** Anything derived from the launch parameters is in the transaction's
+own calldata. Anything derived from block state is known to whoever assembles the
+block. What is left is a same-block race, winnable only by an attacker who can
+see a transaction before it executes. Whether that is possible here is a chain
+fact this project does not have, requested at the end of this entry. The decisive
+point is not D's strength but its ordering: **a race is acceptable after A and
+unacceptable before it.** Before A, losing the race is a permanent brick, and no
+probabilistic defence may stand in front of that. After A, losing the race costs a
+restore. D is therefore a reduction in how often the recovery path is needed, not
+a fix, and it is sequenced accordingly in decision 23.
+
+**E is most of the answer and the brief is right that it is unscheduled.** The
+mechanism is real and it already works against today's code: `graduate()` reads
+`slot0`, skips its own swap when the price already equals `sqrtPriceTerminal`,
+and asserts the price before minting, so a third party who moves the price and
+calls `graduate()` in the same transaction graduates the launch with no code
+change at all. What makes it work on a pool that is not empty is the fact the
+documents never state: hostile liquidity does not disturb the mint. Minting
+liquidity is not a trade. The amounts a position consumes are a function of the
+price and of that position's own range, so for any third-party liquidity `L` with
+the price at terminal, the core mint consumes exactly what it would have consumed
+at `L == 0`. The pool having a stranger in it is not a problem; the price being
+wrong is, and the wrongness is curable by anyone.
+
+And the cure is cheap in exactly the case that matters. Crossing one wei of
+liquidity costs about one wei. The dust block works only against a rule that
+demands exactly zero, and that rule exists to protect the curve's reserve, not to
+protect the price. Move the payment to a party who volunteered and the attack's
+cost to the protocol scales with the attacker's own stake in it: dust is free to
+clear, and liquidity deep enough to make clearing expensive is liquidity the
+attacker has to fund, at a price that is about to be overwritten, in a pool that
+nobody has to use.
+
+**F is correct and unaffordable.** It is the same economics as E — the restore is
+paid by whoever wants graduation, never by `ethReserve` — with better ergonomics,
+since no second contract is involved. It costs settle, take, token-pull, refund
+and slippage paths inside `BondingCurve`, where `_restorePrice` currently has no
+settle or take path at all, which is why it is small. `CurveDeployer` has 448
+bytes of margin as of this entry (measured below), so F is out on size before it
+is out on anything else, and it would also put caller-supplied ETH inside the one
+function that must not confuse a payment with a reserve. E gets F's economics for
+zero bytes in the contract that has none to spare, which is the whole reason to
+prefer it. **E is not a consolation prize for B; E is B with the payer corrected
+and the code relocated.**
+
+### Recommendation
+
+All four of the following, in this order. The first is the blocker. The others
+make the first safe to take.
+
+**1. Nothing may require a key to be uninitialised or empty.** `BondingCurve`'s
+constructor reads `slot0.sqrtPriceX96` on the canonical key and calls
+`PoolManager.initialize` if and only if that value is zero. `graduateAlt` loses
+`AltPoolInitialized` entirely, and the two branches of `_settle` collapse into
+one: initialise if the key is unopened, otherwise restore for free if the price
+is wrong, then assert the price. **The constructor must not suppress any other
+failure of `initialize`.** A `getSlot0` test does that by construction; a
+`try`/`catch` or a swallowed low-level call does not, and would hide a genuine
+misconfiguration behind a griefed-pool branch. Which of those the engineer uses
+is an implementation choice; distinguishing the two cases is not.
+
+**2. The curve's own restoring swap keeps its zero-net-delta rule unchanged.**
+Invariant 41 is not relaxed. What changes is only that its failure is no longer
+the end of the path.
+
+**3. Ship `GraduationHelper`,** specified in `docs/SPEC.md` 8.6: stateless,
+ownerless, holding nothing between transactions, granted no privilege by any
+Pledrin contract, which in one transaction moves a pool to `sqrtPriceTerminal`
+with its caller's ETH or launch tokens, calls `graduate` or `graduateAlt`, claims
+the bounty it just earned and forwards it with any remainder to its caller. It
+takes a list of candidate keys and takes the first that works, which is what
+makes a front-run race on a named key survivable. It costs zero bytes against
+`CurveDeployer` and it is replaceable by anyone, because it uses nothing but
+public functions. That last property is the reason this is a scheduling decision
+rather than a trust decision: if the helper is absent or defective, graduation is
+still reachable by anyone willing to write the equivalent.
+
+**4. Widen the alternate key space along `fee`, and let it reach the canonical
+spacing.** `graduateAlt(uint24 fee, uint24 tickSpacing)`, with
+`ALT_POOL_FEE_MIN = 3000`, `ALT_POOL_FEE_MAX = POOL_FEE = 10000`,
+`ALT_TICK_SPACING_MIN = 10`, `ALT_TICK_SPACING_MAX = POOL_TICK_SPACING = 200`,
+and the single pair `(POOL_FEE, POOL_TICK_SPACING)` refused as
+`CanonicalKeyNotAllowed`. That is 7,001 fee values times 191 spacings less one
+pair: **1,337,190 keys**, against today's 190, and the launch needs one of them.
+`docs/CHAIN_FACTS.md`, under "Gas accounting and what actually limits an
+attacker", now costs the denial of that set against this chain's measured limits;
+the figures are deliberately not repeated here so that there is one place for
+them to go stale. The pair exclusion replaces `ALT_TICK_SPACING_MAX = 199` as the
+mechanism that keeps `graduate` the only path to the canonical key, and preserves
+that property exactly.
+
+Taken together the four give one rule per case, and no case has no answer:
+
+| State of the key graduation wants | What happens |
+|---|---|
+| Unopened | The protocol initialises it at `sqrtPriceTerminal`, free |
+| At `sqrtPriceTerminal`, any liquidity | The protocol mints; third-party liquidity does not disturb the amounts |
+| Wrong price, no liquidity in the path | The protocol restores it for zero net delta, free |
+| Wrong price, dust in the path | A third party restores it for about the cost of the dust and graduates atomically |
+| Wrong price, deep hostile liquidity | Nobody restores it. Take an alternate key, which is free, and leave the attacker's capital in a pool that will never be the venue |
+| Every key pre-seized | Not reachable: 1,337,190 keys, per launch, re-done after every failed attempt |
+
+### What it costs
+
+**ABI.** Three deliberate changes to `contracts/abi/`, all of them in
+`BondingCurve`, and none in `LaunchFactory`, `CreatorVesting`, `LiquidityLock`,
+`Timelock` or either deployer.
+
+| Change | Kind |
+|---|---|
+| `graduateAlt(uint24)` becomes `graduateAlt(uint24,uint24)` | new selector, old one gone |
+| `Graduated` gains `fee` and `tickSpacing` | event signature change, new topic0 |
+| `PoolPreInitialized(launch*, token*, sqrtPriceX96)` added | new event |
+| `AltPoolInitialized()` removed; `InvalidPoolFee(uint24)` and `CanonicalKeyNotAllowed()` added | one selector out, two in |
+
+`GraduationHelper`'s own ABI is new rather than changed. No getter is removed, no
+getter changes type, and `graduate()` keeps its signature and stays
+non-payable — which is the difference between this recommendation and option F.
+
+**EIP-170.** `CurveDeployer`'s runtime is 24,049 bytes at commit `5b86188`, read
+from `contracts/out/CurveDeployer.sol/CurveDeployer.json`, so the margin is
+**527 bytes**. Neither the 596 this entry was briefed with nor the 448 an earlier
+revision of this paragraph recorded is current, and both were correct when they
+were taken: 596 is exactly the margin at `81b8d77`, the commit before finding 1's
+fix, and 448 was a variant of that fix that was never committed. **Finding 1's
+fix cost 69 bytes**, not the 176 the 448 variant implied and not the 97 an
+earlier revision of this paragraph charged to it. The 97 is real and is the drift since spec 2.1's
+row was last measured: 69 for finding 1 plus 28 for two revert-reason rounds that
+landed in the contracts without that row being updated. Spec 2.1 has the ledger.
+The lesson is in the variance rather than in any of the five numbers: a figure in
+a document is a measurement of a tree, and subtracting it from a current build
+gives drift rather than the cost of any one change. Every byte of `BondingCurve`
+creation code is a byte of `CurveDeployer` runtime, so the constructor change is
+charged at full price. Order of magnitude, per change:
+
+| Change | Estimate |
+|---|---|
+| Constructor reads `slot0` and branches | the only clear addition; ~100 bytes, all in creation code |
+| `_settle` loses a branch, a getter call and a custom error | roughly neutral to negative |
+| `fee` through `_poolKeyFor`, two range checks, one pair check | ~80 bytes |
+| `Graduated` gains two fields; `PoolPreInitialized` added | ~70 bytes |
+| `GraduationHelper` | zero against this budget; a separate contract |
+
+Net: **low hundreds of bytes, plausibly under a hundred**, and the sign is not
+certain because the branch collapse in `_settle` may pay for the fee plumbing.
+That is affordable against 527 bytes only if measured rather than assumed, and
+the measurement has to be taken against `5b86188` or later. If the margin does
+not hold, the order to drop in is: the `PoolPreInitialized` event first, since it
+is telemetry; then the fee widening, which costs the alternate path its
+robustness but leaves the blocker fixed; and never change 1, because change 1 is
+the finding. If dropping all of that is still not enough, decision 5's option B
+or splitting the curve stops being optional, which spec 2.1 has said since it was
+written.
+
+**What is not spent.** No curve ETH, in any case, on any path. No new admin
+power, no new privileged address, no oracle, no new trust in anything. The
+protocol gains no ability to decide who griefed whom.
+
+### Where this disagrees with the review
+
+The reviewer's recommendation for finding 2 is change 1 and it is right. Three
+places where this entry goes somewhere else:
+
+- **Finding 3's option 1** accepts an initialised alternate key with **zero
+  liquidity**. That reproduces the defect one level down: the attacker adds a wei
+  and the key is disqualified again, and the check costs a liquidity read for a
+  condition that is not the one that matters. The condition that matters is the
+  price, and liquidity is only ever evidence about how expensive the price is to
+  fix — which is a judgement for whoever pays, not a predicate for the contract.
+  So: no liquidity check at all, on any path.
+- **Finding 3's option 2**, accepting a key already at `sqrtPriceTerminal`, is
+  correct and is already what the code does on the canonical path; under change 1
+  it stops being a special case and becomes the general rule, so it does not need
+  to be written as an option.
+- **Finding 3 reads the atomic restore as an undocumented mitigation that
+  happens to exist.** It is better than that: it is the load-bearing mechanism,
+  and the reason is the one the finding does not state, that the mint is
+  indifferent to third-party liquidity. Promoting it from a lucky property to a
+  specified path with a scheduled contract is most of this decision.
+
+### What this does not close
+
+- **A same-block race for a named key.** An attacker who can see a graduation
+  transaction before it executes can initialise and dust the key it names. The
+  helper's candidate list is the answer and it is a cost ratio, not a closure:
+  the attacker pays per key blocked, the honest caller pays for the probes that
+  failed. Recorded in `docs/THREAT_MODEL.md` 10.9.
+- **Pre-seizing the canonical key of launches that do not exist yet**, which
+  after change 1 is a nuisance rather than a failure: the launch is born with a
+  foreign price on its canonical pool and may need the helper at graduation. It
+  costs the attacker about 47,027 gas per future nonce. Decision 23 is the
+  response and it is deferred, so for now this is accepted and disclosed.
+- **A pre-launch shadow market**, which threat model 4.4 already accepts, and
+  which gains one honest limit worth stating: a position opened before the launch
+  transaction cannot contain launch tokens, because none exist, so the
+  pre-launch pool can hold a standing ETH bid and cannot sell anybody a token.
+- **Deep hostile liquidity on the canonical key**, which makes the canonical pool
+  expensive to restore and is answered by moving to an alternate key rather than
+  by paying. The launch then graduates on a key that is not the one
+  `LaunchCreated.poolId` named, which is a worse outcome than the canonical pool
+  and a much better one than no pool.
+
+### Chain facts this decision needed, and where they landed
+
+Four were requested here rather than written, because this architect does not own
+`docs/CHAIN_FACTS.md`. None was needed to take changes 1 to 4. Two have since
+been measured and are in that file; two are not.
+
+**Measured, and one of them corrected this entry.** The gas limits are in
+`docs/CHAIN_FACTS.md` under "Gas accounting and what actually limits an
+attacker", with the commands that produced them, and they make the key-space
+argument quantitative rather than rhetorical. They also falsify a sentence this
+section used to contain: it said the binding resource in a key-space argument is
+block space. It is not. The block gas limit on this chain is `2**50`, a sentinel
+rather than a cap, so block space is not scarce; the figures that bind are the
+ceiling on a single transaction and the gas-per-second speed limit, the latter
+enforced by the price rising rather than by transactions being rejected. The
+shape of the conclusion survives — denying the key space of **one** launch costs
+hours of the chain's entire throughput and whole ETH, and the work does not
+transfer to the next launch because the key contains the token address — but it
+is bought by a different mechanism than the one this entry assumed, and an
+attacker is throttled by price rather than stopped by capacity.
+
+**Still outstanding, and both bear on decision 23 rather than on this one.**
+
+- **Whether a third party can observe a transaction on chain 4663 before it
+  executes, and whether ordering is first-come-first-served.**
+  `docs/CHAIN_FACTS.md` records that `txpool_content` and
+  `eth_newPendingTransactionFilter` are absent from the endpoint while a
+  `pending` tag is served, and records correctly that this is a fact about one
+  endpoint and not evidence about the sequencer. No argument here may treat the
+  absence of a method as mempool privacy. Everything about racing for a pool key
+  turns on the real answer.
+- **Whether `blockhash` returns a usable value on this chain**, for the last 256
+  blocks, and whether the sequencer knows it before a transaction that reads it
+  is ordered. It needs a fork test that calls it from a contract, not a `cast`
+  invocation.
+
+A third request was partly answered and is worth keeping open: the gas cost of a
+minimal v4 position mint through PositionManager on this chain. The 47,027 gas to
+initialise a key is measured; the larger half of the cost table is an estimate,
+and it is the half that matters, because after change 1 a bare `initialize` is
+tolerated and only liquidity blocks a key.
+
+---
+
+## 23. Whether the launch token's address should be unpredictable
+
+**DEFERRED 2026-11-11, pending a measurement that decision 22's change 1
+produces.** Not a blocker, and explicitly sequenced after decision 22: taking
+this instead of change 1 would be a probabilistic defence standing in front of a
+permanent brick.
+
+### Question
+
+`TokenDeployer.deploy` uses plain `CREATE`, so the launch token's address is
+`f(TokenDeployer, nonce)` and both inputs are public. That is what decision 22
+records as falsifying three documents. After decision 22's change 1 the
+consequence is no longer a brick, but the prediction still lets an attacker seize
+the canonical pool key of launches that do not exist yet, at about 47,027 gas per
+future nonce, so that whichever launch lands there is born with a foreign price
+on its canonical pool. Should the address be made unpredictable with `CREATE2`?
+
+### Options
+
+**A. Leave `CREATE`.** The prediction stands. Launches that were pre-seized reach
+graduation through `GraduationHelper` on the canonical key, or through an
+alternate key.
+
+**B. `CREATE2` with a salt derived inside `TokenDeployer`** from values its caller
+does not choose — for instance the calling curve's address together with the
+parent block hash. **This needs no ABI change**: `deploy(string,string)` keeps
+its signature and the salt never appears in it. Prediction then requires both the
+parent block hash and the launch's own calldata, because the CREATE2 address
+depends on the init-code hash and the init code carries `name`, `symbol` and the
+curve address. The attacker's window collapses from "any time in advance,
+untargeted" to "this block, after seeing a transaction that has not executed".
+
+**C. `CREATE2` with a caller-supplied salt.** An ABI change, and worse than B for
+a reason that has nothing to do with pool keys: a chosen salt is a vanity-address
+grinder, and the addresses worth grinding are ones that resemble another launch's.
+The protocol validates no name, symbol or metadata anywhere, so address
+similarity is the one identifier a reader has left.
+
+### Trade-offs
+
+B is nearly free where it sits. `TokenDeployer` has 21,597 bytes of margin, so
+nothing competes with it there, and the salt costs no interface. Against that, it
+buys a race rather than a closure, and the value of the race is unknown until
+somebody establishes whether a pending transaction is observable on this chain —
+the first chain fact decision 22 asks for. A sequencer that knows the parent block
+hash before it orders a transaction also knows the salt.
+
+B has two second-order costs to write down. A `CREATE2` deployment to an address
+that already has code fails, so two identical calls from the same caller in the
+same block collide; for a launch this cannot happen, because every curve address
+is distinct, and a stranger who collides has only refused their own second call.
+And `blockhash` on a Nitro chain is not verified here to return what it returns
+on L1, which is the second chain fact asked for.
+
+A has one merit that is easy to miss: initialising at launch is still worth its
+gas under A, because it moves the attacker from a targeted attack on a launch
+they can see succeeding to an untargeted one on a nonce that may never be used by
+a launch that may never reach its cap. Most launches do not graduate. That
+argument is now the whole justification for initialising at launch, replacing the
+false one, and it survives either option.
+
+### Recommendation
+
+**A for now, B when there is evidence the attack happens.** The evidence is what
+decision 22's `PoolPreInitialized` event exists to produce: it fires only when a
+launch found its canonical key already taken, so counting it over the first weeks
+of testnet and mainnet answers whether this is a real behaviour or a reviewer's
+proof of concept. Revisit when either that count is non-zero in normal operation
+or the chain facts show that a pending transaction is not observable, which would
+make B a near-closure rather than a race. Do not ship C.
+
+A race is acceptable here, and the reason is worth stating precisely rather than
+assumed: after decision 22, losing the race costs one extra graduation transaction
+through a public helper, with no user funds at risk and no deadline. Before
+decision 22 it cost the protocol its only entry point, and no race would have been
+acceptable at that price.
+
+---
+
+## 24. The read side's two staleness thresholds
+
+**RESOLVED 2026-11-11 by the protocol architect: one threshold, measured in
+seconds. `STALENESS_BLOCK_WARN` is removed from `docs/DATA_MODEL.md` 1.7 and from
+section 3.13's warning condition, and `STALENESS_WARN_SECONDS` moves to a default
+of 10 with its upper bound tied to `QUOTE_TTL_SECONDS`.** Phase 2, blocks nothing,
+and recorded because the shape of the defect is worth more than the constant.
+
+### Question
+
+`docs/DATA_MODEL.md` 1.7 defaulted `STALENESS_BLOCK_WARN` to 50 blocks and
+`STALENESS_WARN_SECONDS` to 30 seconds, and section 3.13 warned on either. At the
+0.104 s block time measured in `docs/CHAIN_FACTS.md`, 50 blocks is 5.2 seconds and
+30 seconds is 288 blocks, so the block threshold fires roughly six times earlier
+and the time threshold can never be reached. Should the two be made to agree, or
+should one go?
+
+### Options
+
+**A. Make them agree**, by setting `STALENESS_BLOCK_WARN` to about 96 so that both
+describe the same 10 seconds.
+
+**B. Remove `STALENESS_BLOCK_WARN`** and warn on elapsed seconds only, keeping
+`blocksBehind` as a displayed field in `IndexerStatus`.
+
+### Trade-offs
+
+A keeps two constants that must be held consistent by hand against a block time
+that `docs/CHAIN_FACTS.md` is explicit about: 0.104 s is an observation with a
+date on it, not a bound, and a sequencer or batch-posting change moves it. Two
+constants describing one quantity in two units cannot be made to agree once; they
+have to be re-agreed after every change to the conversion factor, and when they
+drift the tighter one silently becomes the only one that fires while the looser
+one still reads like a second safety net. That is the part of this defect that
+outlives the constant: a reader who tunes the dead threshold changes nothing and
+has no way to find out.
+
+B cannot disagree with itself. It also measures the quantity a reader actually
+has an opinion about — how old the number on the screen is — rather than how many
+blocks of work the indexer is behind, which is the same quantity in a unit that is
+not stable on this chain. The protocol already refuses block counts as a unit of
+time in the contracts for the same reason (`docs/CHAIN_FACTS.md`); the read side
+had no reason to be different. The cost of B is that an indexer that has stopped
+while the chain keeps producing is detected by elapsed seconds rather than by
+block distance, which detects it equally well and sooner.
+
+The default moves from 30 seconds to **10**, and the bound becomes
+`2 <= STALENESS_WARN_SECONDS < QUOTE_TTL_SECONDS`. The reason for the relation is
+presentational coherence rather than taste: `QUOTE_TTL_SECONDS` is 15, so a
+threshold at or above it would let a page display an unwarned price older than the
+life of a quote shown next to it.
+
+### Recommendation
+
+**B**, taken now, since it is a deletion plus one default and nothing is built on
+either constant yet.
+
+---
+
 ## Verification prerequisites for Phase 1
 
 Not decisions. These were v4 behaviours the spec assumed. All six were tested on
@@ -1460,7 +2050,7 @@ result.
 | A single-sided native-ETH position with `tickLower` strictly **above** the current tick can be minted through PositionManager, funded in `currency0` only. | Spec 8.2 step 6, section 10.1, Invariant 42 | **Refuted as originally written.** The original read "`tickUpper` strictly below the current tick", which v4 funds in `currency1`: as specified, the holder-protection pool would have minted a token-funded sell wall instead of a standing ETH bid. The corrected direction holds and is now specified. |
 | Minting with a bounded `currency1` amount and a bounded `currency0` amount consumes at most `LP_SUPPLY` with a remainder under `LP_DUST_MAX`, at most `R_target`, and the ETH residual is recoverable to the curve. | Spec 8.2 step 4, Invariant 39 | **Half refuted.** "At most `R_target`" holds and `R_target` is the exact bound; ETH headroom is not monotone in `virtualEthReserve`, so `amount0Max` must be `R_target`. "Exactly `LP_SUPPLY`" is unachievable: `MINT_POSITION` is parameterised by liquidity and the `currency1` owed is a step function of it, leaving an irreducible 28,428 / 1,088 / 240 base units across the permitted range. The ETH residual is recoverable; the token remainder is stranded in the curve. |
 | The token approval path for PositionManager requires `token.approve(PERMIT2, ...)` followed by `PERMIT2.approve(token, POSITION_MANAGER, ...)`, and nothing else. | Spec 8.2 step 3 | Holds, and both legs are necessary. A direct `token.approve(POSITION_MANAGER, ...)` is not the path; either leg alone fails, on `AllowanceExpired` or inside the ERC-20 transfer. |
-| `PoolManager.initialize` with `hooks = address(0)` succeeds and leaves the pool with zero liquidity. | Spec 8.1 | Holds. `sqrtPriceTerminal` is exactly `5000 * 2**96` at the default and ticks 170352, 115135 and 207243 were reproduced; a second `initialize` on the same key reverts `PoolAlreadyInitialized`, which is what makes initialising at launch an anti-grief measure. |
+| `PoolManager.initialize` with `hooks = address(0)` succeeds and leaves the pool with zero liquidity. | Spec 8.1 | Holds. `sqrtPriceTerminal` is exactly `5000 * 2**96` at the default and ticks 170352, 115135 and 207243 were reproduced; a second `initialize` on the same key reverts `PoolAlreadyInitialized`. **The conclusion drawn from that revert was wrong.** This row read "which is what makes initialising at launch an anti-grief measure", which held only while the key was believed to be unreachable before the launch transaction. It is reachable, the revert fires against the launch rather than against the attacker, and decision 22 is the correction: the launch tolerates an initialised key and the price property is carried by an assertion rather than by a race. |
 
 Two further measured facts, neither among the six, for whoever writes the
 graduation path and the lock:

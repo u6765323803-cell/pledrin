@@ -9,6 +9,15 @@ and says how. The second, section 10, states what the design does not prevent.
 Section 10 is the more important half. The product's claim is that rugging is
 expensive, not that it is impossible, and this document exists to hold that line.
 
+**Five sections were corrected on 2026-11-11 after a security review falsified a
+premise this document shared with `docs/SPEC.md`: that a launch's Uniswap pool
+key cannot be reached before the launch transaction.** It can. Sections 4.1,
+4.3, 4.5, 5.2 and 6.4 now say so and say what is true instead, 4.10 and 10.9 are
+new, and the remedy is decision 22 of `docs/OPEN_DECISIONS.md`. Each of those
+sections states that the earlier claim was wrong rather than quietly replacing
+it, because the error was in an inference this document made and not in anything
+the code did differently from what it was told.
+
 ---
 
 ## 1. Adversaries
@@ -23,9 +32,18 @@ expensive, not that it is impossible, and this document exists to hold that line
 | Protocol insider | Holds the factory owner key | Divert fees or user funds |
 | External dependency | Uniswap governance, chain operator | Not adversarial by intent, but changes outcomes |
 
-The Robinhood Chain sequencer is first-come-first-served with no public mempool,
-which raises the cost of mempool-based attacks but is not relied on anywhere.
-Every mitigation below holds against a fully public mempool.
+**Unsourced, and corrected on 2026-11-11.** This paragraph asserted that the
+Robinhood Chain sequencer is first-come-first-served with no public mempool. That
+is not in `docs/CHAIN_FACTS.md`, no command in this project produced it, and the
+Trader-MEV row immediately above assumes the opposite by granting that adversary
+sight of pending state. It is withdrawn as a statement of fact and recorded as a
+chain fact this project needs, in decision 22 of `docs/OPEN_DECISIONS.md`.
+
+What stands, and is the only thing that was ever load-bearing: **every mitigation
+in this document holds against a fully public mempool and against an adversary
+who orders transactions within a block.** Section 10.9 is the one place where the
+cost of an attack — not its success — depends on whether a transaction can be
+seen before it executes, and it says so.
 
 ---
 
@@ -105,6 +123,18 @@ Invariant 10. Forcing ETH into the curve, forcing tokens into it, or any future
 chain mechanism that credits balances without a call cannot move any price. This
 single rule removes the whole class of balance-manipulation attacks rather than
 patching instances of it.
+
+The rule is about pricing and was correct about pricing, and it was read as
+covering more than it says. Until 2026-11-11 the curve had exactly one place that
+read `address(this).balance`, and it read it for **control flow** rather than for
+a price: the core graduation mint's ETH measurement, which a forced balance could
+invert into a revert (6.6). No price moved, and graduation stopped, which is why
+"cannot move any price" was a true sentence that left a defect standing behind
+it. The curve now reads no ETH balance of its own for any purpose except the
+floor mint's delta, whose soundness is an ordering property rather than a pricing
+one (spec 8.2 step 8, Invariant 70). **The general form worth keeping: a forced
+balance cannot move a Pledrin price, and the question to ask of any balance read
+is what decision it feeds, not whether it feeds a price.**
 
 ### 2.8 Blocking a specific user
 
@@ -191,12 +221,52 @@ pool key before the protocol does, at an absurd price, so that the protocol's ow
 `initialize` reverts and its liquidity would be minted against a manipulated
 price.
 
-Closed completely. `createLaunch` initialises the pool in the launch transaction
-(section 8.1). The token address does not exist before that transaction, so the
-pool key is not computable before it, so there is no window. **No attacker can
-ever choose a Pledrin pool's initial price.** This is the single most valuable
-property bought by initialising at launch rather than at graduation, and it is
-why the extra `initialize` gas on launches that never graduate is accepted.
+**This section claimed the attack was closed completely, and the claim was
+false.** It argued that `createLaunch` initialises the pool in the launch
+transaction, that the token address does not exist before that transaction, that
+the pool key is therefore not computable before it, and that there is therefore
+no window. The first three clauses do not give the fourth. A `CREATE` address is
+`keccak256(rlp([deployer, nonce]))[12:]`; `TokenDeployer` is a singleton at a
+fixed address and its nonce is a public read; so the pool key of the launch that
+the next `createLaunch` will create is computable by anyone, at any time, before
+any launch transaction exists. **Non-existence is not unpredictability**, and
+this section used the first to assert the second.
+
+What that bought an attacker while `initialize` was unconditional was worse than
+a hostile price. `PoolManager.initialize` is permissionless and `Pool.initialize`
+reverts `PoolAlreadyInitialized` on an open key, so seizing the predicted key for
+roughly 47,000 gas reverted `createLaunch` for whoever landed on that nonce — and
+the revert rolled `TokenDeployer`'s nonce back, so the next attempt by anybody
+targeted the same seized address and failed the same way. Eight consecutive slots
+fell to one transaction. Clearing a slot cost 452,183 gas against the attacker's
+47,027, roughly ten to one in the attacker's favour, indefinitely sustainable.
+The protocol's only entry point was deniable at that price, and because the
+attacker works ahead of the queue rather than racing a victim, a
+first-come-first-served sequencer was no defence. The review of 2026-11-11
+executed this rather than predicting it.
+
+**What is true now.** `docs/OPEN_DECISIONS.md` decision 22 and spec 8.1 make the
+launch tolerate an open key: the constructor reads `slot0`, calls `initialize`
+only if the key is unopened, logs `PoolPreInitialized` otherwise, and the launch
+proceeds either way. So:
+
+- **The launch cannot be denied.** Seizing the key costs the attacker gas and
+  prevents nothing. Invariant 64 asserts that `createLaunch` succeeds whatever
+  was done to the key first, and would have caught the original defect.
+- **The hostile price is still harmless, for a different reason than this
+  section gave.** It is no longer harmless because the attacker cannot set it. It
+  is harmless because `graduate` asserts `slot0.sqrtPriceX96 ==
+  sqrtPriceTerminal` before any liquidity is minted (spec 8.2 step 3,
+  Invariants 40 and 66), and an attacker who sets any other price has set a
+  number that will be overwritten. **No attacker can choose a Pledrin pool's
+  price at the moment liquidity enters it.** That is the property the design
+  has; the stronger one this section used to claim it does not.
+- **What remains is the cost of getting the price back**, which is 4.2 when the
+  pool is empty and 4.3 when it is not.
+- **The attack is now visible.** `PoolPreInitialized` fires in the launch
+  transaction of every launch whose key was seized, so how often this happens is
+  a number the protocol will have rather than a guess. Decision 23 is the
+  response that is waiting on it.
 
 ### 4.2 Moving the price of the zero-liquidity pool
 
@@ -216,35 +286,87 @@ rejects `amountSpecified == 0`, so the restoring call nominates one unit of exac
 input and relies on an empty pool consuming none of it. The attack costs the
 attacker gas and achieves nothing.
 
+This holds whether the pool was opened by the launch and then moved, or opened by
+the attacker at a price of their choosing in the first place (4.1). The curve
+does not distinguish the two cases and has no reason to: the only thing it reads
+is the price, and the only thing it requires is that the price be
+`sqrtPriceTerminal` when liquidity is minted.
+
 ### 4.3 Adding liquidity so that the reset is not free
 
-If the attacker mints real liquidity into the pool at the ticks between the
-manipulated price and `sqrtPriceTerminal`, restoring the price would require
-actually trading against it, which would cost the curve ETH or tokens.
+If the attacker mints liquidity into the pool at the ticks between the
+manipulated price and `sqrtPriceTerminal`, restoring the price requires actually
+trading against it, which would cost the curve ETH or tokens.
 
-`graduate()` requires the reset's net deltas to be zero, so it reverts rather
-than spending any curve value on a swap. Consequences:
+`graduate()` requires the reset's net deltas to be zero, so it declines rather
+than spending any curve value on a swap. That part is unchanged and is not
+negotiable:
 
 - The curve never funds a swap. `ethReserve` is spent only on sells and on the
-  two graduation positions, the core one and the floor one. Invariant 4.
+  two graduation positions, the core one and the floor one. Invariants 4 and 41.
 - State remains frozen in `Graduating`. `tokensSold`, `ethReserve` and every
   token held by the curve are untouched and remain under Invariants 1 and 2.
   **No user funds are at risk at any point during this grief; the only cost is
   delay.**
 - `graduate()` is retryable forever with no deadline.
-- After `ALT_DELAY` the launch can graduate on a different pool key
-  (section 4.5).
 
-The attacker also pays for the privilege: liquidity minted at a wrong price in a
-pool whose price is about to be reset to `sqrtPriceTerminal` is a losing
-position, and tokens they used to mint it had to be bought from the curve at the
-curve's price.
+**Two claims this section made about the attacker's cost were wrong, and both
+understated how cheap the block is.**
+
+The first: that the attacker must mint *real* liquidity. One wei is enough. The
+restoring swap nominates one wei of exact input, so any liquidity at all in the
+path makes the swap settle something and `SwapNotFree` reverts; a dust position
+blocks the key exactly as well as a deep one does.
+
+The second: that the tokens were bought from the curve at the curve's price. They
+were not necessarily bought at all. A range lying entirely above the current tick
+is funded in `currency0` alone, which is ETH (5.3 and spec 8.1), so an attacker
+placing liquidity between a manipulated price and `sqrtPriceTerminal` can fund it
+single-sided in ETH and needs no launch token. "Each instance is a losing
+position" is therefore false for the cheapest instance: one wei of ETH in a pool
+nobody trades is not a position anybody loses anything on.
+
+**What actually answers the attack**, and it is the mechanism this document did
+not state. Restoring the price is a swap, and nothing requires the curve to
+perform it. Moving a price costs whoever moves it, and `graduate()` skips its own
+swap when the price is already `sqrtPriceTerminal`, so a third party may move the
+price with their own ETH or their own launch tokens and call `graduate()` in the
+same transaction. The curve spends nothing and the graduation completes. Spec 8.6
+specifies `GraduationHelper` for this and 4.10 costs it.
+
+The economics then come out the right way round, which they did not before:
+
+- **Dust is free to clear.** Crossing one wei of liquidity costs about one wei.
+  The dust block worked only against a rule demanding exactly zero, and that rule
+  exists to protect the curve's reserve rather than to protect the price. Once
+  the payer is someone who volunteered, the cheapest attack is also the cheapest
+  to undo.
+- **Liquidity deep enough to be expensive to cross is liquidity the attacker
+  funded.** Whoever crosses it trades at prices the attacker chose, so the cost
+  of the restore is the attacker's gain — which is exactly why the protocol must
+  not be the payer, and why a bounded restore budget inside the curve was refused
+  (decision 2's addendum and decision 22). Nobody is obliged to pay it. The
+  answer to deep hostile liquidity is 4.5: take another key, free, and leave the
+  attacker's capital in a pool that will never be the venue.
+- **Third-party liquidity does not disturb the mint.** Minting is not a trade,
+  so a stranger's position changes none of the graduation's amounts
+  (Invariant 66). The pool having a stranger in it is not the problem; the price
+  being wrong is.
 
 ### 4.4 The pre-initialised pool as a shadow market
 
 Because the pool exists from launch, anyone may add liquidity to it and trade
 against it before graduation. A second market therefore exists alongside the
 curve for the whole curve phase, and the two prices can diverge.
+
+One limit of the pre-launch case is worth stating, because 4.1 now permits it. A
+position opened on a launch's key before the launch transaction cannot contain
+launch tokens, because none exist and the token contract has no code, so such a
+position can only be a standing ETH bid. A seized key can hold an offer to buy
+the token and cannot hold an offer to sell it, and nobody can be sold a worthless
+token by a pool that predates the token. Once the launch is live anyone can buy
+from the curve and seed the other side, which is the ordinary shadow market this
+section accepts.
 
 This is accepted and is not a vulnerability. The curve is the canonical venue:
 it is the only source of new supply, it is where the cap is measured, and its
@@ -255,37 +377,71 @@ frontend should discourage, not a loss the protocol caused.
 
 ### 4.5 Blocking every pool key
 
-After `ALT_DELAY = 1 hour` in `Graduating`, `graduateAlt(uint24 tickSpacing)`
-performs the identical procedure on a caller-supplied `tickSpacing` in
-`[10, 199]`, and requires that pool to be uninitialised so that it is
-initialised at `sqrtPriceTerminal` with no prior liquidity (Invariant 38). The
-range is a range of integers and not a list of canonical tiers, so the usable set
-is every spacing from 10 to 199 — 190 distinct pool keys. The range stops one
-short of `POOL_TICK_SPACING = 200` so that this path can never name the canonical
-pool key, which the launch transaction already initialised: `graduateAlt(200)`
-reverts `InvalidTickSpacing` on the range check. The range should not be read as
-a menu in either direction. An attacker must therefore pre-initialise and hold
-hostile liquidity on all 190 keys, continuously, for as long as the launch
-exists, and re-do it after every failed attempt. Each instance is a losing
-position.
+**This section's costing of the alternate path was wrong and is replaced.** It
+said that an attacker "must therefore pre-initialise **and hold hostile
+liquidity** on all 190 keys, continuously, for as long as the launch exists", and
+that "each instance is a losing position". Neither clause held. `graduateAlt`
+disqualified any *initialised* key, so a bare `initialize` removed a spacing
+permanently: about 47,000 gas, no capital, no position, nothing at stake. One
+transaction batch covered all 190. And on the canonical key one wei of liquidity
+was enough (4.3). The documented escape from a graduation grief was available for
+pure gas plus dust, and this document costed it as requiring continuous capital
+at risk.
 
-The uninitialised requirement is load-bearing in a second way that is easy to
-miss, and must not be relaxed. Restoring a griefed price is free in both
-currencies but not in gas: the restoring swap walks the tick bitmap in proportion
-to the tick distance divided by the tick spacing. Measured on a fork against the
-deployed PoolManager, restoring from the extreme tick cost 173k gas of EVM
-execution at `tickSpacing = 200` and 2.33M at `ALT_TICK_SPACING_MIN = 10`, the
-latter alone exceeding the two-million-gas graduation the bounty is sized
-against. Because `graduateAlt` opens the alternate pool itself at
-`sqrtPriceTerminal`, that cost never enters the graduation path. Allowing an
-already-initialised alt pool would import it and would hand an attacker a
-gas-exhaustion grief on the one path that exists to defeat griefing. The figures
-are EVM execution gas under a forked EVM; Nitro's gas accounting differs
+**What the path is now.** `docs/OPEN_DECISIONS.md` decision 22 and spec 8.4 make
+`graduateAlt` name both free fields of the pool key:
+
+```
+graduateAlt(uint24 fee, uint24 tickSpacing)
+```
+
+with `fee` in `[3000, 10000]`, `tickSpacing` in `[10, 200]`, and the single pair
+`(POOL_FEE, POOL_TICK_SPACING)` refused so that `graduate` stays the only path to
+the canonical key (Invariant 67). That is `7001 * 191 - 1 = 1,337,190` keys per
+launch, against 190. Nothing in the protocol enumerates them: the caller names
+one, so the width costs no gas and no code.
+
+Uniswap v4 permits that width. With `hooks = address(0)` any `fee` from 0 to
+`MAX_LP_FEE = 1,000,000` is accepted — `Hooks.isValidHookAddress` passes the zero
+address whenever the fee is not the dynamic-fee sentinel and `LPFeeLibrary`
+rejects only above the maximum — so the field was simply unused. The range is
+capped at `POOL_FEE` rather than above it so that an escape key is never more
+expensive for a trader than the canonical pool would have been.
+
+**The attacker's cost, stated honestly this time.** Per key: one `initialize`,
+measured at 47,027 gas, plus a v4 position mint to add the wei of liquidity that
+turns an open key into a blocked one — the larger of the two, and still an
+estimate on this chain. `docs/CHAIN_FACTS.md`, under "Gas accounting and what
+actually limits an attacker", costs the whole set against this chain's measured
+limits and is the single place those figures live. Two of its conclusions belong
+here rather than there. The scarce resource is **not** block space: the block gas
+limit is a sentinel, so what binds is the ceiling on one transaction and the
+gas-per-second speed limit, which is enforced by the price rising rather than by
+transactions being rejected — an attacker at that scale is throttled by cost, not
+stopped by capacity. And the work does not amortise: the pool key contains the
+launch token's address, so seizing the space for one launch seizes nothing for
+the next, and the whole bill is payable again per launch and again after every
+failed attempt, against a launch that needs exactly one key.
+
+**The gas argument for refusing initialised keys is preserved by a different
+mechanism.** The measurement behind it stands: the restoring swap walks the tick
+bitmap in proportion to the tick distance divided by the tick spacing, and
+restoring from the extreme tick cost 173k gas of EVM execution at
+`tickSpacing = 200` against 2.33M at `ALT_TICK_SPACING_MIN = 10` on a fork
+against the deployed PoolManager, the latter alone exceeding the two-million-gas
+graduation. What was wrong was the inference that refusing initialised keys is
+therefore the right defence — it surrendered the whole key set to anyone with a
+gas allowance in order to avoid a cost that the caller chooses. Because
+`ALT_TICK_SPACING_MAX` is now `POOL_TICK_SPACING`, the alternate set contains
+keys at the canonical coarse spacing, so a caller facing an extreme price on a
+fine-spacing key can name a coarse one instead and the expensive bitmap walk is a
+cost a caller declines rather than a path the protocol forfeits. The figures are
+EVM execution gas under a forked EVM; Nitro's gas accounting differs
 (`docs/CHAIN_FACTS.md`), so they describe the relative cost of the loop and not a
 chain gas quote.
 
 `ALT_DELAY` exists so the honest primary key wins when it is available; without
-it, a caller could fragment the canonical pool onto an odd spacing for no reason.
+it, a caller could fragment the canonical pool onto an odd key for no reason.
 
 ### 4.6 Nobody calls `graduate()`
 
@@ -329,6 +485,43 @@ nothing: they receive exactly the bond and fees `graduate()` would have given
 them, and they pay for the grief. What they lose is the locked Uniswap pool,
 which is the thing that makes a graduated token tradeable at all.
 
+### 4.10 The recovery path, and what it costs
+
+4.3 and 4.5 both end in the same place: when the curve's own free restore cannot
+run, the price can still be moved by somebody who pays for it, and a graduation
+in the same transaction then needs nothing from the curve that the curve does not
+already do. Spec 8.6 specifies `GraduationHelper` for that. What is worth putting
+in a threat model is what the path depends on and what it does not.
+
+**It is not a trust dependency.** No Pledrin contract names the helper, it holds
+no privilege, and it calls only functions any address may call. If it is absent,
+or defective, or replaced by a hostile copy, graduation is still reachable by
+anyone who writes an equivalent, and a hostile copy can harm nobody but its own
+caller: the funds at stake in a call are the caller's `msg.value` and the token
+allowance the caller granted. Invariant 68 states that in testable form.
+
+**It does not reduce anybody's exposure to the attacker.** The restorer pays what
+crossing the hostile liquidity costs, which is about nothing for dust and real
+money for depth, and the attacker is the counterparty either way (4.3). The
+honest conclusion is that nothing makes a deep hostile position free to clear.
+What the design does is make it unnecessary to clear: the alternate key costs the
+restorer nothing at all.
+
+**Who pays and who can pay.** The graduation bounty funds it when there is one.
+Beyond that the parties with the standing incentive are the creator, whose
+vesting does not start until graduation, and the holders, for whom graduation is
+the difference between a frozen curve and a permanent market. One real limitation
+follows from the direction of the swap: restoring a price that sits *below*
+`sqrtPriceTerminal` requires launch tokens, and the curve is frozen in
+`Graduating` so nobody can buy them from it. In that direction the restorer must
+be a holder or must acquire tokens from one. Every launch in `Graduating` has
+holders by construction, since the whole curve supply has been sold, so this is a
+constraint on who can act rather than on whether anybody can.
+
+**It does not remove the final backstop.** `abortGraduation` after
+`GRAD_GRACE` is unchanged (4.9), and a launch that nobody is willing to pay to
+graduate still reaches a permanent exit against the deepest reserve it ever held.
+
 ---
 
 ## 5. Sandwiching the migration
@@ -349,10 +542,13 @@ the curve's last price and hands that 20% to the first seller.
 
 ### 5.2 No window between seeding and tradeability
 
-Pool initialisation happens at launch; the price assertion, the core mint and the
-floor mint all happen inside one `graduate()` transaction. There is no block in
-which the pool is initialised but unseeded in a way an attacker can exploit for
-value — only the free price-shift of 4.2, which `graduate()` undoes.
+The price assertion, the core mint and the floor mint all happen inside one
+`graduate()` transaction, whoever opened the pool and whenever they opened it.
+There is no block in which the pool carries protocol liquidity at a price the
+protocol did not assert. The pool is open for the whole curve phase and anybody
+may trade it, which is the shadow market of 4.4, and the two things that can be
+done to it in that time — the free price shift of 4.2 and the liquidity of 4.3 —
+cost an attacker gas and a dust position and move no value out of the protocol.
 
 ### 5.3 The floor position cannot create a gap
 
@@ -463,8 +659,20 @@ it is recorded here rather than claimed away.
 
 ### 6.4 First depositor on the Uniswap pool
 
-Removed by initialising the pool at launch at a price the protocol chooses
-(4.1). The protocol is always the pool's initialiser.
+**This section read "removed by initialising the pool at launch at a price the
+protocol chooses; the protocol is always the pool's initialiser." The second
+clause is false** and rested on the same premise as 4.1: anyone may open a
+Pledrin launch's pool key before the launch exists, so the protocol is the
+initialiser in the ordinary case and not always.
+
+The attack is still removed, by the assertion rather than by the ordering. The
+classic first-depositor attack needs the first liquidity provider's price to be
+the price the next party's deposit is valued against. Pledrin's own deposit is
+valued at `sqrtPriceTerminal`, asserted immediately before it (spec 8.2 step 3,
+Invariants 40 and 66), so a stranger who deposited first fixed no price that the
+protocol will use and the amounts the core mint consumes are unchanged by their
+position. What a first depositor can do is make the price expensive to restore,
+which is 4.3, and that is a liveness grief rather than a mispricing.
 
 ### 6.5 Donation to the locked position
 
@@ -514,15 +722,38 @@ assertion while turning a permissionless ERC-20 transfer into a way to hold a
 capped launch out of graduation until it stalled. The delta form is
 load-bearing and must be preserved by any future change to the mint.
 
-Two adjacent underflows, neither reachable and both safe in the direction they
-fail: a balance *increase* measured across the mint call would make the token
-delta underflow and revert the graduation, and a consumption above `LP_SUPPLY`
-would make the remainder underflow and revert it. Neither can happen, because no
-code a third party controls executes inside that call. The pool is hookless, so
-`modifyLiquidities` enters no hook, and **the only Pledrin code it enters is the
-curve's own `receive`**, which accepts value from PositionManager alone and
-reverts otherwise. Everything else it reaches is Uniswap v4's own contracts and
-the launch token, which has no transfer hook, no callback and no fee on transfer.
+Two adjacent underflows of the **token** reading, neither reachable and both safe
+in the direction they fail: a token balance *increase* measured across the mint
+call would make the token delta underflow and revert the graduation, and a
+consumption above `LP_SUPPLY` would make the remainder underflow and revert it.
+Neither can happen, because no code a third party controls executes inside that
+call. The pool is hookless, so `modifyLiquidities` enters no hook, and **the only
+Pledrin code it enters is the curve's own `receive`**, which accepts value from
+PositionManager alone and reverts otherwise. Everything else it reaches is
+Uniswap v4's own contracts and the launch token, which has no transfer hook, no
+callback and no fee on transfer.
+
+**That in-window argument was true, was stated without a scope, and was not
+sufficient — which is the correction this section owes.** It read as a general
+claim about everything the mint measures, and the review of 2026-11-11 found a
+third underflow two lines above the two named here, on the **ETH** reading, which
+the argument did not reach and could not: no third party needed to execute
+anything inside the call, because the batch's own closing
+`SWEEP(currency0, MSG_SENDER)` sends PositionManager's *entire* native balance to
+the curve, and a balance anyone parked there **before** the call therefore arrived
+inside it and subtracted from the measurement. A parked balance above the
+position's cost underflowed and reverted `graduate()` and `graduateAlt` on every
+key at once, which is a cheaper and more complete denial than anything in
+section 4, and a stray balance left by an unrelated v4 user did it by accident
+from 0.1 ETH. The lesson for this document, rather than for the code: "no third
+party controls code in that window" bounds what can happen *during* a call and
+says nothing about state established before it that the call itself imports.
+
+The ETH reading is gone. Spec 8.2 step 4 now computes the core mint's ETH cost
+from the position's own parameters before the call, Invariant 60 splits the two
+mechanisms and quantifies over a parked balance, and Invariant 70 states the
+ordering that keeps the floor mint's remaining delta sound. The token argument
+above is unchanged and is the one this section was always about.
 
 `LiquidityLock.onERC721Received` is deliberately absent from that list. v4's
 PositionManager mints the position with `_mint`, which emits `Transfer` and
@@ -541,9 +772,10 @@ value at risk, which is the same outcome as 4.3.
 
 A static analyser flags the before-and-after balance reading in that function as
 `reentrancy-balance`, because a balance read spans an external call. The verdict
-on that finding is recorded in `docs/SECURITY_NOTES.md`. This section covers the
-donation question only, which stands on the measurement property above
-independently of how the detector finding is resolved.
+on that finding is recorded in `docs/SECURITY_NOTES.md`, scoped to the token
+reading it actually covers. This section covers the donation question only, which
+stands on the measurement property above independently of how the detector
+finding is resolved.
 
 ---
 
@@ -676,6 +908,15 @@ What a stranger can do:
   takes a position id the lock must already own and names no recipient. The
   consequence is for readers rather than for holders: a `PositionLocked` log is
   not proof that the launch behind it is real.
+
+- **Advance `TokenDeployer`'s nonce**, and so change which address the next
+  launch's token will take. Calling `deploy` costs the caller a throwaway ERC-20
+  and 452,183 gas, measured. This was briefly load-bearing: while the launch
+  transaction's `initialize` was unconditional, stepping past a seized nonce was
+  the only way to clear a bricked factory (4.1). It is now inert — a launch
+  tolerates an open key — and all it does is shift which predicted address the
+  next launch lands on, which is of no use to an attacker who can predict either
+  one.
 
 What follows for anyone building on this: a `CurveDeployed` or `TokenDeployed`
 log, and the mere existence of a curve or a token, are not evidence of a launch.
@@ -835,7 +1076,45 @@ which raises every exit price, and the creator receives nothing. That is the ful
 extent of the remedy. It is not a refund, and a holder who bought near the cap can
 still lose most of their ETH.
 
-### 10.9 The claim this design actually makes
+### 10.9 A same-block race for a pool key
+
+Every pool key a Pledrin launch can use is computable in advance, and opening one
+is permissionless (4.1). After decision 22 that denies nothing, because the
+protocol tolerates an open key and the price is carried by an assertion. What it
+leaves is a race, in one narrow place: an attacker who can see a transaction
+before it executes can open and dust the one key that transaction names, and make
+it revert.
+
+This is not closed and the reasons are worth being exact about.
+
+- **Making the token address unpredictable does not close it.** Anything derived
+  from the launch parameters is in the transaction's own calldata; anything
+  derived from block state is known to whoever assembles the block. The best
+  available version buys a same-block race rather than a closure, which is why
+  decision 23 recommends it as a reduction in how often the recovery path is
+  needed and not as a fix.
+- **The candidate list in spec 8.6 is a cost ratio, not a closure.** An attacker
+  cannot block a list they have not seen, so they must block keys speculatively
+  and the honest caller pays only for the probes that failed. That is a good
+  ratio and it is still a ratio.
+- **Whether the race is winnable at all is a chain fact this project still does
+  not have.** `docs/CHAIN_FACTS.md` records that this endpoint serves neither
+  `txpool_content` nor `eth_newPendingTransactionFilter` while it does serve a
+  `pending` block tag, and records that this is a fact about the endpoint and not
+  about the sequencer: another endpoint, or the sequencer's own feed, may expose
+  what this one does not. **The absence of a method is not mempool privacy**, and
+  no argument in this document treats it as such — which is also why section 1's
+  unsourced claim about ordering was withdrawn rather than replaced with a weaker
+  version of itself. Until the real answer exists, the honest position is that
+  the race may be free to win, and the design does not depend on it being hard.
+
+What makes this acceptable rather than fatal is the thing that changed in 4.1:
+losing the race costs one more transaction against a state that is frozen, with
+no user funds at risk and no deadline inside `GRAD_GRACE`. It was not acceptable
+when losing it cost the protocol its only entry point, and no probabilistic
+defence should ever have been asked to stand in front of that.
+
+### 10.10 The claim this design actually makes
 
 Rugging a Pledrin launch is expensive, not impossible.
 
@@ -854,4 +1133,6 @@ What is genuinely enforced, without an oracle, an admin or any off-chain input:
 
 What is not enforced is everything that depends on knowing who someone is or what
 they intended. Those are in sections 10.1 through 10.8, and no future version of
-this protocol will close them on-chain.
+this protocol will close them on-chain. Section 10.9 is of a different kind: it
+is a race rather than a question about identity, and it is listed here because the
+design does not close it and should not be read as closing it.

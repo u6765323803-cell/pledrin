@@ -13,7 +13,22 @@ and whether it blocks Phase 1 (the Solidity implementation).
 
 ## 1. Trading fees accruing to the permanently locked positions
 
-**Blocks Phase 1.**
+**RESOLVED 2026-11-11 by the founder: permissionless compound-only.**
+
+`LiquidityLock` gets a single permissionless function that collects the
+position's accrued fees and reinvests them into that same position. No
+recipient parameter, no withdrawal path, no transfer path. Every wei stays
+inside the lock and the position can only grow.
+
+This is conditional on the fork test named in the appendix proving that
+collect and increase execute as one `modifyLiquidities` call with no
+intermediate recipient. If they cannot, the fallback is **no collection at
+all** — not a two-step version that holds funds between calls. That fallback
+is pre-approved and needs no further decision.
+
+Because the lock is not upgradeable, this function must be written and
+reviewed as the riskiest code in the repository: it is the only code with a
+reason to touch a position that must otherwise never move.
 
 ### Question
 
@@ -70,7 +85,18 @@ than building a two-step version that holds funds across calls.
 
 ## 2. Fallback if the free v4 price reset is not achievable
 
-**Blocks Phase 1.**
+**RESOLVED 2026-11-11 by the tech lead: ship as specified if the fork test
+passes, otherwise the committed fallback.**
+
+The first fork test Phase 1 writes answers this. If a zero-net-delta swap
+restores the price of a zero-liquidity v4 pool, the specification ships
+unchanged. If it does not, the committed fallback ships: `graduate()` reverts
+immediately on a wrong pool price, graduation proceeds through
+`graduateAlt`, and `ALT_DELAY` drops to zero.
+
+Explicitly not on the table: a bounded reset budget, or a tolerance band
+around the terminal price. Both trade away properties the specification
+currently states cleanly, and neither is worth the trade.
 
 ### Question
 

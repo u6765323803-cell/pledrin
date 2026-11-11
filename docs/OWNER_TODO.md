@@ -45,13 +45,14 @@ Until this is done the team cannot push branches, open pull requests, or have
 GitHub Actions run — which means the whole review-and-merge workflow and every
 quality gate is inert.
 
-## 3. Approve the Phase 0 specification — blocking
+## 3. Approve the Phase 0 specification — done 2026-11-11
 
-Nothing in Phase 1 starts until you have read and approved `docs/SPEC.md`,
-`docs/THREAT_MODEL.md` and the decisions in `docs/OPEN_DECISIONS.md`.
+Approved. Both decisions that blocked Phase 1 are answered and recorded in
+`docs/OPEN_DECISIONS.md`: `LiquidityLock` gets a permissionless compound-only
+function, and the v4 price-reset fallback is committed in advance.
 
-Read `docs/OPEN_DECISIONS.md` first and answer only the items it marks as
-blocking Phase 1. The rest can wait.
+Items 1 and 2 above are also done — the GitHub App has write access, `main`
+and the Phase 0 branch are pushed, and CI has run green.
 
 ## 4. Decide the protocol treasury address — soon
 

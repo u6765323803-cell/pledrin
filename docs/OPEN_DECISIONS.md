@@ -2389,6 +2389,82 @@ either constant yet.
 
 ---
 
+## 25. Whether `GraduationHelper`'s log surface is specified or incidental
+
+**Phase 1 is unblocked by this and Phase 2 may not be.** Raised on 2026-11-11
+while reconciling `docs/SPEC.md` section 8.6 against
+`contracts/src/GraduationHelper.sol`, and recorded rather than decided in the
+spec, because the answer binds a document this entry's author does not own.
+
+### Question
+
+The helper emits one event and declares nine errors, and `docs/SPEC.md` section
+16 names none of them. Section 16's table is otherwise the protocol's whole log
+surface, and `.github/scripts/freeze-abi.sh` already lists `GraduationHelper`
+among the nine contracts whose ABI is frozen for the read side, so the event will
+appear in `contracts/abi/GraduationHelper.json` whether or not any document
+mentions it. The event is:
+
+```
+GraduatedVia(address indexed launch, address indexed caller,
+             uint256 candidateIndex, uint256 bounty,
+             uint256 ethReturned, uint256 tokensReturned)
+```
+
+Is that event part of the specified surface — a row in section 16, with a note in
+16.1 for an indexer — or is it implementation telemetry that the specification
+deliberately does not name?
+
+What hangs on it is small but real. The curve's own `Graduated` log already
+carries everything a launch's history needs, including the key the graduation
+used (Invariant 69), so nothing in `docs/DATA_MODEL.md` needs `GraduatedVia` to
+reconstruct a launch. What only `GraduatedVia` carries is **which candidate in
+the caller's list won**, and that is unrecoverable from anywhere else: every
+failed candidate is a reverted self-call that leaves no log, and a walk in which
+nothing graduated reverts and keeps no logs at all. It is also the only log that
+answers "what has this address done through the helper" without scanning
+`Graduated` for a `caller` that happens to be a helper instance.
+
+### Options
+
+**A. Name it in section 16**, as the helper's one log, with a sentence in 16.1
+saying no read-side row depends on it.
+
+**B. Leave section 16 to the launch's own contracts** and state in section 8.6
+that the helper's logs are not part of the specified surface.
+
+**C. Say nothing**, which is the status quo and is how this gap arose.
+
+### Trade-offs
+
+A costs one table row and makes the spec's log surface agree with the frozen ABI
+set, which is the thing a Phase 2 reader diffs the two against. Its risk is
+implying an indexing requirement that `docs/DATA_MODEL.md` does not carry, which
+the 16.1 sentence is there to deny.
+
+B is honest about the helper's standing — it is named by no Pledrin contract and
+holds no privilege, so a hostile copy emits whatever it likes and an indexer that
+trusted the event by signature alone would be trusting an unprivileged contract's
+word. That argument is the strongest thing in favour of B, and it applies to the
+event's *interpretation* rather than to whether the spec names it: a reader can
+only reach it if some document says the helper has logs at all.
+
+C leaves a specified deliverable with an ABI that no document describes, which is
+the same failure mode as decision 16's missing external ABI, in the other
+direction.
+
+### Recommendation
+
+**A, with B's caveat written into the row rather than instead of it**: name
+`GraduatedVia` in section 16, note in 16.1 that no read-side row depends on it,
+and state that a `GraduatedVia` log proves only that *some* contract claiming to
+be a helper emitted it — the authoritative record of a graduation is the curve's
+own `Graduated`. The nine errors need no entry: section 16.2 covers the protocol's
+refusals, and the helper's refusals are a caller's own diagnostics on a call that
+reverts in full.
+
+---
+
 ## Verification prerequisites for Phase 1
 
 Not decisions. These were v4 behaviours the spec assumed. All six were tested on

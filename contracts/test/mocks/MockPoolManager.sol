@@ -4,16 +4,19 @@ pragma solidity 0.8.38;
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {Pool} from "v4-core/src/libraries/Pool.sol";
+import {SafeCast} from "v4-core/src/libraries/SafeCast.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {BalanceDelta, toBalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 
 /// @title Deterministic stand-in for Uniswap v4's PoolManager
-/// @notice Implements only the five entry points the protocol calls — `initialize`,
-/// `unlock`, `swap`, `extsload` and the native-ETH receive — and implements them with the
-/// behaviour measured against the live deployment in `contracts/test/fork`.
+/// @notice Implements only the entry points the protocol calls — `initialize`, `unlock`,
+/// `swap`, `sync`, `settle`, `take`, `extsload` and the native-ETH receive — and
+/// implements them with the behaviour measured against the live deployment in
+/// `contracts/test/fork`.
 /// @dev Test-only, and deliberately narrow. It exists because `foundry.toml` pins
 /// `solc_version = 0.8.38` while `PoolManager.sol` pins `=0.8.26`, so the real core
 /// contract cannot be compiled into this project and the deterministic suite — which CI
@@ -48,7 +51,27 @@ import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 ///   why it has to pick the direction from the comparison rather than guess;
 /// - `unlock` refuses to nest (`AlreadyUnlocked`) and `swap` refuses to run outside an
 ///   unlock (`ManagerLocked`): `PoolManager.sol:104-114` and the `onlyWhenUnlocked`
-///   modifier at `:95-98`.
+///   modifier at `:95-98`;
+/// - `sync(currency)` takes no lock and is two cases: for native it only resets the synced
+///   currency, because "the reserves balance is not used for native settling", and for an
+///   ERC-20 it records the currency together with `balanceOfSelf()` as the reserves the
+///   next settlement is measured against (`PoolManager.sol:279-288`,
+///   `CurrencyReserves.syncCurrencyAndReserves` and `resetCurrency`);
+/// - `settle()` is `onlyWhenUnlocked` and credits `msg.sender`. It credits `msg.value`
+///   when the synced currency is native **or was never synced**, and otherwise
+///   `balanceOfSelf() - syncedReserves`, in which case a non-zero `msg.value` is refused
+///   with `NonzeroNativeValue` and the synced currency is reset
+///   (`PoolManager.sol:300-302` and `_settle`, `:349-366`). So `sync`, `transfer`,
+///   `settle` in that order is the protocol's token-settling sequence and not a choice,
+///   which is what `GraduationHelper._settleToken` says at its own call site;
+/// - `take(currency, to, amount)` is `onlyWhenUnlocked`, debits `msg.sender` by `amount`
+///   and then transfers that much of the currency out of this contract to `to`
+///   (`PoolManager.sol:291-297`);
+/// - the delta ledger those three move against: `_accountDelta` ignores a zero delta and
+///   maintains a count of the (address, currency) pairs with an open balance, and `unlock`
+///   reverts `CurrencyNotSettled` when that count is non-zero at the end of the callback
+///   (`PoolManager.sol:112`, `:368-379`). `swap` accounts its own reported delta to the
+///   locker, both currencies, exactly as `_accountPoolBalanceDelta` does (`:382-384`).
 ///
 /// Inferred, not verified:
 ///
@@ -62,20 +85,36 @@ import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 ///   `MAX_LP_FEE` (`PoolManager.sol:117-134`). Every one of those is a function of
 ///   protocol constants and the token address, so none can fire at any permitted
 ///   parameter set — but this mock would accept a key that the chain rejects;
-/// - there is no delta ledger. The real `unlock` reverts `CurrencyNotSettled` when a
-///   currency is left open and `take`/`settle` move balances against it; here a swap's
-///   reported delta is a number a test chose and nothing accounts for it. `swap` moves no
-///   ETH and no token in either direction;
-/// - `receive()` stands in for `settle()`. The real PoolManager has no `receive` at all
-///   and is paid through `settle{value:}` inside an unlock, so a plain transfer to it
-///   reverts on chain and succeeds here. Only `MockPositionManager` pays it, and the only
-///   thing either mock does with the ETH afterwards is hold it.
+/// - the ledger is the accounting and nothing else. This mock holds no pool reserves, so a
+///   `take` pays out of whatever balance a test funded this contract with and a `settle`
+///   simply keeps what it is paid: a swap's reported delta is still a number a test chose,
+///   and nothing here checks that the two sides of a pool's book add up. `swap` itself
+///   moves no ETH and no token in either direction — only `settle` and `take` do;
+/// - the ledger and the synced currency are ordinary storage, where the real contract
+///   keeps both in transient slots. A delta opened inside a call that reverts is rolled
+///   back either way; what differs is that a second `unlock` in the same transaction
+///   starts from this mock's persisted value rather than from a cleared transient slot,
+///   and a settled unlock leaves both at zero;
+/// - `receive()` is still here, and the real PoolManager has none: it is paid through
+///   `settle{value:}` inside an unlock, so a plain transfer to it reverts on chain and
+///   succeeds here. `MockPositionManager` pays this way because that is how it models
+///   `SETTLE_PAIR`'s native leg, and the only thing either mock does with the ETH
+///   afterwards is hold it;
+/// - `LockTaken` and `LockReleased` have no counterpart in the real contract at all.
+///   They exist so a test can prove *when* a transfer into this contract happened:
+///   `settle` and `take` are guarded by the lock, but a token transfer to this address is
+///   a call on the token and nothing here could refuse it, so the second clause of
+///   Invariant 68 — settlement to the PoolManager inside that swap's own lock, and nowhere
+///   else — is checked by log order against these two.
 ///
 /// The knobs (`setSwapDelta`, `setSwapRestoresPrice`, `pokeSlot0`, `pokeTick`,
 /// `setLiquidity`) exist to reach the defensive branches of `graduate` that cannot be
 /// reached on a healthy pool, each of which would be unrecoverable in production if it
 /// were wrong. They have no counterpart in the real contract.
 contract MockPoolManager {
+    using CurrencyLibrary for Currency;
+    using SafeCast for uint256;
+
     /// @dev `StateLibrary.POOLS_SLOT`. The protocol reads `slot0` through `extsload`, so
     /// the mock has to store it where the real contract stores it.
     uint256 private constant POOLS_SLOT = 6;
@@ -107,6 +146,16 @@ contract MockPoolManager {
     event Initialize(PoolId indexed id, uint160 sqrtPriceX96, int24 tick);
     /// @notice A swap was executed.
     event Swap(PoolId indexed id, bool zeroForOne, int256 amountSpecified, uint160 limit);
+    /// @notice A currency was synced, so the next `settle` measures against this balance.
+    event Sync(Currency indexed currency, uint256 reserves);
+    /// @notice A debt was settled. `paid` is what the ledger credited `payer` with.
+    event Settle(address indexed payer, Currency indexed currency, uint256 paid);
+    /// @notice A credit was taken out of this contract.
+    event Take(address indexed taker, Currency indexed currency, address to, uint256 amount);
+    /// @notice The lock was taken. Test-only: the real contract emits nothing here.
+    event LockTaken(address indexed locker);
+    /// @notice The lock was released, with the open-delta count that let it be.
+    event LockReleased(address indexed locker, uint256 nonzeroDeltas);
 
     /// @notice True while a callback this mock started is running, as `Lock` is on the
     /// real contract. `swap` is refused outside one and `unlock` refuses to nest.
@@ -114,6 +163,35 @@ contract MockPoolManager {
 
     /// @notice When non-empty, every `initialize` reverts with exactly this data.
     bytes private _initializeRevertData;
+
+    /// @notice What this contract owes an address in a currency (positive) or is owed by
+    /// it (negative), as `PoolManager`'s transient `currencyDelta` does.
+    mapping(address target => mapping(Currency currency => int256)) public currencyDelta;
+    /// @notice How many (address, currency) pairs currently have an open delta.
+    uint256 public nonzeroDeltaCount;
+
+    /// @dev The currency `sync` last named, and the balance it recorded for it. The zero
+    /// address means native or never synced, which `_settle` treats identically.
+    Currency private _syncedCurrency;
+    uint256 private _syncedReserves;
+
+    /// @notice Call counts, so a test can assert that a path settled nothing at all.
+    uint256 public settleCalls;
+    uint256 public takeCalls;
+    uint256 public syncCalls;
+    /// @notice Everything this contract has been paid through `settle`, by currency.
+    mapping(Currency currency => uint256) public settledTotal;
+    /// @notice Everything that has left through `take`, by currency.
+    mapping(Currency currency => uint256) public takenTotal;
+
+    /// @dev Refuses a call made while the lock is not held, with the error the real
+    /// contract's own `onlyWhenUnlocked` gives. `settle` and `take` carry it because the
+    /// real ones do, which is what makes a settlement outside a swap's lock unreachable
+    /// rather than merely unused.
+    modifier onlyWhenUnlocked() {
+        if (!_unlocked) revert IPoolManager.ManagerLocked();
+        _;
+    }
 
     /// @dev Native ETH settled by a mint. The mock keeps it, as the real one does.
     receive() external payable {}
@@ -152,9 +230,12 @@ contract MockPoolManager {
     function unlock(bytes calldata data) external returns (bytes memory result) {
         if (_unlocked) revert IPoolManager.AlreadyUnlocked();
         _unlocked = true;
+        emit LockTaken(msg.sender);
         result = IUnlockCallback(msg.sender).unlockCallback(data);
-        // The real contract reverts `CurrencyNotSettled` here if any currency is still
-        // open. This mock keeps no delta ledger, so it cannot: see the class list above.
+        // As the real one does, and for the same reason: a currency left open means the
+        // locker took value out of the pool and did not pay for it.
+        if (nonzeroDeltaCount != 0) revert IPoolManager.CurrencyNotSettled();
+        emit LockReleased(msg.sender, nonzeroDeltaCount);
         _unlocked = false;
     }
 
@@ -196,7 +277,61 @@ contract MockPoolManager {
         }
 
         emit Swap(id, params.zeroForOne, params.amountSpecified, params.sqrtPriceLimitX96);
-        return toBalanceDelta(_swapAmount0, _swapAmount1);
+
+        delta = toBalanceDelta(_swapAmount0, _swapAmount1);
+        // `_accountPoolBalanceDelta`: the swap's delta belongs to the locker, in both
+        // currencies, and has to be closed before `unlock` returns.
+        _accountDelta(key.currency0, _swapAmount0, msg.sender);
+        _accountDelta(key.currency1, _swapAmount1, msg.sender);
+    }
+
+    /// @notice Records the balance the next `settle` of `currency` is measured against.
+    /// @dev `PoolManager.sync`. Takes no lock, and for native does nothing but reset.
+    /// @param currency The currency to sync.
+    function sync(Currency currency) external {
+        syncCalls++;
+        if (currency.isAddressZero()) {
+            _syncedCurrency = CurrencyLibrary.ADDRESS_ZERO;
+            _syncedReserves = 0;
+            emit Sync(currency, 0);
+        } else {
+            uint256 balance = currency.balanceOfSelf();
+            _syncedCurrency = currency;
+            _syncedReserves = balance;
+            emit Sync(currency, balance);
+        }
+    }
+
+    /// @notice Credits the caller for what they have paid, as `PoolManager.settle` does.
+    /// @return paid The amount credited.
+    function settle() external payable onlyWhenUnlocked returns (uint256 paid) {
+        settleCalls++;
+        Currency currency = _syncedCurrency;
+        if (currency.isAddressZero()) {
+            paid = msg.value;
+        } else {
+            if (msg.value > 0) revert IPoolManager.NonzeroNativeValue();
+            uint256 reservesNow = currency.balanceOfSelf();
+            paid = reservesNow - _syncedReserves;
+            _syncedCurrency = CurrencyLibrary.ADDRESS_ZERO;
+            _syncedReserves = 0;
+        }
+
+        settledTotal[currency] += paid;
+        emit Settle(msg.sender, currency, paid);
+        _accountDelta(currency, paid.toInt128(), msg.sender);
+    }
+
+    /// @notice Pays a credit out of this contract, as `PoolManager.take` does.
+    /// @param currency The currency to pay.
+    /// @param to The recipient.
+    /// @param amount The amount.
+    function take(Currency currency, address to, uint256 amount) external onlyWhenUnlocked {
+        takeCalls++;
+        takenTotal[currency] += amount;
+        emit Take(msg.sender, currency, to, amount);
+        _accountDelta(currency, -(amount.toInt128()), msg.sender);
+        currency.transfer(to, amount);
     }
 
     /// @notice The `extsload` of `IExtsload`, which is how `StateLibrary` reads `slot0`.
@@ -272,6 +407,27 @@ contract MockPoolManager {
     /// the second clause of Invariant 38.
     function liquiditySlot(PoolId id) external pure returns (bytes32) {
         return bytes32(uint256(_slot0Slot(id)) + 3);
+    }
+
+    /// @notice The currency `sync` last named, zero for native or never synced.
+    function syncedCurrency() external view returns (Currency) {
+        return _syncedCurrency;
+    }
+
+    /// @dev `PoolManager._accountDelta`: a zero delta is ignored, and the open-delta count
+    /// moves only when a pair's balance leaves or reaches zero.
+    function _accountDelta(Currency currency, int128 delta, address target) private {
+        if (delta == 0) return;
+
+        int256 previous = currencyDelta[target][currency];
+        int256 next = previous + delta;
+        currencyDelta[target][currency] = next;
+
+        if (next == 0) {
+            nonzeroDeltaCount--;
+        } else if (previous == 0) {
+            nonzeroDeltaCount++;
+        }
     }
 
     /// @dev `slot0` packs `sqrtPriceX96 | tick << 160 | protocolFee << 184 | lpFee << 208`.

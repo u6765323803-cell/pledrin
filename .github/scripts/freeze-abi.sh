@@ -29,6 +29,7 @@ contracts=(
   BondingCurve
   CreatorVesting
   CurveDeployer
+  GraduationHelper
   LaunchFactory
   LiquidityLock
   PledrinToken

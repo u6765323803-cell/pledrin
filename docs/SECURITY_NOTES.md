@@ -15,22 +15,27 @@ The configuration lives in `contracts/slither.config.json` rather than in CI
 arguments, so a reviewer running the command above analyses the same set of
 contracts with the same detectors as the pipeline.
 
-As of this revision Slither reports **28 findings across 9 detectors**,
+As of this revision Slither reports **36 findings across 10 detectors**,
 generates an intermediate representation for every function in `src`, and
 `--fail-high` exits **0**:
 
 | Impact | Findings | Detectors |
 |---|---|---|
-| Medium | 13 | `unused-return` 9, `divide-before-multiply` 2, `incorrect-equality` 1, `locked-ether` 1 |
-| Low | 13 | `timestamp` 8, `reentrancy-benign` 4, `reentrancy-events` 1 |
-| Informational | 2 | `low-level-calls`, `cyclomatic-complexity` |
+| Medium | 18 | `unused-return` 14, `divide-before-multiply` 2, `incorrect-equality` 1, `locked-ether` 1 |
+| Low | 15 | `timestamp` 8, `reentrancy-benign` 5, `reentrancy-events` 1, `calls-loop` 1 |
+| Informational | 3 | `low-level-calls` 2, `cyclomatic-complexity` 1 |
 
-None is a defect. One high-impact finding, `reentrancy-balance`, is carried by an
-inline directive at its single site rather than by a configuration change, so the
-gate still fails on a high finding anywhere else; its verdict is in section 2.
-`--fail-high` fails on impact alone and cannot be told that a finding has been
-reviewed, and a permanently red gate is an ignored gate, so the choice was
-between suppressing the one reviewed site and losing the gate entirely.
+Every one of the eight findings added since the previous revision, and the one
+new detector, comes from `GraduationHelper`. The counts were confirmed by
+parsing the report rather than by adding up the deltas.
+
+None is a defect. Three high-impact findings are carried by inline directives at
+their three sites rather than by a configuration change — `reentrancy-balance`
+once in `BondingCurve` and `arbitrary-send-eth` twice in `GraduationHelper` — so
+the gate still fails on a high finding anywhere else; the verdicts are in
+section 2. `--fail-high` fails on impact alone and cannot be told that a finding
+has been reviewed, and a permanently red gate is an ignored gate, so the choice
+was between suppressing the reviewed sites and losing the gate entirely.
 
 ---
 
@@ -246,10 +251,59 @@ own ERC-20 allowance to Permit2, which is zero and which no code path can set
 again. It is worth knowing anyway: adding any `_approve` to the curve in future
 would turn a dust-sized dormant registration into a live one.
 
-### unused-return — medium — intended, nine findings
+### arbitrary-send-eth — high — not a defect, suppressed at two sites
 
-Five of the nine are newly visible — four in `_settle` and one in the
-constructor — for the same reason.
+Both sites are in `GraduationHelper`, both carry a
+`slither-disable-next-line arbitrary-send-eth` directive with the argument
+written at the site, and `slither.config.json` is untouched — so a third
+`arbitrary-send-eth` anywhere in `src` fails the build. Both verdicts below were
+reached by reading the contract, not by accepting a report.
+
+**`_settleEth` — `manager.settle{value: owed}()`.** The destination genuinely is
+caller-controlled: the PoolManager is read off the curve the caller named, and
+that is deliberate, because it is what stops a third party's restoring swap and
+the graduation that follows it from reaching two different deployments. What
+makes the call safe is the amount and not the destination. The line above it
+refuses when `owed` exceeds `address(this).balance`; the call sits inside a lock
+this contract took moments earlier; and the amount is what closing that lock
+costs. A hostile answer therefore reaches the balance the caller brought to this
+call and nothing else, and because the contract holds nothing between
+transactions there is no other balance to reach. That is the exposure the caller
+accepted by choosing the curve, and it is bounded by `docs/SPEC.md` section
+8.6's own guarantee: `msg.value` and `maxTokensIn` bound the caller's loss
+completely.
+
+One consequence of that cap is worth stating because the guarantee does not
+imply it. The bound is the contract's balance rather than `msg.value`, so value
+that reached the helper outside a call of its own can be spent settling a swap.
+Nobody is deprived by this — stray value has no owner, and a caller cannot lose
+what they did not send — but it means a restore can be subsidised and not only
+funded.
+
+**`_forward` — `msg.sender.call{value: ethAmount}("")`.** Here the "arbitrary"
+destination is the caller's own address. Paying the caller is the only thing
+this contract may do with ETH outside a lock it is itself holding — which is
+exactly the scope of Invariant 68(b), the settlement above being the one
+exception that clause names — and the amount is a balance it is never entitled
+to keep, so the finding describes the design rather than a flaw in it. Every alternative is worse: `transfer` and `send` are forbidden by
+the project's rules and flagged by other detectors in any case, and keeping the
+ETH would break the invariant. What makes this suppression reviewable rather
+than a promise is the assertion that follows the transfers — if the forward ever
+failed to empty the contract, `BalanceNotZero` reverts instead of the balance
+quietly accumulating.
+
+### unused-return — medium — intended, fourteen findings
+
+Five of the fourteen are `GraduationHelper`'s and are the same calls with the
+same verdict: `getSlot0` twice in `attemptCandidate`, where only
+`sqrtPriceX96` is wanted and nothing in the helper needs the tick; `unlock`,
+whose callback returns an empty value by construction and whose caller re-reads
+the price from `slot0`; and `settle` twice, where v4 returns what it credited
+and an under-credit cannot pass silently because the enclosing `unlock` then
+reverts `CurrencyNotSettled`.
+
+Of the other nine, five became visible with decision 22 — four in `_settle` and
+one in the constructor — for the same reason.
 
 - `poolManager.initialize` returns the initial tick, at both call sites — the
   constructor's and `_settle`'s. Neither needs it: the specification requires the
@@ -294,7 +348,7 @@ the eight is intended. The detector is excluded in `foundry.toml`'s `[lint]`
 section for the Foundry linter; Slither applies its own and is reported here for
 completeness.
 
-### reentrancy-benign — low — guarded, four findings
+### reentrancy-benign — low — guarded, five findings
 
 `_restorePrice` writes its own `_unlocking` flag after `poolManager.unlock`
 returns, which is the flag's purpose. `_settle` writes after `initialize` and
@@ -302,6 +356,28 @@ returns, which is the flag's purpose. `_settle` writes after `initialize` and
 accounts for two of the four: it writes `isLaunch` and the reputation counters
 after deploying the curve, and the curve is created by that same call and cannot
 be a third party. No value moves on any of these paths after the write.
+
+The fifth is `GraduationHelper._restorePrice`, which writes `_unlockManager`
+back to the zero address after `unlock` returns. It is the same shape and the
+same reason as `BondingCurve._restorePrice` above: the write closes the callback
+guard and must therefore follow the call it guards. The variable is transient
+storage, so it does not survive the transaction in any case.
+
+### calls-loop — low — intended, and the only loop in the protocol
+
+`GraduationHelper.graduateVia` calls `this.attemptCandidate(...)` once per
+candidate. That is the contract's purpose, and `docs/SPEC.md` section 8.6
+permits it explicitly together with the conditions that make it safe: the loop
+is bounded by an array the caller supplies and pays the gas for, in a contract
+that holds nothing, that no other Pledrin contract names, and whose failure
+harms nobody but its own caller. The self-call is the mechanism rather than a
+stylistic choice — a sub-call's revert unwinds that candidate's swap and
+settlement and leaves the walk's own balances where they were, which is what
+makes a failed candidate survivable instead of fatal.
+
+It gets its own entry rather than a line in another because the detector is new
+to this revision. A second `calls-loop` anywhere in `src` is a regression, and
+this table is where that becomes visible.
 
 ### reentrancy-events — low — not reachable
 
@@ -335,10 +411,14 @@ mode of `initialize` still reverts the launch; and that the token's supply
 assertion is exact equality, so a token that is not the one the deployer made
 cannot pass.
 
-### low-level-calls — informational — intended
+### low-level-calls — informational — intended, two findings
 
 `BondingCurve._sendEth` uses `call` so that a recipient contract's failure to
 accept ETH is a revert of the claim rather than a permanently stuck balance.
+`GraduationHelper._forward` uses it to pay its caller, for the same reason and
+under the project rule that forbids `transfer` and `send`: a checked low-level
+call is the only form that neither assumes a gas stipend nor swallows a
+failure.
 
 ---
 

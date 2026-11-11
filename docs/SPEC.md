@@ -32,15 +32,31 @@ step 3 with Invariants 38, 40 and 66; the two-field `graduateAlt` and the
 withdrawn uninitialised requirement of section 8.4 with Invariant 67;
 `GraduationHelper` in sections 2 and 8.6 with Invariant 68; and the
 `PoolPreInitialized` and `Graduated` log changes of section 16 with Invariant 69.
-All of that is implemented except `GraduationHelper`, which is specified and not
-written, so section 8.6 and Invariant 68 are the one part of this document still
-ahead of `contracts/src`. The implementation differs from the design in one
-recorded respect, the shared graduation body taking the pool key instead of a
+All of that is now implemented, `GraduationHelper` included:
+`contracts/src/GraduationHelper.sol` is 431 lines and 4,466 runtime bytes, and
+section 2.1's table measures it. The implementation differs from the design in
+one recorded respect, the shared graduation body taking the pool key instead of a
 flag; section 8.2 states the equivalence it rests on and section 2.1 states what
 it is worth in bytes.
 `ALT_TICK_SPACING_MAX = 199`, recorded above as a correction that changed the
 contracts, is superseded by that decision and is now 200 with the canonical pair
 excluded instead.
+
+**Writing that helper falsified three statements of section 8.6, two of them
+clauses of Invariant 68, and all three are corrected here.** They are the balance
+clause that forbade what step 9 of that section mandates, the value-movement
+clause that forbade the settlement step 3 requires, and a claim about what
+`IBondingCurve` declares that an earlier commit had already made false. Section
+8.6's last subsection records all three, what they have in common, and why each
+was discoverable by reading the contracts that section describes rather than by
+writing one. The same pass closed a gap the three had hidden: section 8.6 now
+states normatively that the helper reads its PoolManager off the curve, which is
+what the interface actually gained a declaration for. `BondingCurve` is unchanged
+by any of it — 18,718 runtime and 22,703 creation bytes before and after, with
+`git diff contracts/abi` empty. Invariant 68 is restated in four clauses with
+each exception written into the clause that carries it, and Invariant 71 is
+appended for `LiquidityLock.compound`'s revert set. Invariant 68's test is being
+written; 71 is awaiting one, which its own entry says.
 
 **One part was behind the code and is now reconciled.** The same review's first
 finding landed as `5b86188`, and this document had required the defect: section
@@ -182,6 +198,7 @@ build settings in `contracts/foundry.toml`:
 | `CurveDeployer` | 23,556 bytes | 23,582 bytes | 1,020 bytes |
 | `BondingCurve` | 18,718 bytes | 22,703 bytes | 5,858 bytes |
 | `LaunchFactory` | 7,232 bytes | 8,645 bytes | 17,344 bytes |
+| `GraduationHelper` | 4,466 bytes | 4,492 bytes | 20,110 bytes |
 | `LiquidityLock` | 2,902 bytes | 3,232 bytes | 21,674 bytes |
 | `TokenDeployer` | 2,979 bytes | 3,005 bytes | 21,597 bytes |
 | `CreatorVesting` | 2,505 bytes | 2,531 bytes | 22,071 bytes |
@@ -190,11 +207,17 @@ build settings in `contracts/foundry.toml`:
 
 Every figure is read from `contracts/out` on 2026-11-11, with decision 22's
 changes 1, 2 and 4 in the tree and with the frame split that `forge coverage`'s
-codegen required. The six contracts other than `BondingCurve` and
-`CurveDeployer` are byte-identical to the tree before that change. The two
-combinations EIP-170 rules out follow from these parts, because a contract that
-embeds another contract's creation code cannot be smaller than the code it
-embeds:
+codegen required. The six contracts other than `BondingCurve`, `CurveDeployer`
+and `GraduationHelper` are byte-identical to the tree before that change;
+`GraduationHelper` did not exist then, and its row is read from the same build as
+the rest. Writing it moved no other figure in this table and no byte of
+`contracts/abi`, which was verified rather than assumed. It is charged against no
+margin here: no contract embeds its creation code, so it competes with EIP-170
+alone and has 20,110 bytes of room.
+
+The two combinations EIP-170 rules out follow from these parts, because a
+contract that embeds another contract's creation code cannot be smaller than the
+code it embeds:
 
 - **A factory carrying `BondingCurve`'s creation code.** The creation code alone
   is 22,703 bytes, which leaves 1,873 bytes of the limit for the entire factory,
@@ -364,12 +387,20 @@ post-deployment wiring step is needed.
 | 4 | `CurveDeployer` | none |
 | 5 | `TokenDeployer` | none |
 | 6 | `LaunchFactory` | the timelock as owner, both deployers, `CreatorVesting`, `LiquidityLock`, PoolManager, PositionManager, Permit2, the treasury, the initial fee config |
-| 7 | `GraduationHelper` | PoolManager; every other address it needs it reads off the curve it is called with |
+| 7 | `GraduationHelper` | none; every address it needs, the PoolManager included, it reads off the curve it is called with (section 8.6) |
 
 `CreatorVesting` can precede the factory because it holds no factory address at
 all: every mutating function is keyed by its caller (section 12). That is what
 removes the factory-vesting cycle, which would otherwise be the one place in the
 system that needed a predicted address or a setter.
+
+`GraduationHelper` takes no constructor argument at all, which is section 8.6's
+normative requirement that it read its PoolManager off the curve it is
+graduating. There is nothing to wire, no address anybody has to be trusted to
+have set correctly, and no wrong-network failure mode: a bare
+`new GraduationHelper()` is the whole deployment. Its position in this order is
+therefore arbitrary — no other contract names it and it names none of them — and
+it may be deployed by anybody at any time, including again.
 
 ---
 
@@ -1344,6 +1375,21 @@ than reverting. A graduation below the threshold is therefore an ordinary
 graduation whose `Graduated` event carries `positionIdFloor = 0` and
 `ethToFloor = 0` (section 16.1).
 
+The floor position's liquidity is the largest value whose `currency0` requirement
+fits in `floorEth`, and the guard that makes that exact must not be removed. The
+requirement is computed with the rounding direction that rounds up, so the
+largest-liquidity computation can in principle ask for one wei more than
+`floorEth`; the mint falls back to the liquidity for `floorEth - 1` if it ever
+does, whose requirement is at most `floorEth` by the same bound.
+`docs/SECURITY_NOTES.md` section 4 proves that fallback unreachable for every
+`(tickLower, tickUpper, floorEth)` — not only for every permitted one — and the
+proof rests on three rounding directions in vendored v4 library code that this
+repository does not own. **Normative: the guard stays, it may not be deleted as
+dead code or narrowed to an unchecked operation, and a bump of `v4-core` or
+`v4-periphery` requires section 4's derivation to be redone.** A rounding
+direction that changes there makes the guard live, and a graduation without it
+would revert with no exit but `abortGraduation`.
+
 **`ethToFloor` is a balance delta across the floor mint, and it is sound only
 because of where step 8 sits.** The floor mint's batch ends in the same
 `SWEEP(currency0, MSG_SENDER)` as the core mint's, so a balance delta measures
@@ -1515,11 +1561,14 @@ to pay for it, and a graduation performed in the same transaction as that move
 needs no change to the curve. `GraduationHelper` is the contract that does it.
 
 It exists because that path must be a specified deliverable rather than an
-emergent property. It is **not** a trust dependency: no Pledrin contract names
-it, it is granted no privilege, and it calls nothing that is not already public
-and permissionless, so if it is absent or defective any party can write an
-equivalent and graduate the launch with it. Scheduling it is a product decision
-about whether the protocol ships the thing its own liveness argument refers to.
+emergent property, and it is now written:
+`contracts/src/GraduationHelper.sol`. It is **not** a trust dependency: no
+Pledrin contract names it, it is granted no privilege, and it calls nothing that
+is not already public and permissionless, so if it is absent or defective any
+party can write an equivalent and graduate the launch with it. That is also the
+limit of what shipping it achieves — the protocol now contains the thing its own
+liveness argument refers to, and a reader who needs that argument to hold without
+trusting this contract loses nothing.
 
 Interface:
 
@@ -1533,11 +1582,70 @@ function graduateVia(
 ) external payable returns (uint256 index);
 ```
 
+**Where its addresses come from, and it takes none.** `GraduationHelper` has no
+constructor argument. Every address a call touches other than its own caller is
+read off the `curve` that call names: the launch token from `curve.token()`, the
+Uniswap v4 PoolManager from `curve.poolManager()`, and the price to restore to
+from `curve.sqrtPriceTerminal()`. All three are read once for the whole walk, so
+every candidate is built from the same token and asks the same PoolManager for
+the same price.
+
+**Normative: the PoolManager is read off the curve and is never a configured
+address.** The alternative — a deployment-time constructor argument — is a
+materially different contract, with three properties this one does not have. It
+can be pointed at a PoolManager the curve does not use, in which case the
+restoring swap and the graduation that follows it reach two different Uniswap
+deployments and the restore buys nothing; it has a wrong-network failure mode;
+and it has an address somebody has to be trusted to have set correctly. Reading
+the manager off the curve removes all three, and it is also what keeps this
+contract free of any external address of its own: it introduces none and guesses
+none. The curve's PoolManager was given to it by the factory at `createLaunch`
+and traces back to `docs/CHAIN_FACTS.md`, which is the only place an address in
+this protocol comes from.
+
+`poolManager()` is the getter that makes the manager readable, and
+`IBondingCurve` gained its declaration for exactly this purpose. It is a public
+immutable `BondingCurve` has always had and it is already in
+`contracts/abi/BondingCurve.json` as `poolManager() -> address`, so the
+declaration is of a getter that already existed: a change to a declaration and
+not to a contract, with `BondingCurve`'s own ABI and bytecode untouched, which is
+why it does not appear in decision 22's ABI ledger.
+
 Behaviour, normative:
 
-1. The caller sends ETH as `msg.value` and, if the restore may need launch
-   tokens, approves the helper for at most `maxTokensIn` base units of
-   `curve.token()`. Those two values bound the caller's loss completely.
+1. The caller brings two values and nothing else: ETH as `msg.value`, and up to
+   `maxTokensIn` base units of `curve.token()`, for which they approve the helper
+   before the call. **Those two values bound the caller's loss completely.** That
+   sentence is the normative part of this step — it is what a caller relies on —
+   and the mechanism exists to make it true: the helper takes both into its own
+   custody once, at the top of `graduateVia`, with `msg.value` arriving with the
+   call and `maxTokensIn` pulled by a single `transferFrom`, and every restore is
+   settled out of those balances and out of nothing else. **Normative: no path
+   inside a `graduateVia` call may spend the caller's allowance after that
+   pull.**
+
+   The deciding reason is the second clause of this step rather than the first. A
+   caller names the `curve`, so a caller also names the contract whose
+   `unlockCallback` runs and chooses that callback's payload. Pulling tokens just
+   in time from inside the callback would make a hostile curve's forged callback
+   a `transferFrom` against whatever allowance the caller had granted, which
+   bounds the loss by the **allowance** and not by `maxTokensIn` — so the
+   guarantee above would be false for any caller who ever approved more than one
+   call's worth, which is the ordinary case. With custody taken upfront the
+   callback can only reach balances the helper is already holding for that same
+   call, and the guarantee holds by construction rather than by the caller's
+   approval hygiene. It is also what gives step 5's "every unspent base unit" a
+   referent: unspent base units exist only if they are sitting in the helper.
+
+   One consequence of settling from balances rather than from remembered amounts:
+   ETH that reached the helper outside a call of its own can be spent settling a
+   restore, so a restore may be **subsidised** by a stray balance. That does not
+   weaken the guarantee — a caller cannot lose value they did not send, and stray
+   value has no owner to be deprived of it — and it is why Invariant 68's balance
+   clause names two outcomes for such value rather than one.
+   `docs/SECURITY_NOTES.md` section 2 states the same consequence at the settle
+   site, where a suppression's argument rests on the cap being the contract's
+   balance rather than `msg.value`.
 2. The helper walks `candidates` in order. A candidate naming
    `(POOL_FEE, POOL_TICK_SPACING)` means the canonical key and is taken through
    `curve.graduate()`; any other permitted pair is taken through
@@ -1547,12 +1655,11 @@ Behaviour, normative:
    swap with `sqrtPriceLimitX96 = sqrtPriceTerminal`, direction chosen by the
    comparison of section 8.1, sized to reach the limit, settled from the caller's
    ETH and tokens, and asserted to have arrived exactly at `sqrtPriceTerminal`.
-   `sqrtPriceTerminal` and `token` are public immutables of the curve and both
-   getters are already in `contracts/abi/BondingCurve.json`; `IBondingCurve`
-   declares `token()` and not `sqrtPriceTerminal()`, so the interface file gains
-   that declaration. That is a change to a declaration and not to a contract:
-   `BondingCurve`'s own ABI and bytecode are untouched by it, which is why this
-   does not appear in decision 22's ABI ledger.
+   `sqrtPriceTerminal` and `token` are public immutables of the curve, both
+   getters are in `contracts/abi/BondingCurve.json`, and `IBondingCurve` declares
+   both. The swap is settled from the balances step 1 took into custody, and v4
+   settlement is a payment to the PoolManager, which is the one destination other
+   than its own caller this contract may pay (step 8, Invariant 68).
 4. **The restore's `PoolManager.unlock` must have returned before
    `graduate`/`graduateAlt` is called.** `PoolManager.unlock` reverts
    `AlreadyUnlocked` when re-entered and the graduation mint takes the lock
@@ -1562,16 +1669,37 @@ Behaviour, normative:
 5. On the first candidate that graduates, the helper calls
    `curve.claimBounty(address(this))` in the same transaction and forwards the
    proceeds, together with every unspent wei and every unspent base unit, to
-   `msg.sender`. It returns that candidate's index.
+   `msg.sender`. It returns that candidate's index. It forwards **balances**
+   rather than the amounts it computes it did not spend, which is what keeps the
+   zero of step 7 reachable after value arrived by a path of its own. A failed
+   claim must not undo a graduation that already happened: `claimBounty` refuses
+   an empty credit with `NothingToClaim`, and a launch whose accrued
+   `protocolFeeEth` is under ten wei is credited a bounty of zero at
+   `GRAD_BOUNTY_BPS = 1000`, so that claim's failure is tolerated and the walk's
+   result stands.
 6. If no candidate graduates, the whole call reverts and the caller keeps
    everything.
-7. At the end of every external call the helper holds zero ETH and zero base
-   units of any launch token, and it asserts both. Step 5's claim is what makes
-   that reachable: `graduate` credits the bounty to `msg.sender`, which is the
-   helper, and a credit left unclaimed would be paid into a contract with no way
-   to pay it out.
-8. It has no owner, no admin function, no storage that outlives a transaction,
-   and no function that moves value to any address other than its own caller.
+7. At the end of every call to `graduateVia` the helper holds zero ETH and zero
+   base units of the launch token, and it asserts both. **The scope is this
+   function and not every external call.** A previous version of this step said
+   every external call, which step 9 contradicts: `receive()` is an external call
+   whose entire purpose is to be holding ETH when it returns. Invariant 68 (a)
+   carries the reconciled form, and the reconciliation belongs to the invariant
+   rather than being an exemption granted to an implementation. Step 5's claim is
+   what makes the zero reachable at all: `graduate` credits the bounty to
+   `msg.sender`, which is the helper, and a credit left unclaimed would be paid
+   into a contract with no way to pay it out.
+8. It has no owner, no admin function and no storage that outlives a
+   transaction, and it moves value to no address other than its own caller,
+   except a swap's settlement to the PoolManager inside that swap's own lock.
+   The exception is step 3's and is scoped to it: value reaches the PoolManager
+   only from inside a lock this contract itself took in the same call, and
+   reaches no other address at any other moment. **The storage clause constrains
+   the implementation to transient storage.** A reentrancy guard, or a flag
+   recording which manager a callback is expected from, held in ordinary storage
+   violates this clause while behaving perfectly correctly, so both must be
+   transient. An implementer reaching for an ordinary `ReentrancyGuard` would
+   break the clause with nothing failing to tell them.
 9. Its `receive()` accepts ETH from any sender, because PoolManager and the curve
    both pay it.
 
@@ -1588,6 +1716,44 @@ there is one, and otherwise the creator, whose vesting does not start until
 graduation, and the holders, for whom graduation is the difference between a
 frozen curve and a permanent market. The helper does not change those
 incentives; it makes them actionable on a pool that step 2 cannot fix.
+
+#### What writing this contract falsified
+
+`contracts/src/GraduationHelper.sol` was written from the section above, and
+writing it falsified three of its statements. They are recorded here for the
+reason section 2.1 records how its size table went stale: a specification that
+says which of its claims an implementation refuted is worth more to the next
+reader than one that has been quietly adjusted to match the code.
+
+| Statement, as it stood | What was wrong with it | Where the corrected form is |
+|---|---|---|
+| "At the end of every external call the helper holds zero ETH and zero base units of any launch token" | `receive()` is an external call, and step 9 *requires* it to accept ETH from any sender because the PoolManager and the curve both pay it. The clause forbade what the same section mandates. | Step 7 and Invariant 68 (a), scoped to `graduateVia` |
+| "no function that moves value to any address other than its own caller" | Step 3's restoring swap is settled from the caller's ETH and tokens, and v4 settlement is a payment to the PoolManager. The clause forbade a step of its own section. | Step 8 and Invariant 68 (b), with the settlement exception stated and scoped |
+| "`IBondingCurve` declares `token()` and not `sqrtPriceTerminal()`, so the interface file gains that declaration" | `sqrtPriceTerminal()` had been declared since `375bdc2`, which landed with decision 22, so the sentence described a tree that no longer existed. What the interface actually gained is `poolManager()`, and the reasoning the sentence carried applies unchanged to that getter. | The two provenance paragraphs above |
+
+Invariant 68's third clause, "no storage that outlives a transaction", **does
+hold**, and it was checked against the implementation rather than assumed: the
+contract inherits `ReentrancyGuardTransient` and its one state variable is
+declared `transient`, so nothing persists. What the check added is step 8's
+sentence that the clause constrains an implementer's choice of guard, which the
+clause did not say while it was only a property of a contract nobody had written.
+
+**All three failures share a shape, and that is the part worth carrying
+forward.** Each described the *rest of the tree* — what another file declares,
+what an external call may hold, where value may go — rather than the contract
+being specified. The statements about the helper itself held up: the interface,
+the candidate walk and its ordering guidance, the two sequential unlocks of step
+4, the bounty claim of step 5, and step 1's loss bound all survived contact with
+an implementation. All three were also discoverable without writing anything, by
+reading the contracts this section describes: one by opening `IBondingCurve.sol`,
+two by reading this section's own steps against each other.
+
+The fourth correction of that pass was a gap rather than an error, and it has the
+same shape. The section specified the restoring swap, its settlement and its
+sequencing without ever saying where the PoolManager they happen on comes from,
+and the two available answers are different contracts. A gap of that kind is
+invisible to a reader checking a section for contradictions; only somebody who
+has to write the constructor meets it.
 
 ---
 
@@ -1641,6 +1807,16 @@ Two guards in `compound` are load-bearing and must not be relaxed:
 2. `LiquidityNotIncreased`, which reverts if the position's liquidity fell. It is
    a backstop against a mis-encoded batch rather than a case expected to arise.
 
+Because each side's required amount is bounded by that side's credit, `compound`
+cannot revert for a rounding reason: `NothingToCompound` and
+`LiquidityNotIncreased` are the only reverts it can produce (Invariant 71).
+`docs/SECURITY_NOTES.md` section 4 derives that bound, and it derives it from
+rounding directions in the vendored v4 libraries, which this repository does not
+own. **Normative for a dependency bump: a change to `v4-core` or `v4-periphery`
+requires that derivation to be redone**, because a rounding direction that
+changes there turns the bound into a third revert reason that no test in this
+suite names and no sentence of this section expects.
+
 The ratio residual of each compounding is **retained** by the lock and
 accumulates there. It is not reinvested by a later call and the lock cannot spend
 it, because the v4 actions involved work off the PoolManager delta of the current
@@ -1664,7 +1840,11 @@ so the liquidity not bought becomes retained residual rather than anyone's profi
 — and the attack costs two legs of the pool's own fee on a notional large enough
 to move a pool that holds the whole ETH target, paid into the position being
 griefed. Decision 12 of `docs/OPEN_DECISIONS.md` records the full comparison
-against the alternative, whose grief costs only gas.
+against the alternative, whose grief costs only gas, and
+`docs/THREAT_MODEL.md` 5.5 states the attack in full: what it can and cannot do,
+why it destroys value instead of moving it, and why both alternative encodings —
+a caller-supplied liquidity and a lock-computed one — are worse than the
+deprecated action.
 
 ---
 
@@ -2470,7 +2650,11 @@ is a change that must add it to a table in this section.
 
 Numbered, individually testable assertions. Every one must have a test that
 fails if it is violated. The four marked **mandatory** — 1, 2, 14 and 25 — are
-the core of the invariant suite.
+the core of the invariant suite. An entry that no test yet covers says so in its
+own text; on 2026-11-11 that is Invariant 71 alone, with Invariant 68's test in
+progress. Numbers are never reused and never renumbered, because test names and
+commit messages reference them, so a new invariant is appended rather than placed
+beside the ones it belongs with.
 
 ### Curve solvency
 
@@ -2870,12 +3054,38 @@ the core of the invariant suite.
     `(POOL_FEE, POOL_TICK_SPACING)` with `CanonicalKeyNotAllowed`. The usable set
     is 1,337,190 distinct pool keys and `graduate` is the only function that can
     reach the canonical key. All three refusals are given before the state check.
-68. `GraduationHelper` holds zero ETH and zero base units of every launch token
-    at the end of every external call; has no owner, no admin function and no
-    storage that outlives a transaction; moves value to no address other than its
-    own caller; and is named by no other Pledrin contract. Deleting it,
+68. `GraduationHelper`, in four clauses. Two of them carry an exception that
+    section 8.6 requires, and each clause states its own exception and the reason
+    for it, because an unexplained exception in an invariant is how a later
+    reader talks themselves into a wider one.
+    (a) **Balance.** At the end of every call to `graduateVia`,
+    `GraduationHelper` holds zero ETH and zero base units of any launch token.
+    Value that arrives by any other path does not persist: the next successful
+    `graduateVia` either spends it settling that call's swap or forwards it to
+    that caller. The scope is `graduateVia` and not every external call because
+    section 8.6 step 9's `receive()` is an external call that must accept ETH
+    from any sender — the PoolManager pays a restore's credit there and the curve
+    pays a claimed bounty there — so a clause over every external call would
+    forbid what the same section mandates. The launch token the clause is
+    measured against is `curve.token()` for the curve the call named.
+    (b) **Value movement.** It moves value to no address other than its own
+    caller, except a swap's settlement to the PoolManager inside that swap's own
+    lock. The exception exists because section 8.6 step 3's restoring swap is
+    settled from the caller's ETH and tokens and v4 settlement is a payment to
+    the PoolManager; it extends to no moment outside a lock this contract itself
+    took in that same call, and to no other address.
+    (c) **Storage and powers.** It has no owner, no admin function and no storage
+    that outlives a transaction. The last clause constrains the implementation to
+    transient storage: a reentrancy guard or a callback flag held in ordinary
+    storage violates it while behaving correctly, so an implementer who reaches
+    for an ordinary `ReentrancyGuard` breaks this invariant without any other
+    assertion failing.
+    (d) **Standing.** It is named by no other Pledrin contract. Deleting it,
     replacing it or deploying a second instance changes no curve's behaviour and
     no invariant in this section.
+    A test of (a) must force ETH and launch tokens into the helper outside a call
+    of its own, since that is the only case in which the clause's two sentences
+    say different things.
 69. Every `Graduated` log carries the `fee` and `tickSpacing` of the key the
     graduation used, so the whole pool key is reconstructible from that one log
     together with `token()`, since `currency0` and `hooks` are always
@@ -2894,6 +3104,19 @@ the core of the invariant suite.
     neither `coreEth` nor `floorEth` before step 8 begins. A test must assert
     this with a non-zero `S`, because the three clauses are an ordering property
     that no single-function test observes.
+
+### The lock's compounding
+
+71. `LiquidityLock.compound` can revert for exactly two reasons:
+    `NothingToCompound` when the position's liquidity did not change, and
+    `LiquidityNotIncreased` when it fell. It cannot revert for a rounding reason,
+    because the amount each side of its batch requires is bounded by the credit
+    that side was given — section 9 states the consequence and
+    `docs/SECURITY_NOTES.md` section 4 derives the bound. This invariant belongs
+    with Invariant 46 by subject and is numbered 71 because the numbers in this
+    section are referenced by test names and commit messages: an invariant is
+    appended, never inserted beside its relatives, and never renumbered.
+    **Awaiting a test.**
 
 ---
 

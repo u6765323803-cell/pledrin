@@ -364,4 +364,12 @@ interface IBondingCurve {
 
     /// @notice The id of the canonical pool key.
     function poolId() external view returns (PoolId);
+
+    /// @notice The Uniswap v4 PoolManager this launch opens, restores and mints on.
+    /// @dev Declared for `GraduationHelper`, which reads the deployment off the curve it is
+    /// graduating rather than storing one of its own, so that a third party's restoring swap
+    /// and the graduation that follows it cannot reach two different PoolManagers
+    /// (`docs/SPEC.md` section 8.6). The getter is the public immutable `BondingCurve` has
+    /// always had, so this declaration changes that contract's ABI and bytecode not at all.
+    function poolManager() external view returns (IPoolManager);
 }

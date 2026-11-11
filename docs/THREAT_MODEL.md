@@ -497,8 +497,22 @@ in a threat model is what the path depends on and what it does not.
 no privilege, and it calls only functions any address may call. If it is absent,
 or defective, or replaced by a hostile copy, graduation is still reachable by
 anyone who writes an equivalent, and a hostile copy can harm nobody but its own
-caller: the funds at stake in a call are the caller's `msg.value` and the token
-allowance the caller granted. Invariant 68 states that in testable form.
+caller: the funds at stake in a call are the caller's `msg.value` and the
+`maxTokensIn` base units that call pulled. Invariant 68 states the helper's side
+of that in testable form.
+
+**The bound is `maxTokensIn` and not the allowance, and that is a property of the
+helper's mechanism rather than of a caller's approval hygiene.** An earlier
+revision of the paragraph above said "the token allowance the caller granted",
+which is the weaker bound and the one a different mechanism would have delivered:
+a helper that pulled tokens just in time from inside its own `unlockCallback`
+would be making a `transferFrom` against the whole standing allowance, on a call
+whose callback the caller's chosen `curve` controls. Spec 8.6 step 1 requires the
+custody to be taken once at the top of the call instead, so a hostile curve's
+forged callback can reach only the balances that call is already holding. A
+caller who keeps a standing approval to a *hostile copy* of the helper is of
+course exposed to the whole of it; what the specified mechanism guarantees is
+that the real one cannot spend it.
 
 **It does not reduce anybody's exposure to the attacker.** The restorer pays what
 crossing the hostile liquidity costs, which is about nothing for dust and real

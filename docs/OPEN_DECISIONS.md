@@ -811,6 +811,175 @@ and never code on a chain.
 
 ---
 
+## 14. The order of `buy`'s deadline and window checks
+
+**RESOLVED 2026-11-11: option B, and implemented in `contracts/src` the same
+day.** `_buy` now checks `WrongState`, `BuyWindowClosed`, `DeadlinePassed`,
+`BuyTooSmall` in that order. `docs/SPEC.md` section 5.4, the check-order table in
+section 16.2 and Invariant 32 are the specification; Invariant 32 asserts the new
+order explicitly, because it asserted the old one explicitly and would otherwise
+have become the thing that failed.
+
+Raised 2026-11-11 while writing the revert-reason standard of section 16.2. No
+ETH, no token and no state was at stake either way; what changed is the sentence
+a caller is shown.
+
+**Which argument failed.** The brief that introduced this ordering defended it as
+calldata validation whose verdict is true in every state, by analogy with the
+`tickSpacing` range check that `graduateAlt` runs ahead of its state check. That
+justification does not survive inspection, on two counts, and both are recorded
+because the conclusion is worth less than the reason. The range check is a pure
+function of its argument, while the deadline check compares the argument against
+`block.timestamp`, so its verdict is a fact about the block rather than about the
+calldata. And the range check runs *before* `graduateAlt`'s state check, while
+the deadline check runs *after* `buy`'s, so `buy` was never applying a
+calldata-first rule for the deadline check to be an instance of: its first
+refusal was already `WrongState`.
+
+**Why now rather than at the next edit.** The entry's own recommendation was B
+"whenever `_buy` is next touched". That deferral was dropped once the
+justification for A was gone: swapping strictly dominates, so waiting only kept a
+misleading message in place for no gain. Section 16.2's instruction that a front
+end read `gradDeadline` before echoing `DeadlinePassed` was a mitigation for this
+defect and is no longer stated as one.
+
+### Question
+
+`buy` checked, in this order, `state == Live`, `block.timestamp <= deadline`,
+`block.timestamp < gradDeadline`, and `msg.value >= MIN_BUY_WEI`. Exactly one
+input class makes the middle two both true: a transaction whose own deadline has
+passed, sent to a launch whose graduation window has also closed and which
+nobody has yet moved out of `Live` by calling `expire()`. That call answers
+`DeadlinePassed`. A resubmission with a fresh deadline then answers
+`BuyWindowClosed`. Should the two checks be swapped?
+
+### Options
+
+**A. Keep the order.** The caller's own deadline is honoured before the launch's
+window is consulted, so a transaction that sat in the mempool is refused for the
+reason the caller themselves wrote into the calldata. The cost is the input class
+above: the first refusal names a condition a later call can clear while the real
+blocker, the closed window, is permanent. That is precisely what section 16.2
+forbids everywhere else, and it costs the caller one wasted round trip and one
+wasted gas payment.
+
+**B. Check `BuyWindowClosed` before `DeadlinePassed`.** No input class is worse
+off. While the window is open the window check cannot fire, so a stale
+transaction still answers `DeadlinePassed`; once the window is closed the caller
+is told the permanent truth on the first attempt. The cost is conceptual rather
+than practical: a transaction the caller instructed not to execute after `T` is
+refused for a reason other than `T`, and a reader who expects calldata to be
+validated before chain state has to look at section 16.2 to see why.
+
+### Trade-offs
+
+The argument recorded for A is that the deadline check is calldata validation
+whose verdict is true in every state, by analogy with the `tickSpacing` range
+check that `graduateAlt` runs ahead of its state check. It fails on two counts,
+both set out in the resolution above, and that failure is what decided this
+entry.
+
+Against that, A is already written, already tested and harmless to funds, and the
+front end can compensate: `gradDeadline` is an immutable public getter, so an
+application can read it once per launch and say "the launch's buy window closed"
+rather than echoing "deadline passed".
+
+B is a reordering of two adjacent `if` statements in `_buy`, with no new error, no
+new storage read and no change to any precondition, which makes it the cheapest
+change in this document.
+
+### Recommendation
+
+**B, taken whenever `_buy` is next touched for any other reason.** It costs
+nothing by the standard section 16.2 states and it removes the only remaining
+case where this protocol tells a caller to retry something that cannot succeed.
+If A is kept, keep section 16.2's instruction that a front end reads
+`gradDeadline` before it echoes `DeadlinePassed`, because that instruction is
+then the only thing standing between the caller and a misleading message.
+
+---
+
+## 15. Whether `release` should name a schedule it has finished paying
+
+**RESOLVED 2026-11-11: option B, and implemented in `contracts/src` the same
+day.** `release` rejects a schedule with `released == allocation` as
+`ScheduleFullyReleased()`, checked before the releasable amount is computed, and
+`NothingToRelease` narrows to the three conditions a later call clears: not
+started, inside the cliff, nothing newly accrued. `docs/SPEC.md` section 12's
+table and Invariant 62 are the specification, and section 16.2's shared-error
+table records the split rather than an exception.
+
+Raised 2026-11-11, same source as decision 14.
+
+**Which classification failed.** This case was handed over as one of four
+deliberate exceptions to the standard, on the stated line that a shared error is
+acceptable across functions when the caller can discriminate from data already in
+hand. The other three exceptions — `claimProtocolFees`, `claimCreatorFees` and
+`claimBounty` — are cross-function and clear that line: the caller holds the
+launch state and can tell the clearable case from the permanent one. This one is
+not cross-function. It was one function answering three clearable conditions and
+one terminal condition with a single error, which is the intra-function shape the
+standard forbids, and it sat one line below the `ScheduleVoided` check that the
+same round of changes had just added for exactly that reason. The line drawn in
+the brief condemned it; it was classified as permitted by it. Recording the
+misclassification is the point of this paragraph: the standard is only worth
+having if it decides cases against the person applying it.
+
+### Question
+
+`CreatorVesting.release` answered `NothingToRelease` for four conditions: the
+schedule has not started, it is inside its cliff, no further base unit has
+accrued since the last release, and the schedule has been released in full. The
+first three are cleared by a later call. The fourth never is. Section 16.2's
+standard is that within a single function the refusals must be as final as the
+conditions that cause them, and this is the one place in the protocol that does
+not hold. Should a fourth error be added?
+
+### Options
+
+**A. Keep one error.** `NothingToRelease` keeps covering all four. The caller
+that wants the difference reads `scheduleOf(launch)` and compares `released`
+against `allocation`.
+
+**B. Add one error, checked before the releasable amount is computed.** One
+comparison, `released == allocation`, and one new selector, on the same pattern
+as the `voided` check that the same round of changes added immediately above it.
+The error names the terminal case and `NothingToRelease` is then clearable in
+every case it still covers.
+
+### Trade-offs
+
+The harm from A is the smallest in this family. The only party with a reason to
+call `release` is the creator's payout path; a finished schedule has already paid
+the allocation in full, so nobody is misinformed about where their tokens are;
+and the ERC-20 `Transfer` and `VestingReleased` logs already show the schedule
+paid out.
+
+Against that, A is the exception a later reader is most likely to file as an
+oversight, because it sits inside the one function this round of changes
+corrected for exactly this reason, and because the rule it breaks is the
+intra-function one rather than the cross-function one the three settled shared
+errors rely on. A reader who accepts the reasoning for splitting `ScheduleVoided`
+out of `NothingToRelease` has no way to see why the finished case was left in.
+
+B costs one selector and one more branch in a function with no owner, no
+acceleration path and nothing else to get wrong. `CreatorVesting` is a few
+kilobytes of runtime code against the 24,576-byte limit that section 2.1 of the
+specification sizes the deployers against, so there is no size argument against
+it either.
+
+### Recommendation
+
+**B**, at the same priority as decision 14 and preferably in the same change,
+since both are one-line edits to functions whose behaviour is otherwise settled.
+If A is kept instead, section 16.2's table must keep saying that this one is
+unsettled rather than reclassifying it as a deliberate exception, because the
+other three exceptions are shared *across* functions and this one is not, and
+collapsing the two kinds would weaken the standard to the point where it stops
+deciding anything.
+
+---
+
 ## Verification prerequisites for Phase 1
 
 Not decisions. These were v4 behaviours the spec assumed. All six were tested on

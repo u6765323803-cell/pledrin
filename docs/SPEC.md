@@ -9,8 +9,16 @@ second pass changed the contracts rather than the document and are verified
 against them here: the fee destinations of section 6.3 with Invariant 59, and
 `ALT_TICK_SPACING_MAX = 199` in section 15.1. One later contract change is
 carried here as well: `FeeAccrued` gained a fifth amount, `reserveCut`
-(sections 6.3, 16 and 16.1, and Invariant 59). Where this document is silent,
-`docs/OPEN_DECISIONS.md` records the gap.
+(sections 6.3, 16 and 16.1, and Invariant 59). So is a later round of
+revert-reason changes, verified against `contracts/src` on 2026-11-11: the
+refusals of `CreatorVesting.release` and `BondingCurve.claimBond`, the order in
+which `buy` gives its own, and the standard that governs every refusal in this
+protocol (sections 5.4, 11.3, 12 and 16.2, and Invariants 32, 62 and 63).
+Decisions 14 and 15 of `docs/OPEN_DECISIONS.md` were resolved into that round,
+and were the only two refusals this document had recorded as unsettled. Nothing
+in the round changed a condition under which a trade, a claim or a release
+succeeds. Where this document is silent, `docs/OPEN_DECISIONS.md` records the
+gap.
 
 All external addresses come from `docs/CHAIN_FACTS.md` and nowhere else. No
 address appears in this document that is not in that file.
@@ -408,8 +416,12 @@ Two further derived facts, both exact:
 ### 5.4 Buy
 
 `buy(uint256 minTokensOut, uint256 deadline)`, payable. Requires
-`state == Live`, `block.timestamp <= deadline`,
-`block.timestamp < gradDeadline`, and `msg.value >= MIN_BUY_WEI`.
+`state == Live`, `block.timestamp < gradDeadline`,
+`block.timestamp <= deadline`, and `msg.value >= MIN_BUY_WEI`, checked in that
+order. The window is checked before the caller's own deadline because a closed
+window is permanent while a passed deadline is cleared by resubmitting, so the
+order decides which refusal a caller sees when both are true and it names the one
+that cannot be cleared (section 16.2, Invariant 32).
 
 Let `v = msg.value`.
 
@@ -631,10 +643,17 @@ the treasury.
 
 | Function | Caller | Precondition | Destination |
 |---|---|---|---|
-| `claimCreatorFees()` | anyone | `state in {Graduated, Stalled}` | `creator` |
-| `claimProtocolFees()` | anyone | any state | `protocolTreasury` |
-| `claimBond()` | anyone | `bondState == Returned` | `creator` |
+| `claimCreatorFees()` | anyone | `state in {Graduated, Stalled}` and `creatorFeeEth > 0` | `creator` |
+| `claimProtocolFees()` | anyone | any state, and `protocolFeeEth > 0` | `protocolTreasury` |
+| `claimBond()` | anyone | `bondState == Returned` and `pendingBondWei > 0` | `creator` |
 | `claimBounty(address earner)` | anyone | `pendingBountyWei[earner] > 0` | `earner` |
+
+The precondition column is the whole condition for success, so a call that fails
+any part of it reverts. Which error it reverts with is not interchangeable: one
+error is deliberately not reused across reasons of unequal finality.
+`claimBond`'s four refusals are in section 11.3, and the standard the whole
+protocol applies, together with the shared errors kept in spite of it, is in
+section 16.2.
 
 `claimBounty` takes the earner as an argument rather than reading `msg.sender`.
 Graduation credits the bounty to a mapping keyed by the address that graduated
@@ -1344,17 +1363,40 @@ Three constraints do the actual work, and none of them is a punishment:
    graduated liquidity, so no rule is needed to forbid it and no bond is needed
    to deter it.
 
-### 11.3 The three terminal bond states
+### 11.3 The bond state machine and `claimBond`'s refusals
 
 `bondState` is one of `None`, `Bonded`, `Returned`, `Forfeited`. It leaves
 `Bonded` at most once, and every exit is a single write guarded by the state
-check. This is what makes Invariant 7 — a bond is never paid twice — a
+check. This is what makes Invariant 25 — a bond is never paid twice — a
 one-enum assertion rather than a balance argument.
 
 | Transition | Condition | Effect |
 |---|---|---|
 | `Bonded -> Returned` | `graduate()`, `graduateAlt()` or `abortGraduation()` | `pendingBondWei = bondHeldWei`; `bondHeldWei = 0`; `bondsReturned++` |
 | `Bonded -> Forfeited` | `expire()`: `state == Live && block.timestamp >= gradDeadline && s < C` | `ethReserve += bondHeldWei`; `bondHeldWei = 0`; `bondsForfeited++`; `bondWeiForfeited += bondWei` |
+
+`claimBond()` names which of those states refused it. The refusal is a function
+of `bondState` alone in three of the four states, where the credit is zero and is
+not read; in `Returned` the credit decides:
+
+| `bondState` | `pendingBondWei` | Refusal | Permanent |
+|---|---|---|---|
+| `Bonded` | `0` | `BondNotReturned()` | No. The launch has not settled yet: `graduate()`, `graduateAlt()` or `abortGraduation()` turns the identical call into a payment, and `expire()` turns it into `BondForfeitedToHolders()`. |
+| `None` | `0` | `NoBondPosted()` | Yes. `bondWei` was zero at launch and no path creates a bond afterwards. |
+| `Forfeited` | `0` | `BondForfeitedToHolders()` | Yes. `expire()` added the bond to `ethReserve` (section 11.4). It will never be paid to the creator. |
+| `Returned` | `0` | `BondAlreadyClaimed()` | Yes. The bond has been paid. |
+| `Returned` | `> 0` | none; the call pays the credit to the creator | |
+
+`Returned` with an empty credit can only mean a completed claim, which is what
+makes the fourth refusal exact rather than an inference. The only write that sets
+`bondState = Returned` runs solely when `bondHeldWei` is non-zero and sets
+`pendingBondWei` to that amount in the same statement, nothing else ever adds to
+the credit, and `claimBond` is the only function that empties it. Invariant 63
+states this as an assertion, and Invariant 25 is the same fact counted in wei.
+
+An indexer reads the same distinction from `BondStateChanged`, whose
+`destination` is the creator on a return and the launch itself on a forfeit, and
+from the `FeesClaimed` log with `kind = Bond` that a successful claim emits.
 
 ### 11.4 Automatic payout to holders
 
@@ -1456,6 +1498,38 @@ The interface:
 voided schedule; `void()` reverts `ScheduleVoided` on an already-voided one.
 Neither can fire from a launch, because a launch calls each at most once and only
 from a terminal transition.
+
+`release(address launch)` refuses with one of four errors, chosen so that a
+caller is never told to wait for tokens that are not coming:
+
+| Condition | Refusal | Permanent |
+|---|---|---|
+| `allocation == 0` | `NoSchedule()` | Yes for every Pledrin launch: a launch's schedule is created inside its launch transaction or never, because `creatorFirstBuy` is callable only by the factory and only while `tokensSold == 0` (section 15.3). For an address that is not a launch it says only that this address has no schedule yet, since `createSchedule` is permissionless. |
+| `voided` is set | `ScheduleVoided()` | Yes. `expire()` set it, nothing clears it, and no release of this schedule will ever succeed. |
+| `released == allocation` | `ScheduleFullyReleased()` | Yes. The schedule has paid the allocation in full and has nothing left to pay. |
+| `start == 0` | `NothingToRelease()` | No. The clock starts when the launch graduates or stalls; if the launch expires instead, this refusal becomes `ScheduleVoided()`. |
+| `block.timestamp < start + cliff` | `NothingToRelease()` | No. |
+| started, past the cliff, no further base unit accrued since the last release | `NothingToRelease()` | No. |
+
+The checks run in that order, and both terminal conditions are rejected
+**before** the releasable amount is computed. That ordering is the point of them:
+`releasable` returns zero for a voided schedule and zero for a finished one
+(Invariants 21 and 22), so computing first and reporting `NothingToRelease` would
+answer a creator whose allocation is irrecoverable, and a creator who has already
+been paid all of it, with the same word it uses for a creator who is one second
+short of their cliff.
+
+`NothingToRelease` therefore carries the narrow meaning stated in the table, and
+nothing terminal hides behind it any more: the schedule exists, is not voided, is
+not finished, and has nothing releasable at this block time. A schedule in that
+condition can still pay, either when its clock advances or when its launch
+settles.
+
+The `releasable(address launch)` view cannot make any of these distinctions and
+is not changed to: it returns zero for a voided schedule, for a schedule before
+its cliff and for a finished one alike. A caller that needs the reason reads
+`scheduleOf(launch)`, which returns `voided`, `start`, `released` and
+`allocation`, and decides from those.
 
 Every mutating function is keyed by `msg.sender` and takes no launch argument,
 and `createSchedule` funds itself by pulling the allocation out of its caller.
@@ -1723,7 +1797,7 @@ in section 16.1.
 
 ---
 
-## 16. Events
+## 16. Events and revert reasons
 
 Indexed fields are chosen for the indexer's access patterns: by launch, by
 creator, by trader.
@@ -1811,6 +1885,78 @@ emitted for a transfer, because `transferOwnership` reverts (section 14).
   `launch` against `isLaunch` before attributing a locked position to a launch.
 - Reputation is reported one counter per log, so the three counters a bonded
   `createLaunch` touches arrive as three `ReputationUpdated` events.
+
+### 16.2 Revert reasons
+
+A refusal is part of the external interface, and two consumers read it directly.
+The web application has to explain a transaction in plain words before it is
+signed. An indexer records whatever reason a failed call returned as that call's
+cause. Both are wrong in the same way when the reason is wrong.
+
+**The standard, for every function of every Pledrin contract: a refusal must not
+name a condition that a later call can clear when the real blocker is permanent.**
+A caller told `BondNotReturned` is told to come back. A caller told
+`BondForfeitedToHolders` is told not to. Naming the first when the second is true
+is a defect rather than an imprecision, and it is one that no compiler and no
+invariant about balances will catch. Where one error served several conditions of
+unequal finality, the error is split until every refusal a function can give is
+as final as the condition that caused it. A split of this kind changes no
+precondition, no storage write and no state transition; if it changes any of
+those, it is not this kind of change.
+
+Four parts of this document are that standard applied: `claimBond`'s four
+refusals (section 11.3); `release`'s four (section 12); `buy`'s window check
+ahead of its deadline check (section 5.4); and the graduation checks, where the
+state check precedes the `ALT_DELAY` check so that a launch which has already
+graduated answers `WrongState` instead of being told to wait out a delay that is
+not what stands in its caller's way (Invariant 37).
+
+The standard binds a function's refusals to each other. It does not require that
+an error name exactly one condition across the whole protocol: a shared error is
+acceptable when the caller can tell the cases apart from data it already holds.
+
+#### Shared errors, and whether they are settled
+
+| Function | Error | Status |
+|---|---|---|
+| `claimProtocolFees()` | `NothingToClaim()` | Settled. The bucket is empty. Clearable in `Live`, `Expired` and `Stalled`, where every sell accrues a protocol share (section 6.3), and permanent in `Graduated`, where no trade executes. In `Graduating` it is clearable only by way of `Stalled`. Any caller already holds `state`, so one error serves both meanings. |
+| `claimCreatorFees()` | `NothingToClaim()` | Settled. Only `Graduated` and `Stalled` reach this error at all, because every other state answers `WrongState` first. Clearable in `Stalled`, where a sell still accrues the creator share; permanent in `Graduated`. Discriminated by `state`, as above. |
+| `claimBounty(address earner)` | `NothingToClaim()` | Settled. It means either that this address never graduated this launch or that its bounty has already been paid, and both are permanent: the credit is written only to the address that graduated the launch and only in that transaction (section 8.2), so no passage of time credits an address that is not credited already. Nothing clearable is implied, and the distinction tells a caller nothing it can act on. An indexer that wants it reads `Graduated.caller` against `FeesClaimed` with `kind = Bounty`. |
+| `release(address launch)` | `NothingToRelease()` | Settled, by splitting rather than by exception. It covers three conditions — not started, inside the cliff, nothing newly accrued — and a later call clears all three, so nothing terminal hides behind it. The terminal condition it used to cover, a schedule released in full, is `ScheduleFullyReleased()` as of Decision 15 of `docs/OPEN_DECISIONS.md`. That case was the only shared error inside a single function rather than across two, which is the shape this standard forbids rather than the shape it permits, and it was fixed instead of excused. |
+
+`WrongState(State current)` is not in this family. It carries the state in its
+payload, so the refusal discriminates itself: a caller learns which state refused
+it and, by Invariant 30, whether that state can still change. An error that
+discriminates itself needs no second error.
+
+#### Deliberate check order
+
+Where two refusals can both be true of one call, the order the checks run in
+decides which one the caller sees. That order is specified, not incidental:
+
+| Function | Order | Reason |
+|---|---|---|
+| `graduateAlt(uint24 tickSpacing)` | `InvalidTickSpacing`, then the state check, then `AltDelayNotElapsed` | The range check is a verdict about calldata alone and is true in every state, so `graduateAlt(200)` answers it rather than `AltPoolInitialized`, which is a pool-state error that only happens to fire (section 8.4, Invariant 38). The delay check follows the state check, because a launch that has already graduated is not waiting for a delay (Invariant 37). |
+| `buy(uint256 minTokensOut, uint256 deadline)` | `WrongState`, `BuyWindowClosed`, `DeadlinePassed`, `BuyTooSmall` | The window closes permanently and a deadline is cleared by resubmitting, so the window is named first. A buy that merely sat in the mempool still answers `DeadlinePassed`, because the window check cannot fire while the window is open (section 5.4, Invariant 32). |
+| `sell(uint256 tokensIn, uint256 minEthOut, uint256 deadline)` | `WrongState`, `DeadlinePassed`, `ZeroAmount`, `SellExceedsSupplySold`, then the quote's own `ZeroAmount` and `SlippageExceeded` | The state first, then the caller's own deadline. There is nothing behind the deadline here for the order to matter against: `sell` has no window and stays open in both terminal states (Invariant 33). |
+
+The `buy` row was the other way round until Decision 14 of
+`docs/OPEN_DECISIONS.md` reversed it. One input class made both checks true: a
+transaction whose own deadline had passed, sent after `gradDeadline` to a launch
+still `Live` because nobody had called `expire()` yet. It answered
+`DeadlinePassed`, and a resubmission with a fresh deadline then answered
+`BuyWindowClosed` — a condition a later call can clear, named while the real
+blocker was permanent. Swapping the two checks costs nothing: while the window is
+open the window check cannot fire, so a stale buy still answers
+`DeadlinePassed`, and once the window has closed the caller is told the permanent
+truth on the first attempt.
+
+A `DeadlinePassed` from `buy` therefore now implies that the window was still
+open in the block that refused it, which is the property Invariant 32 asserts. A
+front end needs no second read to interpret it and must not present it as
+anything other than what it is: resubmitting is the remedy. Reading
+`gradDeadline` remains worth doing to show how much of the window is left, and is
+no longer needed to decide what a refusal means.
 
 ---
 
@@ -1957,7 +2103,14 @@ the core of the invariant suite.
     and 2. What this invariant forbids is what it was written to forbid: there
     is no buy after `Live`, so `tokensSold` can never rise again, and the cap is
     a one-way door because `Graduating` admits neither direction.
-32. `buy` reverts unless `state == Live && block.timestamp < gradDeadline`.
+32. `buy` reverts unless `state == Live && block.timestamp < gradDeadline`, and
+    its refusals are given in the order `WrongState`, `BuyWindowClosed`,
+    `DeadlinePassed`, `BuyTooSmall`. A call made at or after `gradDeadline`
+    therefore answers `BuyWindowClosed` whether or not its own deadline has also
+    passed, and a `DeadlinePassed` from `buy` implies
+    `block.timestamp < gradDeadline` in the block that refused it. No refusal of
+    `buy` names a condition a later call can clear while a permanent condition
+    also holds (section 16.2).
 33. `sell` succeeds in `Live`, `Expired` and `Stalled` and reverts in
     `Graduating` and `Graduated`.
 34. `Expired` requires `block.timestamp >= gradDeadline && tokensSold < CURVE_SUPPLY`;
@@ -1967,7 +2120,10 @@ the core of the invariant suite.
     of time and at least one external call.
 36. `graduate` and `graduateAlt` together succeed at most once per launch.
 37. `graduateAlt` reverts before `capReachedAt + ALT_DELAY`;
-    `abortGraduation` reverts before `capReachedAt + GRAD_GRACE`.
+    `abortGraduation` reverts before `capReachedAt + GRAD_GRACE`. Both delay
+    checks run after their function's state check, so a launch that is not
+    `Graduating` answers `WrongState` and is never told to wait out a delay that
+    is not what refused it (section 16.2).
 38. `graduateAlt` accepts only `tickSpacing` in
     `[ALT_TICK_SPACING_MIN, ALT_TICK_SPACING_MAX] = [10, 199]`, narrowed from
     `uint24` to `int24` through `SafeCast`, and only a pool that is not yet
@@ -2126,6 +2282,25 @@ the core of the invariant suite.
     exists at that point and still carries the core mint's unspent remainder; it
     is unusable for exactly as long as those two clauses hold, and for no other
     reason.
+
+### Revert reasons
+
+62. `CreatorVesting.release(launch)` gives exactly the refusal section 12's table
+    assigns to the schedule's condition, in that order: `NoSchedule` when
+    `allocation == 0`; `ScheduleVoided` when `voided` is set, whatever the clock
+    says and whatever `releasable` returns; `ScheduleFullyReleased` when
+    `released == allocation`, which is checked before the releasable amount is
+    computed; and `NothingToRelease` only on a schedule that exists, is not
+    voided, is not finished, and has nothing releasable at this block time. No
+    voided schedule and no finished schedule ever answers `NothingToRelease`, so
+    for every schedule that does answer it there is a later block time, or a later
+    transition of its launch, at which `release` pays.
+63. `claimBond()` gives exactly the refusal section 11.3's table assigns to the
+    launch's bond: `NoBondPosted` in `None`, `BondNotReturned` in `Bonded`,
+    `BondForfeitedToHolders` in `Forfeited`, and `BondAlreadyClaimed` in
+    `Returned` with `pendingBondWei == 0`. It succeeds only in `Returned` with a
+    non-zero credit, and therefore at most once per launch, so
+    `BondAlreadyClaimed` is reachable only after a claim that paid.
 
 ---
 

@@ -197,6 +197,18 @@ Uniswap v4's own contracts, whose addresses are immutable, and exactly one piece
 of Pledrin code: the curve's `receive()`, which reverts for every sender other
 than `positionManager`. No third party can execute anything in that window.
 
+**That argument is scoped to the token delta and does not extend to the ETH
+delta measured two lines above it.** The Phase 1 security review
+(`docs/security/REVIEW-2026-11-11-phase1-contracts.md`, finding 1) shows that
+`_mintData`'s closing `SWEEP(currency0, MSG_SENDER)` sends PositionManager's
+*entire* native balance to the curve rather than the mint's unspent remainder,
+so `ethBefore - address(this).balance` is influenced by any balance parked in
+PositionManager beforehand — with nobody executing anything inside the window and
+no reentrancy involved. "No third party can execute anything here" was therefore
+true and insufficient, and generalising it from the token reading to the whole
+function was my error. The ETH reading is a confirmed high-impact finding and is
+being fixed; this verdict covers `remainder` and the dust check alone.
+
 `LiquidityLock.onERC721Received` is deliberately **not** part of that argument,
 although the position NFT is minted to the lock during this call. v4's
 PositionManager mints with `_mint(owner, tokenId)`

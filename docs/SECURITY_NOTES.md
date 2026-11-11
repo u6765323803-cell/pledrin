@@ -15,47 +15,38 @@ The configuration lives in `contracts/slither.config.json` rather than in CI
 arguments, so a reviewer running the command above analyses the same set of
 contracts with the same detectors as the pipeline.
 
-As of this revision Slither reports **35 findings across 11 detectors**, and the
-run exits non-zero. None of the 35 is a defect. The run is nonetheless not
-acceptable, for the reason in the next section.
+As of this revision Slither reports **28 findings across 9 detectors** and
+generates an intermediate representation for every function in `src`:
+
+| Impact | Findings | Detectors |
+|---|---|---|
+| High | 1 | `reentrancy-balance` |
+| Medium | 13 | `unused-return` 9, `divide-before-multiply` 2, `incorrect-equality` 1, `locked-ether` 1 |
+| Low | 13 | `timestamp` 8, `reentrancy-benign` 4, `reentrancy-events` 1 |
+| Informational | 1 | `low-level-calls` |
+
+None is a defect. The one high finding has a written verdict in section 2, and
+it is the reason `--fail-high` exits 255: the flag fails on impact alone and
+cannot be told that a high finding has been reviewed. A permanently red gate is
+an ignored gate, so this will not be left as it stands — the fix belongs in the
+same change that implements it, not in a note here.
 
 ---
 
-## 1. Open blocker: the analysis does not cover the whole program
+## 1. Resolved: the analysis once covered less than the whole program
 
-Slither cannot build an intermediate representation for six function bodies and
-says so on stderr:
+This section is kept after the fix because the failure mode is worth
+recognising: for a period, this repository had a static-analysis gate that
+reported a clean, ordinary-looking result while six function bodies — including
+every buy and the whole of graduation — were absent from the model.
 
-```
-ERROR:ContractSolcParsing:Impossible to generate IR for BondingCurve.constructor (src/BondingCurve.sol#133-219):
- 'NoneType' object has no attribute 'parameters'
-ERROR:ContractSolcParsing:Impossible to generate IR for BondingCurve.graduateAlt (src/BondingCurve.sol#317-327)
-ERROR:ContractSolcParsing:Impossible to generate IR for BondingCurve._buy (src/BondingCurve.sol#504-541)
-ERROR:ContractSolcParsing:Impossible to generate IR for BondingCurve._settle (src/BondingCurve.sol#561-614)
-ERROR:ContractSolcParsing:Impossible to generate IR for BondingCurve._mintData (src/BondingCurve.sol#737-762)
-ERROR:ContractSolcParsing:Impossible to generate IR for LiquidityLock._compoundData (src/LiquidityLock.sol#135-152)
-```
+Slither 0.11.6 could not build an intermediate representation for
+`BondingCurve.constructor`, `graduateAlt`, `_buy`, `_settle`, `_mintData` and
+`LiquidityLock._compoundData`, reported each on stderr as
+`ERROR:ContractSolcParsing: Impossible to generate IR ... 'NoneType' object has
+no attribute 'parameters'`, and then ran all 102 detectors over what was left.
 
-Those six are the curve's constructor, every buy, the whole of graduation, the
-alternate-pool entry point, and the two functions that encode Uniswap v4 action
-payloads. Slither then runs all 102 detectors over the remaining model and
-reports its findings in the ordinary format.
-
-This matters in both directions.
-
-**False positives.** Every "never initialized" finding in section 2 is an
-artefact of the constructor being absent from the model: each of those variables
-is assigned in the constructor, and `capReachedAt` is additionally written in
-`_buy`. The six dead-code findings and both `constable-states` findings have the
-same single cause — the functions that call them, and the functions that write
-them, are the ones that failed to parse.
-
-**False negatives, which are the real problem.** A genuine reentrancy, arbitrary
-send or uninitialised read inside `_settle` or `_buy` would not be reported at
-all, and its absence from the output would be indistinguishable from its absence
-from the code.
-
-Nothing in Slither's exit code reflects this. Measured on this repository:
+### Why the exit code did not save us
 
 | Invocation | Exit code |
 |---|---|
@@ -63,44 +54,87 @@ Nothing in Slither's exit code reflects this. Measured on this repository:
 | `--no-fail-pedantic` | 0 |
 | `--fail-none` | 0 |
 
-A clean exit is therefore available while six function bodies are missing from
-the analysis. `.github/workflows/security.yml` greps for `ERROR:ContractSolcParsing`
-and fails the job itself, because no flag does it.
+A clean exit was available with six function bodies missing. No flag reports
+this condition, so `.github/workflows/security.yml` greps for
+`ERROR:ContractSolcParsing` and fails the job itself. **That gate stays even
+though the cause is fixed**, because the same class of failure can return with
+any dependency bump or Slither release, and the next occurrence would again look
+like a clean run.
 
-Slither 0.11.6 is the current release, so there is no upgrade to take. The
-failure does not depend on the IR pipeline: `via_ir = false` produces the same
-six errors and the same 35 findings.
+### Root cause
 
-The triggering construct is not yet identified. Three hypotheses have been
-eliminated by minimal reproduction, recorded so that nobody spends the time
-again — none of the following reproduces the error in isolation against the same
-solc and the same Slither:
+A library-name collision. `lib/v4-periphery/lib/v4-core/src/libraries/SafeCast.sol`
+declares a library also called `SafeCast`, and it declares only `toUint160`,
+`toUint128`, `toInt128` and `toInt256`. Slither resolves a `using SafeCast for T`
+directive by **name** across the file's scope, and in any file that reaches the
+Uniswap v4 surface it binds to v4-core's library rather than to the
+OpenZeppelin one the file imports. Every cast whose name that library does not
+declare — `toUint8`, `toUint64`, `toInt24` — resolved to `None`, and
+`convert_constant_types` in `slither/slithir/convert.py` raised on
+`[p.type for p in func.parameters]`. That killed IR generation for the whole
+enclosing function.
 
-- **SafeCast through a `using` directive.** The correlation looked strong: every
-  failing function uses a SafeCast method other than `toUint128`, and `sell`,
-  which parses cleanly, uses only `toUint128`. A contract exercising `toUint8`,
-  `toUint64`, `toUint160` and a chained `toInt256().toInt24()`, with `using
-  SafeCast` attached to both `uint256` and `int256`, analyses cleanly. The
-  correlation is coincidence.
-- **Errors and events declared in an interface and used in the implementation.**
-  `sell` parses cleanly while reverting with four interface-declared errors and
-  emitting an interface-declared event, and `_mintData` and
-  `_compoundData` fail while containing no `revert` and no `emit` at all.
-- **`bytes("")`, a string-literal conversion.** It occurs in exactly two places
-  in the codebase and both are inside failing functions, which made it the best
-  positional fit of the three. A contract using `bytes("")`, a bare `""`, a named
-  `bytes` constant and `hex""` in an `abi.encode` analyses cleanly.
+This explains the distribution exactly. `sell`, `_mintCore` and
+`_approvePositionManager` parsed cleanly only because `toUint128` and
+`toUint160` happen to exist in v4-core's library; `CreatorVesting` and `Timelock`
+used `toUint64` without trouble because neither file reaches v4.
 
-What the two smallest failing functions still have in common, and what the next
-reproduction should isolate, is that both take a `PoolKey` and read a `Currency`
-from it while indexing a library of `uint256` action constants — that is, the
-Uniswap v4 type and library surface, which none of the reproductions above
-imported.
+There is a second-order effect worth stating plainly, because it is worse than
+the six missing functions and was not visible at all: for every `toUint128` call
+site in `BondingCurve` and `LiquidityLock`, Slither was analysing **v4-core's
+implementation rather than the OpenZeppelin one solc compiles**. The analyser
+was not merely covering less than the program; on those lines it was covering a
+different program.
 
-**Status: open, and a gate on closing the contracts phase.** Until it is fixed,
-treat static analysis of `BondingCurve` and `LiquidityLock.compound` as not
-having run. The invariant and fork test suites are the only coverage those paths
-currently have.
+### The fix
+
+`using` directives in `BondingCurve.sol` and `LiquidityLock.sol` now name their
+functions:
+
+```solidity
+using {SafeCast.toInt24} for int256;
+using {
+    SafeCast.toInt256, SafeCast.toUint8, SafeCast.toUint64, SafeCast.toUint128, SafeCast.toUint160
+} for uint256;
+```
+
+Slither's function-list path keeps searching every library called `SafeCast`
+until it finds one that declares the named function, so the binding becomes the
+same one solc uses. This is standard Solidity since 0.8.13, it is the same
+OpenZeppelin implementation with the same checks and the same custom errors, and
+the compiled bytecode is unchanged. It also documents at the attachment site
+which of the two `SafeCast` libraries applies, which is the same ambiguity that
+fooled the analyser and can fool a reviewer.
+
+Two alternatives were rejected for making the code worse to satisfy a tool:
+plain `uint8(...)` / `uint64(...)` truncations, which drop the overflow checks,
+and a project-local reimplementation of `SafeCast`, which would duplicate
+audited code.
+
+### Correction to the previous revision of this section
+
+An earlier revision recorded "SafeCast through a `using` directive" as
+**eliminated** by minimal reproduction, and noted that every failing function
+used a cast other than `toUint128` while the one clean function used only
+`toUint128` — then dismissed that as coincidence. It was not coincidence; it was
+the signal, and the reasoning that discarded it was wrong. The reproduction that
+cleared the hypothesis did not import anything from Uniswap v4, so it contained
+only one library called `SafeCast` and could not exhibit the collision. The
+hypothesis was correct and the test of it was inadequate.
+
+The other two hypotheses recorded there were genuinely eliminated and remain so:
+interface-declared errors and events, and `bytes("")` string-literal conversion.
+Neither reproduces, and neither is implicated by the cause above.
+
+### Reproduction
+
+`slither . --config-file slither.config.json` against a two-file project that
+imports both `SafeCast` libraries reproduces the error for a plain local, a
+library constant, `block.timestamp`, an explicit `SafeCast.toUint8(x)` call and a
+chained cast; aliasing the OpenZeppelin import does not help; `toUint128` does
+not reproduce; and a contract using the function-list directive produces no
+errors. On the real sources the parse errors went from six to **zero** and the
+findings from 35 to 28.
 
 ---
 
@@ -108,21 +142,119 @@ currently have.
 
 Grouped by detector, with Slither's impact rating.
 
-### arbitrary-send-erc20 — high — not a defect
+Four detectors that appeared in the previous revision are absent from this one —
+`arbitrary-send-erc20` and `uninitialized-state` (both high), `dead-code` and
+`constable-states`. All four were artefacts of the missing function bodies
+described in section 1 and disappeared when the analysis became complete. They
+are not suppressed and not fixed; they were never real.
 
-`BondingCurve._pullToken` is reported for passing a non-literal `from` to
-`transferFrom`. It is a private helper with exactly one call site, `sell`, which
-passes `msg.sender`. No caller can choose `from`.
+### reentrancy-balance — high — not a defect
 
-### uninitialized-state — high — false positive
+```
+Reentrancy in BondingCurve._mintCore(PoolKey,int24):
+  External call allowing reentrancy:
+  - positionManager.modifyLiquidities{value: target}(_mintData(...), block.timestamp)
+  Balance read before the call:
+  - tokensBefore = token.balanceOf(address(this))
+  Possible stale balance used after the call in a condition:
+  - remainder > PledrinConstants.LP_DUST_MAX
+```
 
-`token`, `gradDeadline`, `sqrtPriceTerminal`, `totalFeeBps`, `creatorShareBps`,
-`protocolShareBps` and `capReachedAt` are all reported as never initialized. All
-seven are assigned in the constructor, which Slither failed to parse; see
-section 1. `capReachedAt` is also written in `_buy`, which also failed to parse.
-The runtime behaviour is covered by the fork tests — in particular the test that
-`graduateAlt` reverts before `ALT_DELAY`, which can only pass if `capReachedAt`
-holds a non-zero value.
+The detector's premise is that a balance read before an external call may be
+stale when used after it. Here the value used after the call is not that balance:
+
+```solidity
+uint256 tokensBefore = token.balanceOf(address(this));
+positionManager.modifyLiquidities{value: target}(...);
+tokensUsed = tokensBefore - token.balanceOf(address(this));
+uint256 remainder = PledrinConstants.LP_SUPPLY - tokensUsed;
+if (remainder > PledrinConstants.LP_DUST_MAX) revert LpDustTooHigh(remainder);
+```
+
+`tokensUsed` is a **delta across the call** and `remainder` is derived from it
+and from a constant, never from an absolute post-call balance. Any token balance
+the curve holds beyond what the mint consumes therefore raises both ends of the
+subtraction equally and cancels: a donation of `D` before `graduate()` gives
+`tokensBefore = LP_SUPPLY + D` and a post-call balance of `LP_SUPPLY + D - U`,
+so `tokensUsed = U` and `remainder = LP_SUPPLY - U`, both independent of `D`.
+The amount the mint pulls is set by the position's parameters and capped at
+`LP_SUPPLY`; it is in no way a function of the curve's balance.
+
+For the read to be stale in a way that changed `remainder`, the balance would
+have to move during the call by something other than the mint's own pull. Inside
+`modifyLiquidities` the pool is hookless and the currencies are native ETH and
+the launch token, a plain ERC20 with no transfer callbacks. The call reaches
+Uniswap v4's own contracts, whose addresses are immutable, and exactly one piece
+of Pledrin code: the curve's `receive()`, which reverts for every sender other
+than `positionManager`. No third party can execute anything in that window.
+
+`LiquidityLock.onERC721Received` is deliberately **not** part of that argument,
+although the position NFT is minted to the lock during this call. v4's
+PositionManager mints with `_mint(owner, tokenId)`
+(`lib/v4-periphery/src/PositionManager.sol:369`), inheriting solmate's `ERC721`,
+whose `_mint` emits `Transfer` and invokes no receiver hook — only
+`safeTransferFrom` does. So that callback does not run here at all. An earlier
+revision of this verdict named it as a window participant and argued that its
+`external view` declaration made it inert; the declaration is real and is pinned
+by Invariant 57, but it was the wrong reason, because the function is never
+reached on this path. Naming a surface that is not on the path makes an argument
+look broader while leaving it resting on something unverified.
+
+Both failure directions also fail closed rather than open: an in-window balance
+increase would underflow `tokensBefore - balanceOf` and revert, and
+`tokensUsed > LP_SUPPLY` would underflow `remainder` and revert.
+
+**This construction is load-bearing and must not be simplified.** Reading the
+post-call balance directly and treating it as the remainder would let any holder
+push `remainder` past `LP_DUST_MAX` by sending tokens to the curve, revert
+`graduate()` at will, hold a launch that had reached its cap out of graduation
+until `GRAD_GRACE` expired, and leave `abortGraduation` to strand it in `Stalled`
+with no Uniswap pool — a griefing attack on every holder, at the cost of a token
+balance the attacker already owns.
+
+This finding was invisible before the fix in section 1, because `_mintCore` calls
+`_mintData`, one of the six functions that failed to parse.
+
+One adjacent fact, recorded because the opposite is the natural assumption:
+`_mintCore` revokes only the **ERC-20** leg of the Permit2 approval, which is
+what specification section 8.2 step 4 prescribes. The Permit2 registration
+itself survives graduation carrying the unspent remainder — at the default
+virtual reserve, an allowance of 1,088 base units with `expiration` at
+`type(uint48).max`. It is inert, because a Permit2 pull also needs the curve's
+own ERC-20 allowance to Permit2, which is zero and which no code path can set
+again. It is worth knowing anyway: adding any `_approve` to the curve in future
+would turn a dust-sized dormant registration into a live one.
+
+### unused-return — medium — intended, nine findings
+
+Five of the nine are newly visible — four in `_settle` and one in the
+constructor — for the same reason.
+
+- `poolManager.initialize` returns the initial tick, at both call sites — the
+  constructor's and `_settle`'s. Neither needs it: the specification requires the
+  tick to be read back from `slot0`, which both do.
+- `poolManager.getSlot0` is destructured for one field at four sites, three in
+  `_settle` and one in `_mintFloor`. The other fields are deliberately unused, and
+  reading `tick` rather than deriving it from `sqrtPriceX96` is required by the
+  specification.
+- `poolManager.unlock` returns the callback's encoded result; the price-restoring
+  callback returns an empty value and the caller re-reads the restored price.
+- `positionManager.getPoolAndPositionInfo` is destructured for the pool key alone.
+- `curve.creatorFirstBuy` returns the base units bought; the factory does not need
+  them, and the amount reaches indexers through `CreatorVesting`'s
+  `VestingCreated` event.
+
+### divide-before-multiply — medium — intended
+
+`TickAlign.down` and `TickAlign.up` divide by the tick spacing and multiply back.
+The discarded remainder is the alignment itself, not a loss of precision. Both
+sites carry an inline suppression.
+
+### incorrect-equality — medium — not applicable
+
+`CreatorVesting.release` tests `amount == 0` to reject a no-op release. The
+detector is aimed at strict equality against a balance or a timestamp; this is a
+zero check on a computed amount.
 
 ### locked-ether — medium — intended
 
@@ -132,62 +264,34 @@ and PositionManager, so the only ETH that can arrive is a position's residual
 `currency0` and PositionManager's native-value sweep; no one can strand their own
 ETH there by mistake.
 
-### divide-before-multiply — medium — intended
+### timestamp — low — eight findings, deliberate
 
-`TickAlign.down` and `TickAlign.up` divide by the tick spacing and multiply back.
-The discarded remainder is the alignment itself, not a loss of precision. Both
-sites carry an inline suppression.
+Every deadline, vesting cliff and timelock comparison in the protocol.
+`docs/CHAIN_FACTS.md` rules out `block.number` on this Arbitrum Nitro chain and
+specification section 1 requires `block.timestamp` for all time logic, so each of
+the eight is intended. The detector is excluded in `foundry.toml`'s `[lint]`
+section for the Foundry linter; Slither applies its own and is reported here for
+completeness.
 
-### unused-return — medium — intended, four sites
-
-- `poolManager.unlock` returns the callback's encoded result; the price-restoring
-  callback returns an empty value and the caller re-reads the restored price from
-  `slot0`.
-- `poolManager.getSlot0` is destructured for `tick` alone; the other three fields
-  are deliberately unused, and reading `tick` rather than deriving it from
-  `sqrtPriceX96` is required by the specification.
-- `positionManager.getPoolAndPositionInfo` is destructured for the pool key alone.
-- `curve.creatorFirstBuy` returns the base units bought; the factory does not need
-  them, and the amount reaches indexers through `CreatorVesting`'s
-  `VestingCreated` event.
-
-### incorrect-equality — medium — not applicable
-
-`CreatorVesting.release` tests `amount == 0` to reject a no-op release. The
-detector is aimed at strict equality against a balance or a timestamp; this is a
-zero check on a computed amount.
-
-### reentrancy-benign — low — guarded, three sites
+### reentrancy-benign — low — guarded, four findings
 
 `_restorePrice` writes its own `_unlocking` flag after `poolManager.unlock`
-returns, which is the flag's purpose. `LaunchFactory.createLaunch` writes
-`isLaunch` and the reputation counters after deploying the curve; the curve is
-created by that same call and cannot be a third party. No value moves on any of
-the three paths after the write.
+returns, which is the flag's purpose. `_settle` writes after `initialize` and
+`_restorePrice`, both calls to the immutable PoolManager. `LaunchFactory.createLaunch`
+accounts for two of the four: it writes `isLaunch` and the reputation counters
+after deploying the curve, and the curve is created by that same call and cannot
+be a third party. No value moves on any of these paths after the write.
 
-### timestamp — low — excluded project-wide
+### reentrancy-events — low — not reachable
 
-Excluded in `foundry.toml`'s `[lint]` section with its reason: `docs/CHAIN_FACTS.md`
-rules out `block.number` on this Arbitrum Nitro chain and specification section 1
-requires `block.timestamp` for all time logic. Reported here for completeness
-because Slither applies the detector regardless of the Foundry linter's settings.
+`CurveDeployer.deploy` emits after `new BondingCurve{value: msg.value}(...)`. The
+curve does not exist before that statement, so nothing can re-enter to reorder or
+fabricate the log.
 
 ### low-level-calls — informational — intended
 
 `BondingCurve._sendEth` uses `call` so that a recipient contract's failure to
 accept ETH is a revert of the claim rather than a permanently stuck balance.
-
-### dead-code — informational — false positive
-
-`_mintCore`, `_mintFloor`, `_restorePrice`, `_mintData`, `_floorLiquidity` and
-`_approvePositionManager` are reported as never used. They are called from
-`_settle` and from each other; `_settle` is one of the six functions that failed
-to parse. See section 1.
-
-### constable-states — informational — false positive
-
-`capReachedAt` and `graduatedAt` are reported as constant. They are written in
-`_buy` and `_settle` respectively, both of which failed to parse. See section 1.
 
 ---
 
@@ -195,7 +299,6 @@ to parse. See section 1.
 
 Recorded so that a green pipeline is not read as more than it is.
 
-- The six function bodies of section 1, which include all of graduation.
 - Economic behaviour. No detector can tell whether the curve's terminal price
   matches the pool's opening price, which is the property that removes the
   migration sandwich. That is `contracts/test/fork/` and the invariant suite.
@@ -203,3 +306,5 @@ Recorded so that a green pipeline is not read as more than it is.
   verified by fork test against the live deployment, not by analysis.
 - Anything in `docs/THREAT_MODEL.md` section 10, which lists what the design does
   not prevent at all.
+- Whether the analyser is analysing the program at all. Section 1 is the standing
+  evidence that this needs its own check, which is why CI has one.

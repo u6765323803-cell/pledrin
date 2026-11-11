@@ -27,8 +27,8 @@ This was conditional on the fork test named in the appendix proving that
 collect and increase execute as one `modifyLiquidities` call with no
 intermediate recipient. They do, in two different encodings, so the fallback —
 **no collection at all**, never a two-step version that holds funds between
-calls — is not taken. Which encoding ships was decision 12, now resolved to
-option B and shipped.
+calls — is not taken. Which encoding to use was decision 12, now resolved to
+option B and implemented.
 
 Because the lock is not upgradeable, this function must be written and
 reviewed as the riskiest code in the repository: it is the only code with a
@@ -274,20 +274,20 @@ live testnet launch-to-graduation before mainnet.
 
 ## 5. Per-launch curve deployment mechanism
 
-**RESOLVED FOR PHASE 1 2026-11-11 by what shipped: option A, a full deployment
-per launch.** The cost was not the deployment gas the trade-off below
+**RESOLVED FOR PHASE 1 2026-11-11 by what was implemented: option A, a full
+deployment per launch.** The cost was not the deployment gas the trade-off below
 anticipated; it was EIP-170. `BondingCurve`'s creation code (22,678 bytes) plus
 `LaunchFactory`'s own code does not fit in a 24,576-byte runtime, so the factory
 cannot carry it. A factory that did measured 45,134 bytes at 1,000,000 optimizer
 runs and 32,623 bytes at 200 runs with the IR pipeline, and one deployer carrying
 both `BondingCurve`'s and `PledrinToken`'s creation code measured 25.0 KB.
 
-What shipped instead is two single-purpose deployers that carry creation code and
-nothing else: `CurveDeployer` at 23,531 bytes, with **1,045 bytes of margin**, and
-`TokenDeployer`. Both are stateless, ownerless and permissionless and hold
-nothing. `docs/SPEC.md` sections 2.1 and 2.2 record the mechanism, the deployment
-order and the consequences; `docs/THREAT_MODEL.md` section 8.2 records what a
-stranger can do with a permissionless deployer.
+What was implemented instead is two single-purpose deployers that carry creation
+code and nothing else: `CurveDeployer` at 23,531 bytes, with **1,045 bytes of
+margin**, and `TokenDeployer`. Both are stateless, ownerless and permissionless
+and hold nothing. `docs/SPEC.md` sections 2.1 and 2.2 record the mechanism, the
+deployment order and the consequences; `docs/THREAT_MODEL.md` section 8.2
+records what a stranger can do with a permissionless deployer.
 
 The margin is now a constraint on unrelated work: roughly a kilobyte of new
 `BondingCurve` code makes `CurveDeployer` undeployable, at which point option B
@@ -324,6 +324,25 @@ protocol's highest-frequency write and a creator pays for it.
 then decide. B is a localised optimisation that can be made later without
 changing any interface or any invariant, so there is no reason to take its risk
 before the numbers justify it.
+
+### Addendum, 2026-11-11: the margin figures above are superseded
+
+The sizes quoted in the resolution above were measured before the post-terminal
+fee redirect of spec 6.3 landed. On the landed tree, read from the build
+artifacts: `CurveDeployer` 23,952 bytes with **624 bytes of margin**,
+`BondingCurve` 19,374, `LaunchFactory` 7,232, `TokenDeployer` 2,979, and
+`BondingCurve`'s creation code 23,099 of the deployer's 23,952. All 421 bytes of
+the margin lost are the redirect; the `transferOwnership` override and
+`FeeAccrued`'s `reserveCut` field each made code smaller, and the `SafeCast`
+binding change was byte-identical.
+
+The constraint stated above therefore binds harder than it reads: fewer than 624
+bytes of new `BondingCurve` code, not roughly a kilobyte, makes `CurveDeployer`
+undeployable, at which point option B or splitting the curve stops being
+optional. Spec 2.1 carries the current numbers and is the place to update; this
+addendum exists so that the superseded ones are not read as current.
+
+Nothing described in this entry has been deployed to any network.
 
 ---
 
@@ -558,7 +577,7 @@ hypothetical self-grief that A permits and that gains nobody anything.
 
 ## 12. Which v4 action pair the lock's compounding path uses
 
-**RESOLVED 2026-11-11: option B shipped.** `LiquidityLock.compound` encodes
+**RESOLVED 2026-11-11: option B implemented.** `LiquidityLock.compound` encodes
 `DECREASE_LIQUIDITY` with a hard-coded zero liquidity, then
 `INCREASE_LIQUIDITY_FROM_DELTAS` with `type(uint128).max` on both amounts, then
 two `CLOSE_CURRENCY`. No caller-supplied number reaches the call. `docs/SPEC.md`
@@ -663,8 +682,57 @@ make a test pass.
 
 ## 13. Fees charged on sells after a terminal transition
 
-Does not block Phase 1. Found while reconciling the specification against the
-Phase 1 contracts; it is a property of what shipped, not a defect.
+**RESOLVED 2026-11-11: option B, narrowed to the shares that have no payout
+path.** A trade in `Expired` or `Stalled` still charges the same fee and still
+splits it three ways with the same unchanged arithmetic; what changed is the
+destination of two of the three shares.
+
+| Share | `Expired` | `Stalled` | Why |
+|---|---|---|---|
+| creator | `ethReserve` | `creatorFeeEth` | `claimCreatorFees` requires `Graduated` or `Stalled`, so a share accrued in `Expired` could never be claimed. `Stalled` keeps the claim open, so nothing needs to move there. |
+| protocol | `protocolFeeEth` | `protocolFeeEth` | `claimProtocolFees` has no state gate and always had a path. Unchanged. |
+| holder protection | `ethReserve` | `ethReserve` | The bucket has no claim function at all; it is distributed only by a transition, and in a terminal state that transition has already happened. |
+
+`docs/SPEC.md` section 6.3 is the specification and Invariant 59 the testable
+form. Sections 5.5, 6.1, 6.2, 10.3 and 16.1 and Invariants 4 and 18 were adjusted
+to match.
+
+Why option B rather than this entry's own recommendation of A, and why narrowed:
+the destination is `ethReserve` because holder protection exists for holders and
+the reserve is the only thing holders sell against in a terminal state, which is
+already the destination the protocol chooses for the protection balance standing
+at the transition and for a forfeited bond. Only the two shares with no reachable
+claim move, because redirecting the protocol share as well would give up a fee
+the protocol is still earning on a market it is still providing — that was option
+C's cost, and it was never the problem. The redirect only adds to `ethReserve`
+without changing `tokensSold`, so it raises the solvency product and Invariant 1
+is unaffected; `ethReserve` therefore falls by less than `ethGross` on a
+post-terminal sell, which Invariant 4 now states.
+
+Why it was fixed rather than documented. The project's rule is to be honest about
+what cannot be prevented on-chain, not to be resigned about what can. Sybil
+wallets, a creator buying their own launch through fresh addresses and
+social-engineering rugs are limitations and are written down as limitations,
+because no deterministic on-chain rule closes them. A fee share accruing into a
+bucket with no claim function is not that: it is prevented by one branch in one
+internal function, with no new external surface, no new admin power, no oracle
+and no new trust assumption. The earlier recommendation of A rested entirely on
+not disturbing the fee path while the invariant suite was being written against
+it. That suite is now written: it asserts fee conservation as an inequality that
+holds either way and states the exact equality only pre-terminality, so the
+reason to defer has expired.
+
+Two things the implementation had to carry, both now in the spec. `Sold` must
+report the reserve **after** the redirect, or an indexer following `ethReserve`
+through events drifts by the redirected amount on every post-terminal sell.
+And `FeeAccrued` reports what each bucket actually received, so a redirected
+share reports zero there and the fee a terminal launch charged must be totalled
+from the `fee` field of `Bought` and `Sold` instead.
+
+Did not block Phase 1. Found while reconciling the specification against the
+Phase 1 contracts and first recorded here as a property of what was implemented
+rather than a defect. That classification was wrong: value that no address can
+ever reach is a defect when one branch removes it.
 
 ### Question
 
@@ -690,7 +758,7 @@ Should a terminal launch keep splitting its fee this way?
 
 ### Options
 
-**A. Keep it as shipped.** Simplest possible rule: a sell is a sell, the fee
+**A. Keep it as implemented.** Simplest possible rule: a sell is a sell, the fee
 arithmetic has no state-dependent branch, and the stranded wei raises nobody's
 cost and lowers nobody's payout. Cost: a small, permanent, unexplained-looking
 leak that an auditor will find and ask about, which is why it is written down
@@ -722,6 +790,24 @@ while the invariant suite is being written against the current behaviour; do add
 it if a future revision opens that function for another reason. Either way the
 behaviour stays documented in spec 6.2 and 10.3 rather than being left for an
 auditor to discover.
+
+### Addendum, 2026-11-11, after this entry was resolved
+
+Two notes that keep this record accurate without rewriting it.
+
+`FeeAccrued` has since gained a fifth parameter, `reserveCut`, carrying the
+redirected amount directly. The paragraph above that says a redirected share
+"reports zero there" and that the fee a terminal launch charged "must be
+totalled from the `fee` field of `Bought` and `Sold` instead" describes the
+event's earlier shape and is superseded. The four amounts of a single
+`FeeAccrued` now sum to that trade's fee in every state, so the event reconciles
+on its own and no reconstruction is needed. The final form is in spec sections
+6.3, 16 and 16.1 and in Invariant 59.
+
+No Pledrin contract has been deployed to any network. `docs/OWNER_TODO.md`
+records that mainnet deployment waits on an external audit, so every entry in
+this document that speaks of what was implemented means code in the repository
+and never code on a chain.
 
 ---
 

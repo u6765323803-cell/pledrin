@@ -144,21 +144,28 @@ attack; it is a donation with extra steps.
 ### 3.4 Fee accounting drift
 
 Accrued-but-unclaimed fees are tracked in three storage buckets, never pushed
-during a trade, and never commingled with `ethReserve`. Invariants 3 and 18
-assert that the contract's ETH balance covers every bucket plus the reserve plus
-the bond plus every credited-but-unclaimed payout, and that total fees charged
-equals total fees paid out plus total fees held. A leak in either direction fails
-a test.
+during a trade, and never commingled with `ethReserve` while a launch is `Live`.
+Invariants 3 and 18 assert that the contract's ETH balance covers every bucket
+plus the reserve plus the bond plus every credited-but-unclaimed payout, and that
+every wei of fee ever charged is still accounted for — by the buckets, by the
+claims paid out of them, by the credited bounty, and by the reserve or the locked
+floor position where a terminal transition sends them. A leak in either direction
+fails a test.
 
-One accounting fact is not drift but is worth stating here rather than being
-discovered in an audit: sells stay open after a terminal transition, so fees keep
-accruing, and some of those accruals have no payout path. The creator share of a
-sell made after `expire()`, and the holder-protection share of a sell made after
-either terminal transition, stay in their buckets permanently, because
-`claimCreatorFees` reverts in `Expired` and the one-time donation into
-`ethReserve` has already happened. Nobody can take that ETH; it simply leaves
-circulation. Spec 6.2 states it and decision 13 of `docs/OPEN_DECISIONS.md`
-records whether to change it.
+One accounting fact belongs here rather than in an auditor's findings, because it
+was a defect and was fixed rather than documented. Sells stay open after a
+terminal transition, so fees keep being charged, and two of the three buckets have
+no payout path at that point: `claimCreatorFees` reverts in `Expired`, and the
+holder-protection bucket has no claim function at all and is distributed only by
+a transition that has already happened. A share accrued into either of them after
+a terminal transition would have been unreachable by anyone, for good. It is
+therefore not accrued there. The holder-protection share in `Expired` and
+`Stalled`, and the creator share in `Expired`, are added to `ethReserve` instead,
+where they raise the exit price of every holder still selling; the protocol share
+is unchanged, because it always had a path. Spec 6.3 specifies the destinations,
+Invariant 59 asserts them, and decision 13 of `docs/OPEN_DECISIONS.md` records
+why this was fixed rather than written down as a limitation. A limitation is
+something on-chain code cannot prevent. This was not that.
 
 ### 3.5 Redirecting fees after launch
 
@@ -172,7 +179,10 @@ existing launch.
 ## 4. Griefing graduation
 
 This is the attack surface that matters most, because graduation is
-irreversible, happens once, and strands every holder if it cannot complete.
+irreversible, happens once, and strands every holder if it cannot complete. One
+further graduation grief — donating launch tokens to the curve before
+`graduate()` is called — is treated with the other donation attacks, in
+section 6.6.
 
 ### 4.1 Pre-initialising the pool at a hostile price
 
@@ -247,16 +257,17 @@ frontend should discourage, not a loss the protocol caused.
 
 After `ALT_DELAY = 1 hour` in `Graduating`, `graduateAlt(uint24 tickSpacing)`
 performs the identical procedure on a caller-supplied `tickSpacing` in
-`[10, 200]`, and requires that pool to be uninitialised so that it is
+`[10, 199]`, and requires that pool to be uninitialised so that it is
 initialised at `sqrtPriceTerminal` with no prior liquidity (Invariant 38). The
 range is a range of integers and not a list of canonical tiers, so the usable set
-is every spacing from 10 to 199 — 190 distinct pool keys. The endpoint 200 is in
-range but never usable, because it is the primary key's spacing and that pool was
-initialised at launch, so `graduateAlt(200)` reverts `AltPoolInitialized`; the
-range should not be read as a menu in either direction. An attacker must
-therefore pre-initialise and hold hostile liquidity on all 190 keys,
-continuously, for as long as the launch exists, and re-do it after every failed
-attempt. Each instance is a losing position.
+is every spacing from 10 to 199 — 190 distinct pool keys. The range stops one
+short of `POOL_TICK_SPACING = 200` so that this path can never name the canonical
+pool key, which the launch transaction already initialised: `graduateAlt(200)`
+reverts `InvalidTickSpacing` on the range check. The range should not be read as
+a menu in either direction. An attacker must therefore pre-initialise and hold
+hostile liquidity on all 190 keys, continuously, for as long as the launch
+exists, and re-do it after every failed attempt. Each instance is a losing
+position.
 
 The uninitialised requirement is load-bearing in a second way that is easy to
 miss, and must not be relaxed. Restoring a griefed price is free in both
@@ -390,7 +401,7 @@ What that attack can and cannot do:
 - The alternative encoding, `INCREASE_LIQUIDITY` with a caller-supplied
   liquidity, has a grief that costs only gas: call with a liquidity of 1, collect
   the whole accrued fee, compound almost none of it. That is why the deprecated
-  action is the one that shipped. Decision 12 records the comparison.
+  action is the one that is implemented. Decision 12 records the comparison.
 
 Two guards make the failure mode safe rather than silent: `compound` reverts
 `NothingToCompound` when the batch would add no liquidity — which is the ordinary
@@ -463,6 +474,77 @@ the tick range above the current tick. That deepens the floor for every holder
 and the depositor keeps their own position. Nothing about it harms the protocol or
 holders, and nothing about it gives the depositor access to the locked positions.
 
+### 6.6 Donating launch tokens to the curve before graduation
+
+Any address may transfer launch tokens to the curve at any time and ERC-20 gives
+the curve no way to refuse (6.3). The question this raises, and the one an
+auditor will ask, is whether such a transfer can reach the graduation mint's dust
+check and block graduation. The core position consumes at most `LP_SUPPLY` and
+the mint reverts `LpDustTooHigh` if the remainder exceeds
+`LP_DUST_MAX = 10**5` base units (spec 8.2 step 4, Invariant 39). If a donation
+could inflate that remainder, then any holder could revert `graduate()` for the
+price of tokens they already hold, repeat it for seven days until `GRAD_GRACE`
+expired, and leave `abortGraduation()` to put a launch that had already reached
+its cap into `Stalled` with no Uniswap pool at all. That would be a griefing
+vector against every holder of every capped launch, at a cost the attacker has
+already paid.
+
+It is not reachable, and the reason is a property of how the mint is measured
+rather than a check that could be added or forgotten:
+
+**The token the core mint consumes is measured as a delta across the mint call,
+and the remainder is `LP_SUPPLY` minus that delta. Neither quantity is ever read
+from an absolute balance after the call.**
+
+A donation `D` made at any time before graduation raises the reading taken before
+the call and the reading taken after it by the same `D`, so `D` cancels out of
+the difference. What the mint pulls is fixed by the position's parameters and
+capped at `LP_SUPPLY`; it is not a function of the curve's balance at any point.
+The remainder, and therefore the dust comparison, is identical to what it would
+have been with `D` equal to zero, and the donated tokens stay in the curve
+afterwards with no path out of it (6.3). Spec 8.2 step 4 states the measurement
+normatively and Invariant 60 asserts the consequence.
+
+**The trap, recorded so that nobody simplifies into it.** The obvious
+simplification of that check — read `token.balanceOf(address(this))` after the
+mint and treat the result as the remainder — introduces exactly the grief
+described above, because the curve's post-mint balance is the dust plus every
+token anyone ever sent it. It would read as a tidier version of the same
+assertion while turning a permissionless ERC-20 transfer into a way to hold a
+capped launch out of graduation until it stalled. The delta form is
+load-bearing and must be preserved by any future change to the mint.
+
+Two adjacent underflows, neither reachable and both safe in the direction they
+fail: a balance *increase* measured across the mint call would make the token
+delta underflow and revert the graduation, and a consumption above `LP_SUPPLY`
+would make the remainder underflow and revert it. Neither can happen, because no
+code a third party controls executes inside that call. The pool is hookless, so
+`modifyLiquidities` enters no hook, and **the only Pledrin code it enters is the
+curve's own `receive`**, which accepts value from PositionManager alone and
+reverts otherwise. Everything else it reaches is Uniswap v4's own contracts and
+the launch token, which has no transfer hook, no callback and no fee on transfer.
+
+`LiquidityLock.onERC721Received` is deliberately absent from that list. v4's
+PositionManager mints the position with `_mint`, which emits `Transfer` and
+invokes no receiver hook — only `safeTransferFrom` does — so the lock's
+callback is not on the graduation path at all. An earlier revision of this
+section named it as in-window code. That was an error, and dropping it narrows
+the window rather than weakening the argument: the set of code reachable inside
+the mint call is smaller than this section previously claimed, not larger. The
+callback's own properties matter on a different path, an unsolicited
+`safeTransferFrom` into the lock, and are covered in section 7 and
+Invariant 57.
+
+Were either underflow ever reached, the graduation would revert and the launch
+would stay frozen in `Graduating` with `graduate()` retryable forever and no
+value at risk, which is the same outcome as 4.3.
+
+A static analyser flags the before-and-after balance reading in that function as
+`reentrancy-balance`, because a balance read spans an external call. The verdict
+on that finding is recorded in `docs/SECURITY_NOTES.md`. This section covers the
+donation question only, which stands on the measurement property above
+independently of how the detector finding is resolved.
+
 ---
 
 ## 7. Reentrancy surfaces
@@ -487,7 +569,7 @@ and explains why. The complete enumeration:
 | `claimCreatorFees`, `claimProtocolFees`, `claimBounty`, `claimBond` | ETH to recipient | guard; bucket zeroed before the call |
 | `graduate`, `graduateAlt` | PoolManager `unlock`, PositionManager `modifyLiquidities`, `LiquidityLock.registerPosition` | guard; `state` set to `Graduated` as the first write, before any external call, so a reentrant `graduate` fails the state check (Invariant 36); the writes that follow the core mint are forced, because the floor amount is a function of what that mint consumed, and they are complete before the function's last external calls |
 | `unlockCallback` | PoolManager | reverts unless `msg.sender` is PoolManager and the curve is inside its own `unlock` (Invariant 56) |
-| `onERC721Received` | PositionManager | reverts unless `msg.sender` is PositionManager (Invariant 57) |
+| `onERC721Received` | PositionManager, on an unsolicited `safeTransferFrom` of a position NFT into the lock. Not reached by graduation: PositionManager mints with `_mint`, which invokes no receiver hook | reverts unless `msg.sender` is PositionManager (Invariant 57); declared `external view`, so it can write no storage, register no position and move no token, which is what makes an unsolicited NFT dead weight rather than a lever |
 | `expire`, `abortGraduation` | `CreatorVesting.start` / `void`, `LaunchFactory.record*` | terminal `state` written first; all callees protocol-internal and non-reentrant, called after every local write |
 | `CreatorVesting.createSchedule` | `token.transferFrom` from the caller | guard; the whole schedule is written, and the event emitted, before the pull; the schedule is keyed by the caller, so the pull can only move the caller's own tokens |
 | `CreatorVesting.release` | `token.transfer` to `creator` | guard; `released` incremented before the transfer |
@@ -502,6 +584,27 @@ Two notes that remove surfaces rather than guarding them:
 - No trade makes an outbound call to the creator or the treasury. Fees accrue to
   storage and are claimed separately, so a trade's call graph contains only the
   trader and the token.
+
+**One approval surface survives graduation, dormant.** The core mint grants a
+two-leg approval — the curve's ERC-20 allowance to Permit2, then a Permit2
+registration naming PositionManager as spender with
+`expiration = type(uint48).max` — and revokes only the ERC-20 leg, before the
+floor mint, exactly as spec 8.2 step 4 prescribes. The Permit2 registration
+itself is never revoked and outlives graduation, carrying whatever the core mint
+did not spend: at the default virtual reserve, 1,088 base units, around
+`10**-15` whole tokens. It is inert, because a Permit2 pull needs both legs and
+the ERC-20 leg is zero. It stays inert because no path can set that leg again:
+the curve grants an ERC-20 allowance in exactly two places, to `CreatorVesting`
+in the creator's first buy, which is reachable only while `tokensSold == 0`, and
+to Permit2 inside the core mint, which runs once. After graduation neither is
+reachable, and `Graduated` has no function that approves anything.
+
+The consequence is the part to keep in view, because "both legs are revoked" is
+the natural reading of that step and it is false: **adding any new ERC-20
+approval to Permit2 anywhere in the curve would turn a dormant, dust-sized
+registration into a live one**, and it would do so without touching the line that
+grants the registration. Invariant 61 pins both halves — the allowance is zero
+after graduation, and the core mint is the only place that sets it.
 
 ---
 
@@ -643,9 +746,9 @@ called `createLaunch`, and the protocol will treat those buys as public demand.
 
 Specifically:
 
-- `CREATOR_FIRST_BUY_MAX` caps the **disclosed, vested, badged** allocation at 2%
-  of supply. It does not cap what a creator can accumulate. A creator who wants
-  20% will buy 20% through fresh addresses, unvested and unlocked, and the
+- `CREATOR_FIRST_BUY_MAX` caps the **disclosed, vested, badged** allocation at
+  1.8% of supply. It does not cap what a creator can accumulate. A creator who
+  wants 20% will buy 20% through fresh addresses, unvested and unlocked, and the
   protocol will not know.
 - Volume, buyer count and the appearance of organic demand can all be
   manufactured by a creator trading with themselves. They pay the trading fee on

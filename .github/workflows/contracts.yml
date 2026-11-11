@@ -40,6 +40,25 @@ jobs:
       - name: Build
         run: forge build --sizes
 
+      # `contracts/abi/` is what the indexer and the web app build against, so an ABI
+      # change has to arrive in a reviewed commit rather than appear in a consumer's next
+      # build. The generator is deterministic — only the `abi` array, sorted keys, fixed
+      # indent — so a non-empty diff here means the committed ABIs no longer describe the
+      # contracts, and nothing else in the pipeline would notice.
+      - name: Check the frozen ABIs match the build
+        working-directory: ${{ github.workspace }}
+        run: |
+          ./.github/scripts/freeze-abi.sh
+          # `--intent-to-add` is what makes a NEW ABI file show up in `git diff`. Without
+          # it an untracked file is invisible to the diff and the check passes while a
+          # contract's ABI is absent from the repository entirely, which is the one case
+          # the check most needs to catch.
+          git add --intent-to-add contracts/abi
+          if ! git diff --exit-code -- contracts/abi; then
+            echo "::error::contracts/abi is stale. Run .github/scripts/freeze-abi.sh and commit the result."
+            exit 1
+          fi
+
   test:
     name: test
     runs-on: ubuntu-latest

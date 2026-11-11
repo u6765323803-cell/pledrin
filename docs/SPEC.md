@@ -17,8 +17,12 @@ protocol (sections 5.4, 11.3, 12 and 16.2, and Invariants 32, 62 and 63).
 Decisions 14 and 15 of `docs/OPEN_DECISIONS.md` were resolved into that round,
 and were the only two refusals this document had recorded as unsettled. Nothing
 in the round changed a condition under which a trade, a claim or a release
-succeeds. Where this document is silent, `docs/OPEN_DECISIONS.md` records the
-gap.
+succeeds. One later documentation gap is closed here and changed no code:
+section 16.2 now enumerates the two errors that are in the frozen ABI and in no
+refusal table, `InsufficientValue` and `CapAlreadyReached`, with the section
+that proves each unreachable and the record that keeping each is a decision
+(sections 5.4, 11.4 and 16.2). Where this document is silent,
+`docs/OPEN_DECISIONS.md` records the gap.
 
 All external addresses come from `docs/CHAIN_FACTS.md` and nowhere else. No
 address appears in this document that is not in that file.
@@ -473,6 +477,21 @@ exactly `net + fee`. The `require` is therefore a defensive assertion and not a
 reachable branch. It stays, and must not be deleted as dead code: if a future
 change to the fee rounding ever makes it reachable, the buy has to revert rather
 than underflow the refund subtraction on the next line.
+
+That guard has a name, and the name is in the frozen ABI:
+`CurveMath.InsufficientValue(uint256 available, uint256 required)`, where
+`available` is the value sent and `required` is `net + fee`. It appears in no
+refusal table in section 16.2 because no input reaches it, which is why it is
+recorded here instead. Its unreachability is established three ways and not one:
+by the proof above, which covers every input; by exhaustive search over small
+integers; and by a wider sweep at realistic reserves. **The error is kept
+deliberately. It must not be removed as dead code, and the branch it guards must
+not be narrowed to an unchecked subtraction.** Deleting it would turn a future
+rounding change from a revert into an underflow of the next line's `refund`,
+which is the one failure mode in this function that would not announce itself.
+This paragraph exists so that the next reader to find an unreachable revert in
+`CurveMath` finds the written record that its unreachability is known and that
+keeping it is the decision, rather than tidying it away.
 
 Step 5's `dT >= 1` is defensive in the same sense. A quote yields zero tokens
 only when the curve has nothing left to sell, and the buy that takes the last
@@ -1957,6 +1976,30 @@ front end needs no second read to interpret it and must not present it as
 anything other than what it is: resubmitting is the remedy. Reading
 `gradDeadline` remains worth doing to show how much of the window is left, and is
 no longer needed to decide what a refusal means.
+
+#### Errors in the ABI that no refusal table reaches
+
+The tables above enumerate the refusals a caller can actually receive. Two
+errors are in the frozen ABI and in none of them, because no input and no state
+reaches either. Both are kept deliberately. An integrator reading the ABI finds
+a selector, so each is named here with the section that proves it unreachable
+and the reason it stays:
+
+| Error | Declared in | Why unreachable | Section |
+|---|---|---|---|
+| `InsufficientValue(uint256 available, uint256 required)` | `CurveMath` | The clipped final buy never costs more than the value sent, for every input. Proved for all inputs, and separately confirmed by exhaustive small-integer search and by a sweep at realistic reserves. | 5.4 |
+| `CapAlreadyReached()` | `BondingCurve` | A `Live` launch sitting at the cap does not exist: the buy that reaches the cap moves the launch to `Graduating` in the same transaction. Reachable in a test only by writing the packed state byte directly. | 11.4 |
+
+Neither may be removed as dead code, and the guard behind neither may be
+narrowed to an unchecked operation. The reasons differ and both are stated where
+they belong: deleting `InsufficientValue`'s guard would convert a future
+rounding change into a silent underflow, and deleting `CapAlreadyReached` would
+move "a launch that delivered cannot expire" out of `expire()` and leave it
+inherited from `buy`.
+
+An error being absent from every refusal table is therefore a claim about
+reachability and not an omission. Any future change that makes either reachable
+is a change that must add it to a table in this section.
 
 ---
 

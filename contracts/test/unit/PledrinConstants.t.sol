@@ -207,7 +207,9 @@ contract PledrinConstantsTest is Test {
         assertEq(PledrinConstants.POOL_FEE, 10_000, "POOL_FEE");
         assertEq(PledrinConstants.POOL_TICK_SPACING, 200, "POOL_TICK_SPACING");
         assertEq(PledrinConstants.ALT_TICK_SPACING_MIN, 10, "ALT_TICK_SPACING_MIN");
-        assertEq(PledrinConstants.ALT_TICK_SPACING_MAX, 199, "ALT_TICK_SPACING_MAX");
+        assertEq(PledrinConstants.ALT_TICK_SPACING_MAX, 200, "ALT_TICK_SPACING_MAX");
+        assertEq(PledrinConstants.ALT_POOL_FEE_MIN, 3000, "ALT_POOL_FEE_MIN");
+        assertEq(PledrinConstants.ALT_POOL_FEE_MAX, 10_000, "ALT_POOL_FEE_MAX");
         assertEq(PledrinConstants.FLOOR_RANGE_TICKS, 13_800, "FLOOR_RANGE_TICKS");
         assertEq(PledrinConstants.MIN_FLOOR_WEI, 10 ** 12, "MIN_FLOOR_WEI");
         assertEq(PledrinConstants.MIN_BOND_WEI, 10 ** 16, "MIN_BOND_WEI");
@@ -225,34 +227,59 @@ contract PledrinConstantsTest is Test {
         assertEq(PledrinConstants.MAX_SYMBOL_BYTES, 16, "MAX_SYMBOL_BYTES");
     }
 
-    /// @notice The alternate tick-spacing window is a band strictly below the canonical
-    /// spacing, which is the property that makes `graduateAlt` an escape hatch rather than
-    /// a second route to the pool `graduate` owns.
-    /// @dev Pinning the relationship, not just the literal 199: a pool key is identified by
-    /// its currencies, fee and tick spacing, so an alternate spacing equal to
-    /// `POOL_TICK_SPACING` would produce the canonical key the launch transaction already
-    /// initialised. `graduateAlt`'s own purpose — reaching a *different*, uninitialised key
-    /// when the canonical one has been griefed — would then be unreachable through it, and
-    /// the call would fail later on the pool-state check instead of the range check. The
-    /// window must also be non-empty and lie wholly in the positive range Uniswap v4
-    /// accepts.
-    function test_theAlternateTickSpacingWindowSitsStrictlyBelowTheCanonicalSpacing() public pure {
-        assertLt(
-            PledrinConstants.ALT_TICK_SPACING_MAX,
-            PledrinConstants.POOL_TICK_SPACING,
-            "the alternate key must never be able to be the canonical key"
-        );
+    /// @notice **Invariant 67 at the constants.** The alternate key set is the product of
+    /// the two ranges minus the single canonical pair, and that one exclusion is the whole
+    /// mechanism that keeps `graduate` the only route to the canonical key.
+    /// @dev **This test asserted the opposite relationship until decision 22.** It required
+    /// `ALT_TICK_SPACING_MAX < POOL_TICK_SPACING`, so that the canonical key was outside the
+    /// alternate set by a gap in the spacing range. That gap also put the coarse canonical
+    /// spacing out of reach of every alternate key, which mattered because the restoring
+    /// swap's tick-bitmap walk is expensive at a fine spacing, and finding 3 of
+    /// `docs/security/REVIEW-2026-11-11-phase1-contracts.md` showed the gap bought nothing:
+    /// the keys it protected could be removed from the usable set by a bare `initialize` for
+    /// gas alone. The cap is now `POOL_TICK_SPACING` itself and the pair `(POOL_FEE,
+    /// POOL_TICK_SPACING)` is refused in `graduateAlt`. What is pinned here is therefore the
+    /// arithmetic of the set; the refusal itself is asserted against the contract in
+    /// `test/unit/BondingCurveGraduationGuards.t.sol`.
+    function test_theAlternateKeySetIsBothRangesMinusTheCanonicalPair() public pure {
         assertEq(
             PledrinConstants.ALT_TICK_SPACING_MAX,
-            PledrinConstants.POOL_TICK_SPACING - 1,
-            "and it is the largest spacing that is still strictly below it"
+            PledrinConstants.POOL_TICK_SPACING,
+            "the spacing range reaches the canonical spacing and stops there"
+        );
+        assertEq(
+            PledrinConstants.ALT_POOL_FEE_MAX,
+            PledrinConstants.POOL_FEE,
+            "and the fee range reaches the canonical fee, so no alternate pool is dearer"
         );
         assertLe(
             PledrinConstants.ALT_TICK_SPACING_MIN,
             PledrinConstants.ALT_TICK_SPACING_MAX,
-            "the window is non-empty"
+            "the spacing window is non-empty"
         );
         assertGt(PledrinConstants.ALT_TICK_SPACING_MIN, 0, "and strictly positive");
+        assertLe(
+            PledrinConstants.ALT_POOL_FEE_MIN,
+            PledrinConstants.ALT_POOL_FEE_MAX,
+            "the fee window is non-empty"
+        );
+        assertLe(
+            PledrinConstants.ALT_POOL_FEE_MAX,
+            1_000_000,
+            "and inside LPFeeLibrary.MAX_LP_FEE, which PoolManager.initialize enforces"
+        );
+        assertLe(
+            PledrinConstants.ALT_TICK_SPACING_MAX,
+            32_767,
+            "and the spacing inside TickMath.MAX_TICK_SPACING, enforced in the same place"
+        );
+
+        // The size of the set, which is the number section 8.4 and Invariant 67 quote.
+        uint256 fees = PledrinConstants.ALT_POOL_FEE_MAX - PledrinConstants.ALT_POOL_FEE_MIN + 1;
+        uint256 spacings = uint256(
+            int256(PledrinConstants.ALT_TICK_SPACING_MAX - PledrinConstants.ALT_TICK_SPACING_MIN)
+        ) + 1;
+        assertEq(fees * spacings - 1, 1_337_190, "Invariant 67: 1,337,190 usable keys");
     }
 
     /// @notice Section 4.1's creator first-buy ceiling, 18,000,000 whole tokens.

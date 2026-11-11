@@ -52,7 +52,7 @@ contract BondingCurveApprovalsTest is PledrinTestBase {
         (BondingCurve alternate, IERC20 alternateToken) = createLaunchAtCap();
         vm.warp(alternate.capReachedAt() + PledrinConstants.ALT_DELAY);
         vm.prank(GRADUATOR);
-        alternate.graduateAlt(100);
+        alternate.graduateAlt(PledrinConstants.POOL_FEE, 100);
         _assertGraduationLeftNoAllowance(alternate, alternateToken, "graduateAlt");
     }
 
@@ -103,7 +103,7 @@ contract BondingCurveApprovalsTest is PledrinTestBase {
         vm.expectRevert(
             abi.encodeWithSelector(IBondingCurve.WrongState.selector, IBondingCurve.State.Graduated)
         );
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
         assertEq(
             token.allowance(address(curve), address(permit2)), 0, "and the refusals grant nothing"
         );
@@ -254,7 +254,7 @@ contract BondingCurveApprovalsTest is PledrinTestBase {
         surface[7] = abi.encodeCall(IBondingCurve.claimBounty, (GRADUATOR));
         surface[8] = abi.encodeCall(IBondingCurve.abortGraduation, ());
         surface[9] = abi.encodeCall(IBondingCurve.expire, ());
-        surface[10] = abi.encodeCall(IBondingCurve.graduateAlt, (100));
+        surface[10] = abi.encodeCall(IBondingCurve.graduateAlt, (PledrinConstants.POOL_FEE, 100));
         surface[11] = abi.encodeCall(IBondingCurve.graduate, ());
         surface[12] = abi.encodeWithSignature("unlockCallback(bytes)", bytes(""));
         // A plain ETH send, which is the only thing `receive()` can be reached by.

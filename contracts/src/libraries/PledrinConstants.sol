@@ -52,17 +52,26 @@ library PledrinConstants {
 
     // --- Graduation and the Uniswap v4 pool (sections 8 and 10) ---
 
-    /// @notice LP fee of the graduated pool, in pips.
+    /// @notice LP fee of the canonical pool key, in pips.
     uint24 internal constant POOL_FEE = 10_000;
-    /// @notice Tick spacing of the primary pool key.
+    /// @notice Tick spacing of the canonical pool key.
     int24 internal constant POOL_TICK_SPACING = 200;
+    /// @notice Smallest LP fee `graduateAlt` accepts, in pips.
+    uint24 internal constant ALT_POOL_FEE_MIN = 3000;
+    /// @notice Largest LP fee `graduateAlt` accepts, in pips.
+    /// @dev Equal to `POOL_FEE` rather than above it, so an alternate pool is never more
+    /// expensive for a trader than the canonical pool would have been: an escape forced by
+    /// a transient attack can only make the graduated pool cheaper to trade.
+    uint24 internal constant ALT_POOL_FEE_MAX = POOL_FEE;
     /// @notice Smallest tick spacing `graduateAlt` accepts.
     int24 internal constant ALT_TICK_SPACING_MIN = 10;
     /// @notice Largest tick spacing `graduateAlt` accepts.
-    /// @dev Strictly below `POOL_TICK_SPACING`, so the alternate key is always a different
-    /// pool than the one the launch transaction initialised. At 200 the "alternative" pool
-    /// key would be the canonical pool key, which is the one key `graduate` exists for.
-    int24 internal constant ALT_TICK_SPACING_MAX = 199;
+    /// @dev Equal to `POOL_TICK_SPACING`, so the alternate set contains keys at the
+    /// canonical, coarse spacing and a caller never has to accept the tick-bitmap walk a
+    /// fine spacing imposes on the restoring swap. What keeps `graduate` the only path to
+    /// the canonical key is the refusal of the single pair `(POOL_FEE, POOL_TICK_SPACING)`,
+    /// not a gap in either range.
+    int24 internal constant ALT_TICK_SPACING_MAX = POOL_TICK_SPACING;
     /// @notice Width of the holder-protection band, counted upward in tick terms.
     int24 internal constant FLOOR_RANGE_TICKS = 13_800;
     /// @notice De-minimis threshold below which the floor position is not minted.

@@ -8,9 +8,12 @@ import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
+import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
 
+import {ActionConstants} from "v4-periphery/src/libraries/ActionConstants.sol";
+import {Actions} from "v4-periphery/src/libraries/Actions.sol";
 import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {PositionInfo} from "v4-periphery/src/libraries/PositionInfoLibrary.sol";
 
@@ -22,6 +25,7 @@ import {PledrinConstants} from "src/libraries/PledrinConstants.sol";
 import {TickAlign} from "src/libraries/TickAlign.sol";
 
 import {PoolSwapHelper} from "../helpers/PoolSwapHelper.sol";
+import {PositionHolder} from "../helpers/PositionHolder.sol";
 import {ForkBase} from "./ForkBase.sol";
 
 /// @title Graduation end to end against the live Uniswap v4 deployment
@@ -83,6 +87,10 @@ contract GraduationForkTest is ForkBase {
         uint256 coreId = POSITION_MANAGER.nextTokenId();
         uint256 creatorBalanceBefore = CREATOR.balance;
         uint256 treasuryBalanceBefore = TREASURY.balance;
+        // Read before the mint, because the mint is what moves it. Zero unless somebody
+        // has left a native balance in the live PositionManager; the two assertions below
+        // that would otherwise be false by exactly this much carry it explicitly.
+        uint256 stray = strayInPositionManager();
 
         vm.prank(TRADER);
         curve.graduate();
@@ -93,8 +101,9 @@ contract GraduationForkTest is ForkBase {
         assertEq(curve.protectionEth(), 0, "and the protection pool deposited");
         assertEq(
             unassignedEth(curve),
-            0,
-            "measured: a graduated launch keeps no ETH beyond its unclaimed buckets"
+            stray,
+            "measured: a graduated launch keeps no ETH beyond its unclaimed buckets, except"
+            " whatever the mint's sweep carried in from PositionManager"
         );
 
         // Invariant 39: the measured token dust at the default reserve.
@@ -151,7 +160,12 @@ contract GraduationForkTest is ForkBase {
         );
         assertGt(TREASURY.balance, treasuryBalanceBefore, "the treasury was paid");
         assertGt(bounty, 0, "the bounty was non-zero");
-        assertEq(address(curve).balance, 0, "and the launch now holds nothing at all");
+        assertEq(
+            address(curve).balance,
+            stray,
+            "and the launch now holds nothing at all beyond the swept stray, which is"
+            " immobilised there under Invariant 43"
+        );
     }
 
     /// @notice **Invariant 42 and section 10.1.** The floor position is an ETH bid in the
@@ -340,6 +354,7 @@ contract GraduationForkTest is ForkBase {
         uint256 reserve = curve.ethReserve();
         uint256 protection = curve.protectionEth();
         uint256 coreId = POSITION_MANAGER.nextTokenId();
+        uint256 stray = strayInPositionManager();
 
         vm.prank(TRADER);
         curve.graduate();
@@ -350,37 +365,56 @@ contract GraduationForkTest is ForkBase {
         assertEq(ownerOfPosition(coreId), address(lock), "the core position is locked");
         assertEq(ownerOfPosition(coreId + 1), address(lock), "and the floor position");
         assertEq(
-            curveBalanceBefore - address(curve).balance,
+            curveBalanceBefore + stray - address(curve).balance,
             reserve + protection,
-            "Invariant 41: the restoring swap cost the curve nothing"
+            "Invariant 41: the restoring swap cost the curve nothing. The stray is on the"
+            " left because the mint's sweep adds it to the curve's balance, so the fall is"
+            " smaller by that much without anything extra having left"
         );
     }
 
-    /// @notice **Invariant 38.** After `ALT_DELAY` a launch can graduate on an
-    /// uninitialised alternate tick spacing, and only on one.
-    function test_graduateAltOpensAnUninitialisedPoolOnAnotherSpacing() public {
+    /// @notice **Invariants 38, 67 and 69 on the real deployment.** After `ALT_DELAY` a
+    /// launch graduates on a caller-chosen alternate key, and the only pair refused is the
+    /// canonical one.
+    /// @dev The alternate spacing range reaches `POOL_TICK_SPACING` since decision 22, so
+    /// 200 is inside it and the canonical *pair* is what `graduateAlt` refuses. That matters
+    /// on the real chain more than in the stand-in: the restoring swap walks the real tick
+    /// bitmap, and a caller forced onto a fine spacing pays for it, so being able to pick
+    /// the coarse canonical spacing at another fee is the point of the change.
+    function test_graduateAltOpensAnAlternateKeyOnTheRealDeployment() public {
         (BondingCurve curve, IERC20 token) = createLaunch(defaultParams());
         buyToCap(curve);
 
         vm.expectRevert(IBondingCurve.AltDelayNotElapsed.selector);
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
 
         vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
 
         vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 9));
-        curve.graduateAlt(9);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 9);
         vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 201));
-        curve.graduateAlt(201);
-        // The primary spacing is outside the alternate window, which stops at 199, so the
-        // range check rejects it before the pool-state check is reached. The alternate key
-        // can therefore never be the canonical key the launch transaction initialised.
-        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 200));
-        curve.graduateAlt(uint24(int24(PledrinConstants.POOL_TICK_SPACING)));
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 201);
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidPoolFee.selector, 2999));
+        curve.graduateAlt(2999, 100);
+        // The canonical pair, which is the one pair outside the usable set. Both of its
+        // fields are individually permitted, which is why the refusal is its own error.
+        vm.expectRevert(IBondingCurve.CanonicalKeyNotAllowed.selector);
+        curve.graduateAlt(
+            PledrinConstants.POOL_FEE, uint24(int24(PledrinConstants.POOL_TICK_SPACING))
+        );
 
         uint256 coreId = POSITION_MANAGER.nextTokenId();
-        curve.graduateAlt(100);
+        vm.recordLogs();
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
 
-        PoolKey memory altKey = poolKeyFor(address(token), 100);
+        // **Invariant 69.** The key the graduation used, rebuilt from the one log.
+        GraduatedLog memory log = graduatedLog(address(curve));
+        assertEq(log.fee, PledrinConstants.POOL_FEE, "the fee the log reports");
+        assertEq(log.tickSpacing, 100, "and the spacing");
+        PoolKey memory altKey = poolKeyFor(address(token), log.fee, log.tickSpacing);
+        assertEq(log.poolId, PoolId.unwrap(altKey.toId()), "Invariant 69: the whole key");
+        assertNotEq(log.poolId, PoolId.unwrap(curve.poolId()), "which is not the canonical key");
+
         (uint160 price, int24 tick,,) = POOL_MANAGER.getSlot0(altKey.toId());
         assertEq(price, curve.sqrtPriceTerminal(), "the alt pool opened at the terminal price");
         assertEq(tick, DEFAULT_TERMINAL_TICK, "at the same tick");
@@ -395,6 +429,233 @@ contract GraduationForkTest is ForkBase {
             abi.encodeWithSelector(IBondingCurve.WrongState.selector, IBondingCurve.State.Graduated)
         );
         curve.graduate();
+    }
+
+    // ------------------------------------------------------------------
+    // Finding 1, against the contract that actually sweeps
+    // ------------------------------------------------------------------
+
+    /// @notice **Invariant 60's `S` quantifier and Invariant 70, on the real
+    /// PositionManager.** A native balance parked in PositionManager before `graduate()` is
+    /// swept into the curve and changes nothing else about the graduation.
+    /// @dev This is the half of finding 1 that only the real contract can settle. The
+    /// deterministic suite asserts the same property against a stand-in whose `SWEEP` was
+    /// *modelled*, and the model was wrong for a release: it refunded `msg.value - amount0`
+    /// where `PositionManager._sweep` sends `currency.balanceOfSelf()`, the entire balance.
+    /// Here the sweep is the deployed code. Differential, run twice from the same forked
+    /// state, because a single successful graduation with a stray in place would also pass
+    /// against a saturating balance delta that still mis-reports the event.
+    ///
+    /// `vm.deal` is the faithful way to park it: the real `receive()` refuses ETH from
+    /// anyone but PoolManager and WETH9, and the three routes that work in production —
+    /// `SELFDESTRUCT`, a block reward, and a batch that forwards more value than it settles
+    /// — all arrive without running any of PositionManager's code, which is what `vm.deal`
+    /// does.
+    function test_aStrayBalanceInTheRealPositionManagerIsSweptAndChangesNothing() public {
+        (BondingCurve curve,) = createLaunch(defaultParams());
+        buyToCap(curve);
+
+        uint256 coreId = POSITION_MANAGER.nextTokenId();
+        uint256 snapshot = vm.snapshotState();
+
+        vm.recordLogs();
+        vm.prank(TRADER);
+        curve.graduate();
+        GraduatedLog memory baseline = graduatedLog(address(curve));
+        uint128 baselineCoreLiquidity = POSITION_MANAGER.getPositionLiquidity(coreId);
+        uint128 baselineFloorLiquidity = POSITION_MANAGER.getPositionLiquidity(coreId + 1);
+        uint256 baselineCurveBalance = address(curve).balance;
+        uint256 baselinePoolBalance = address(POOL_MANAGER).balance;
+
+        assertTrue(vm.revertToState(snapshot), "the pre-graduation state was restored");
+
+        // More than the whole raise, and more than the `ethToCore` the pre-fix balance
+        // delta would have subtracted it from — which is what made that subtraction
+        // underflow and revert both graduation paths.
+        uint256 stray = uint256(curve.ethTarget()) + 1 ether;
+        vm.deal(address(POSITION_MANAGER), strayInPositionManager() + stray);
+
+        vm.recordLogs();
+        vm.prank(TRADER);
+        curve.graduate();
+        GraduatedLog memory strayed = graduatedLog(address(curve));
+
+        assertEq(abi.encode(strayed), abi.encode(baseline), "Invariant 60: the same graduation");
+        assertEq(
+            POSITION_MANAGER.getPositionLiquidity(coreId),
+            baselineCoreLiquidity,
+            "the same core liquidity"
+        );
+        assertEq(
+            POSITION_MANAGER.getPositionLiquidity(coreId + 1),
+            baselineFloorLiquidity,
+            "Invariant 70: and the same floor liquidity"
+        );
+        assertEq(
+            address(POOL_MANAGER).balance,
+            baselinePoolBalance,
+            "the pool received not one wei of the stray"
+        );
+        assertEq(
+            address(curve).balance,
+            baselineCurveBalance + stray,
+            "Invariant 43: the curve's balance is higher by exactly the stray"
+        );
+        assertEq(
+            strayInPositionManager(), 0, "and the real sweep took the whole balance, as it does"
+        );
+    }
+
+    /// @notice **The golden `ethToCore`, measured against the real deployment.**
+    /// @dev Since `5b86188`, `Graduated.ethToCore` is computed from `SqrtPriceMath`,
+    /// `TickMath` and `LiquidityAmounts` rather than read off a balance, and it is in the
+    /// log an indexer records — so a library bump that changes a rounding direction changes
+    /// protocol output. What makes the literal a measurement rather than a tautology is the
+    /// second half of this test: the real PoolManager's balance rises by exactly
+    /// `ethToCore + ethToFloor`, so the number the curve computed is the number Uniswap
+    /// charged. `test/unit/CoreMintArithmetic.t.sol` re-derives it from the specification
+    /// and pins the two ends of the reserve range.
+    function test_ethToCoreIsTheComputedNumberAndIsWhatUniswapCharges() public {
+        (BondingCurve curve,) = createLaunch(defaultParams());
+        buyToCap(curve);
+
+        uint256 poolBefore = address(POOL_MANAGER).balance;
+        uint256 curveBefore = address(curve).balance;
+        uint256 stray = strayInPositionManager();
+
+        vm.recordLogs();
+        vm.prank(TRADER);
+        curve.graduate();
+        GraduatedLog memory log = graduatedLog(address(curve));
+
+        assertEq(
+            log.ethToCore,
+            3_999_999_999_999_998_912,
+            "measured: the core mint's ETH cost at the default reserve"
+        );
+        assertEq(
+            uint256(curve.ethTarget()) - log.ethToCore,
+            1088,
+            "1,088 wei of headroom under amount0Max, which is exactly R_target"
+        );
+        assertEq(
+            address(POOL_MANAGER).balance - poolBefore,
+            log.ethToCore + log.ethToFloor,
+            "and both legs are what the real PoolManager was actually paid"
+        );
+        assertEq(
+            curveBefore + stray - address(curve).balance,
+            log.ethToCore + log.ethToFloor,
+            "which is also what left the curve"
+        );
+    }
+
+    /// @notice **Invariants 64 and 66 on the real deployment.** A launch whose canonical key
+    /// was opened by somebody else, at a foreign price, with a real third-party position on
+    /// it, is created and graduates on that key, and the stranger's position is untouched.
+    /// @dev Both halves of decision 22 against the deployed PoolManager. The key is seized
+    /// before the launch exists, using nothing but the deployer's address and nonce. The
+    /// liquidity has to come afterwards, because a position on a token that has not been
+    /// deployed cannot be funded — which is itself worth recording: the pre-launch seizure
+    /// can set a price and nothing else.
+    function test_aSeizedCanonicalKeyWithRealLiquidityChangesNothing() public {
+        address predicted =
+            vm.computeCreateAddress(address(tokenDeployer), vm.getNonce(address(tokenDeployer)));
+        PoolKey memory canonical = poolKeyFor(predicted, PledrinConstants.POOL_TICK_SPACING);
+        uint160 foreign = TickMath.getSqrtPriceAtTick(100_000);
+
+        // The seizure, for the price of one `initialize`.
+        POOL_MANAGER.initialize(canonical, foreign);
+        (uint160 opened,,,) = POOL_MANAGER.getSlot0(canonical.toId());
+        assertEq(opened, foreign, "a stranger chose the opening price");
+
+        vm.recordLogs();
+        (BondingCurve curve, IERC20 token) = createLaunch(defaultParams());
+        assertEq(address(token), predicted, "the seized key was this launch's key");
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Live), "Invariant 64: created");
+        (uint160 afterLaunch,,,) = POOL_MANAGER.getSlot0(curve.poolId());
+        assertEq(afterLaunch, foreign, "and the launch left the foreign price alone");
+
+        buyToCap(curve);
+
+        // A stranger now mints a real position on that key, in ETH alone, in a band above
+        // the terminal tick so the price does not move.
+        PositionHolder stranger = new PositionHolder(POSITION_MANAGER);
+        uint256 strangerId = POSITION_MANAGER.nextTokenId();
+        _mintEthOnlyPosition(stranger, canonical, 180_000, 200_000, 3 ether);
+        uint128 strangerLiquidity = POSITION_MANAGER.getPositionLiquidity(strangerId);
+        assertGt(strangerLiquidity, 0, "the stranger holds liquidity on the launch's own key");
+        assertEq(ownerOfPosition(strangerId), address(stranger), "which is theirs");
+
+        uint256 coreId = POSITION_MANAGER.nextTokenId();
+        vm.recordLogs();
+        vm.prank(TRADER);
+        curve.graduate();
+        GraduatedLog memory log = graduatedLog(address(curve));
+
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "Graduated");
+        assertEq(log.poolId, PoolId.unwrap(canonical.toId()), "on the seized key");
+        assertEq(
+            log.ethToCore,
+            3_999_999_999_999_998_912,
+            "Invariant 66: the same ethToCore as an untouched key"
+        );
+        assertEq(
+            log.tokensToCore,
+            PledrinConstants.LP_SUPPLY - 1088,
+            "Invariant 66: and the same token leg"
+        );
+        assertEq(log.positionIdCore, coreId, "the core position is the next id");
+        assertEq(ownerOfPosition(coreId), address(lock), "and it is locked");
+        assertEq(
+            POSITION_MANAGER.getPositionLiquidity(strangerId),
+            strangerLiquidity,
+            "Invariant 66: the stranger's liquidity is untouched"
+        );
+        assertEq(ownerOfPosition(strangerId), address(stranger), "and still theirs");
+        (uint160 priceAfter,,,) = POOL_MANAGER.getSlot0(curve.poolId());
+        assertEq(priceAfter, curve.sqrtPriceTerminal(), "Invariant 40 held through the mint");
+    }
+
+    /// @dev Mints a position funded in `currency0` alone, owned by `holder`, in a band
+    /// strictly above the current tick. One `MINT_POSITION`, `SETTLE_PAIR`, `SWEEP` batch —
+    /// the same three actions the protocol uses — with `amount1Max` at zero, so no token
+    /// and no Permit2 approval is involved.
+    function _mintEthOnlyPosition(
+        PositionHolder holder,
+        PoolKey memory key,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 value
+    ) private {
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmount0(
+            TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), value
+        );
+        bytes memory actions = abi.encodePacked(
+            uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR), uint8(Actions.SWEEP)
+        );
+        bytes[] memory params = new bytes[](3);
+        params[0] = abi.encode(
+            key,
+            tickLower,
+            tickUpper,
+            uint256(liquidity),
+            uint128(value),
+            uint128(0),
+            address(holder),
+            bytes("")
+        );
+        params[1] = abi.encode(key.currency0, key.currency1);
+        params[2] = abi.encode(key.currency0, ActionConstants.MSG_SENDER);
+
+        vm.deal(address(holder), value);
+        (bool ok, bytes memory ret) =
+            holder.tryModify{value: value}(abi.encode(actions, params), vm.getBlockTimestamp());
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(ret, 0x20), mload(ret))
+            }
+        }
     }
 
     /// @notice Section 9 and decision 1 of `docs/OPEN_DECISIONS.md`: the lock's one

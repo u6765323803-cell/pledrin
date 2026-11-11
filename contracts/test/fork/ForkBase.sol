@@ -2,6 +2,7 @@
 pragma solidity 0.8.38;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -150,13 +151,89 @@ abstract contract ForkBase is Test {
     }
 
     function poolKeyFor(address token, int24 tickSpacing) internal pure returns (PoolKey memory) {
+        return poolKeyFor(token, PledrinConstants.POOL_FEE, tickSpacing);
+    }
+
+    /// @notice A pool key for a launch token at any fee and spacing, which is what
+    /// `graduateAlt` chooses between. `hooks` is always the zero address.
+    function poolKeyFor(address token, uint24 fee, int24 tickSpacing)
+        internal
+        pure
+        returns (PoolKey memory)
+    {
         return PoolKey({
             currency0: CurrencyLibrary.ADDRESS_ZERO,
             currency1: Currency.wrap(token),
-            fee: PledrinConstants.POOL_FEE,
+            fee: fee,
             tickSpacing: tickSpacing,
             hooks: IHooks(address(0))
         });
+    }
+
+    /// @notice The native balance the **live** PositionManager holds right now.
+    /// @dev Zero whenever nobody has left anything there, which is the ordinary case and
+    /// was the case when these tests were written. It does not have to be: a v4 batch that
+    /// forwards more value than it settles leaves the remainder in PositionManager, and
+    /// `SELFDESTRUCT` bypasses the `receive()` sender check. Whatever is there when a
+    /// graduation runs is swept into the curve by the core mint's closing `SWEEP`, so the
+    /// assertions about what a graduated launch holds are higher by exactly this amount
+    /// and name it rather than assume it away. Finding 1 of
+    /// `docs/security/REVIEW-2026-11-11-phase1-contracts.md`; before that finding was
+    /// fixed the graduation would have reverted instead.
+    function strayInPositionManager() internal view returns (uint256) {
+        return address(POSITION_MANAGER).balance;
+    }
+
+    /// @notice Every field of one `Graduated` log, indexed topics included.
+    struct GraduatedLog {
+        bytes32 poolId;
+        address caller;
+        uint24 fee;
+        int24 tickSpacing;
+        uint256 positionIdCore;
+        uint256 positionIdFloor;
+        uint256 ethToCore;
+        uint256 ethToFloor;
+        uint256 tokensToCore;
+        uint256 bounty;
+    }
+
+    /// @notice The eight non-indexed fields of `Graduated`, in ABI order.
+    struct GraduatedData {
+        uint24 fee;
+        int24 tickSpacing;
+        uint256 positionIdCore;
+        uint256 positionIdFloor;
+        uint256 ethToCore;
+        uint256 ethToFloor;
+        uint256 tokensToCore;
+        uint256 bounty;
+    }
+
+    /// @notice The first `Graduated` log a launch emitted in the recording, decoded.
+    /// @dev Requires `vm.recordLogs()` beforehand. `caller` is indexed, so the data carries
+    /// eight words: `fee`, `tickSpacing` and the six amounts.
+    function graduatedLog(address curve) internal view returns (GraduatedLog memory log) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 topic = keccak256(
+            "Graduated(address,bytes32,uint24,int24,uint256,uint256,uint256,uint256,uint256,uint256,address)"
+        );
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != topic || logs[i].emitter != curve) continue;
+            GraduatedData memory data = abi.decode(logs[i].data, (GraduatedData));
+            log.poolId = logs[i].topics[2];
+            log.caller = address(uint160(uint256(logs[i].topics[3])));
+            log.fee = data.fee;
+            log.tickSpacing = data.tickSpacing;
+            log.positionIdCore = data.positionIdCore;
+            log.positionIdFloor = data.positionIdFloor;
+            log.ethToCore = data.ethToCore;
+            log.ethToFloor = data.ethToFloor;
+            log.tokensToCore = data.tokensToCore;
+            log.bounty = data.bounty;
+            return log;
+        }
+        revert("no Graduated event");
     }
 
     function ownerOfPosition(uint256 tokenId) internal view returns (address) {

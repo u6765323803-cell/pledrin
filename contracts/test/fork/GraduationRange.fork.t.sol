@@ -28,6 +28,11 @@ import {ForkBase} from "./ForkBase.sol";
 contract GraduationRangeForkTest is ForkBase {
     using StateLibrary for IPoolManager;
 
+    /// @dev PositionManager's native balance just before the last `_graduateAt` mint, and
+    /// the `Graduated` log it produced.
+    uint256 private _strayAtGraduation;
+    GraduatedLog private _lastLog;
+
     /// @notice The smallest permitted raise, 0.1 ETH. The token shortfall is the largest
     /// the range produces and is still four orders of magnitude inside `LP_DUST_MAX`.
     function test_graduatesAtTheSmallestPermittedRaise() public {
@@ -39,7 +44,7 @@ contract GraduationRangeForkTest is ForkBase {
             token.balanceOf(address(curve)), 28_428, "measured: 28,428 base units at vE0 = 1.25e16"
         );
         assertLe(token.balanceOf(address(curve)), PledrinConstants.LP_DUST_MAX, "Invariant 39");
-        assertEq(unassignedEth(curve), 0, "no ETH is stranded");
+        assertEq(unassignedEth(curve), _strayAtGraduation, "no ETH is stranded beyond the sweep");
 
         (, int24 tick,,) = POOL_MANAGER.getSlot0(curve.poolId());
         assertEq(tick, 207_243, "section 8.1: the terminal tick at the smallest raise");
@@ -48,6 +53,58 @@ contract GraduationRangeForkTest is ForkBase {
         assertEq(floorInfo.tickLower(), 207_400, "the floor band starts above the tick");
         assertEq(floorInfo.tickUpper(), 221_200, "and is FLOOR_RANGE_TICKS wide");
         assertGt(floorInfo.tickLower(), tick, "Invariant 42");
+
+        // **Finding 7, measured.** The ETH headroom under `amount0Max` — which is exactly
+        // `R_target` and must not be tightened — is at its smallest anywhere in the
+        // permitted range here. 172 wei at the canonical spacing. If it ever went negative
+        // `validateMaxIn` would revert the mint, graduation would be impossible for the
+        // launch, and `abortGraduation` into `Stalled` with no pool would be the only exit,
+        // so it is pinned to the wei rather than bounded.
+        assertEq(
+            _lastLog.ethToCore,
+            99_999_999_999_999_828,
+            "measured: the core mint's ETH cost at MIN_VIRTUAL_ETH_RESERVE, spacing 200"
+        );
+        assertEq(uint256(curve.ethTarget()) - _lastLog.ethToCore, 172, "172 wei of headroom");
+    }
+
+    /// @notice The same launch size on the finest permitted spacing, where the headroom is
+    /// **171 wei** — the smallest number anywhere in the permitted parameter space.
+    /// @dev Finding 7 asks for both spacings at this reserve, and this is the harder one:
+    /// `tickUpper` is `alignDown(MAX_TICK, 10)` rather than `alignDown(MAX_TICK, 200)`, so
+    /// the core position's range is wider and its `currency0` requirement a wei higher.
+    /// Measured against the deployed PositionManager, which is what charges it.
+    function test_theEthHeadroomAtTheSmallestRaiseOnTheFinestSpacing() public {
+        ILaunchFactory.LaunchParams memory params = defaultParams();
+        params.name = "Edge10";
+        params.symbol = "EDGE10";
+        params.virtualEthReserve = PledrinConstants.MIN_VIRTUAL_ETH_RESERVE;
+        (BondingCurve curve, IERC20 token) = createLaunch(params);
+        buyToCap(curve);
+
+        vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
+        uint256 coreId = POSITION_MANAGER.nextTokenId();
+        uint256 poolBefore = address(POOL_MANAGER).balance;
+
+        vm.recordLogs();
+        vm.prank(TRADER);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 10);
+        GraduatedLog memory log = graduatedLog(address(curve));
+
+        assertEq(log.tickSpacing, 10, "on the finest permitted spacing");
+        assertEq(
+            log.ethToCore,
+            99_999_999_999_999_829,
+            "measured: the core mint's ETH cost at MIN_VIRTUAL_ETH_RESERVE, spacing 10"
+        );
+        assertEq(uint256(curve.ethTarget()) - log.ethToCore, 171, "171 wei of headroom");
+        assertEq(
+            address(POOL_MANAGER).balance - poolBefore,
+            log.ethToCore + log.ethToFloor,
+            "and that is what the real PoolManager was paid"
+        );
+        assertEq(ownerOfPosition(coreId), address(lock), "the core position is locked");
+        assertLe(token.balanceOf(address(curve)), PledrinConstants.LP_DUST_MAX, "Invariant 39");
     }
 
     /// @notice The largest permitted raise, 1000 ETH. The token shortfall is the smallest
@@ -59,7 +116,7 @@ contract GraduationRangeForkTest is ForkBase {
         assertEq(curve.ethTarget(), 1000 ether, "R_target");
         assertEq(token.balanceOf(address(curve)), 240, "measured: 240 base units at vE0 = 1.25e20");
         assertLe(token.balanceOf(address(curve)), PledrinConstants.LP_DUST_MAX, "Invariant 39");
-        assertEq(unassignedEth(curve), 0, "no ETH is stranded");
+        assertEq(unassignedEth(curve), _strayAtGraduation, "no ETH is stranded beyond the sweep");
 
         (, int24 tick,,) = POOL_MANAGER.getSlot0(curve.poolId());
         assertEq(tick, 115_135, "section 8.1: the terminal tick at the largest raise");
@@ -68,6 +125,16 @@ contract GraduationRangeForkTest is ForkBase {
         assertEq(floorInfo.tickLower(), 115_200, "the floor band starts above the tick");
         assertEq(floorInfo.tickUpper(), 129_000, "and is FLOOR_RANGE_TICKS wide");
         assertGt(floorInfo.tickLower(), tick, "Invariant 42");
+
+        // The other end of the headroom: 17,205 wei at the largest permitted raise. Section
+        // 8.2 called the headroom non-monotone in `virtualEthReserve`; over the permitted
+        // range it rises from 171 at the bottom to this.
+        assertEq(
+            _lastLog.ethToCore,
+            999_999_999_999_999_982_795,
+            "measured: the core mint's ETH cost at MAX_VIRTUAL_ETH_RESERVE, spacing 200"
+        );
+        assertEq(uint256(curve.ethTarget()) - _lastLog.ethToCore, 17_205, "17,205 wei");
     }
 
     /// @notice **Invariant 51 and 50 together, on the live chain.** A configuration change
@@ -181,8 +248,15 @@ contract GraduationRangeForkTest is ForkBase {
 
         buyToCap(curve);
         coreId = POSITION_MANAGER.nextTokenId();
+        // Whatever the live PositionManager holds when the mint runs is swept into the
+        // curve, so the "nothing is stranded" assertions are higher by exactly this much.
+        // Zero unless somebody left a balance there. Finding 1 of
+        // `docs/security/REVIEW-2026-11-11-phase1-contracts.md`.
+        _strayAtGraduation = strayInPositionManager();
+        vm.recordLogs();
         vm.prank(TRADER);
         curve.graduate();
+        _lastLog = graduatedLog(address(curve));
 
         assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "Graduated");
         assertEq(curve.ethReserve(), 0, "Invariant 43");

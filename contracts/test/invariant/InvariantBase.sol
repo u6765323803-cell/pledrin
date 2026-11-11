@@ -92,5 +92,8 @@ abstract contract InvariantBase is PledrinTestBase {
         console2.log("claims", handler.claims());
         console2.log("new launches", handler.newLaunches());
         console2.log("time jumps", handler.timeJumps());
+        console2.log("strays parked in PositionManager", handler.strayParkings());
+        console2.log("  total wei parked", handler.strayParkedWei());
+        console2.log("graduation attempts that panicked", handler.graduationPanics());
     }
 }

@@ -463,7 +463,7 @@ contract BondingCurveLifecycleTest is PledrinTestBase {
         // the clock stands. Not warping is also what keeps this helper's own claim exact —
         // the state it asserts at the end is the state every call above it saw.
         vm.expectRevert(wrongState);
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
 
         vm.expectRevert(wrongState);
         curve.abortGraduation();

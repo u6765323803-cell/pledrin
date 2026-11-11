@@ -382,10 +382,20 @@ than an exception to it. The row above had been measured against a tree that
 moved twice before anyone compared against it, so the difference anyone computed
 from it was drift and not the cost of the change they were looking at. The cause
 is procedural and spec 2.1 now states the rule it implies: a commit that changes
-`BondingCurve` updates the size table in the same commit. At 527 bytes the next
-change has to be measured against the commit it lands on, and quoting a figure
-from a document instead is how a contract becomes undeployable in CI rather than
-at review.
+`BondingCurve` updates the size table in the same commit. The next change has to
+be measured against the commit it lands on, and quoting a figure from a document
+instead is how a contract becomes undeployable in CI rather than at review.
+
+**Third addendum: 527 is now 886, and the budget this entry worries about is no
+longer the binding one.** Decision 22's implementation took `CurveDeployer` to
+23,690 bytes by removing a duplicated graduation body the compiler's inliner had
+been producing, which is 359 bytes recovered by a change set that adds
+functionality. Spec 2.1 has the measurement, the full ledger and the rule that
+keeps it: `_settle` must not be given a literal-valued argument, because that is
+what let the inliner duplicate the body. Option B and splitting the curve are
+further off than they were this morning, and the reason is a compiler decision
+rather than a design one — which is its own argument for measuring whole change
+sets instead of reasoning about parts.
 
 Nothing described in this entry has been deployed to any network.
 
@@ -1501,10 +1511,34 @@ once.
 ## 22. The precondition graduation places on its pool key
 
 **DECIDED 2026-11-11 by the protocol architect, prompted by findings 2 and 3 of
-`docs/security/REVIEW-2026-11-11-phase1-contracts.md`. Not implemented.
-`contracts/src` still carries the design this entry refuses; the four changes in
-the recommendation are the engineer's work and nothing described here has been
-deployed to any network.**
+`docs/security/REVIEW-2026-11-11-phase1-contracts.md`. Changes 1, 2 and 4 are
+implemented in `contracts/src`; change 3, `GraduationHelper`, is specified in
+spec 8.6 and not yet written. Nothing described here has been deployed to any
+network.**
+
+**One deviation from the design, recorded because the equivalence it rests on is
+load-bearing.** The shared graduation body is `_settle(PoolKey)`, deriving
+whether `ALT_DELAY` applies from the key's `fee` and `tickSpacing`, rather than
+`_settle(fee, tickSpacing, bool alternate)` as this entry's change 1 implies. The
+two are equivalent by Invariant 67 and not by accident: `graduate` can name
+nothing but the canonical pair, and `graduateAlt` refuses that pair before the
+body runs, so the delay fires on exactly the set of calls the flag would have
+fired on. A change to the permitted alternate ranges is therefore a change to
+this derivation. The deviation was forced by EIP-170 and it is the reason the
+change set fits at all — spec 2.1 records that the flag form measured 25,445
+bytes, 869 over the limit, because a literal argument lets the inliner duplicate
+the whole graduation body once per call site. Spec 8.2 carries the prohibition
+that follows.
+
+**Two measurements from the implementation that contradict this entry's
+estimates, left in place below rather than corrected in line, because the error
+is instructive.** The margin went **up**: `CurveDeployer` is 23,690 bytes with
+**886 free**, 359 fewer bytes than before a change set that adds a conditional
+`initialize`, a two-field alternate key, three new refusals, a new event and two
+event fields. And the estimate's component figures were about right while its
+total was wrong by the opposite sign, because `_settle` is not a function in the
+compiled output and the components do not add. Spec 2.1 states the rule that
+follows: measure the whole change set, never the parts.
 
 The decision in one statement, and it is normative:
 
@@ -1769,8 +1803,12 @@ Taken together the four give one rule per case, and no case has no answer:
 getter changes type, and `graduate()` keeps its signature and stays
 non-payable — which is the difference between this recommendation and option F.
 
-**EIP-170.** `CurveDeployer`'s runtime is 24,049 bytes at commit `5b86188`, read
-from `contracts/out/CurveDeployer.sol/CurveDeployer.json`, so the margin is
+**EIP-170, as estimated before the change was built.** The figures in this
+paragraph and the table under it are the pre-implementation estimate and are
+superseded by the measurement at the head of this entry; they are kept because
+the way the estimate failed is recorded at the end of them.
+`CurveDeployer`'s runtime was 24,049 bytes at commit `5b86188`, read from
+`contracts/out/CurveDeployer.sol/CurveDeployer.json`, so the margin was
 **527 bytes**. Neither the 596 this entry was briefed with nor the 448 an earlier
 revision of this paragraph recorded is current, and both were correct when they
 were taken: 596 is exactly the margin at `81b8d77`, the commit before finding 1's
@@ -1795,14 +1833,22 @@ charged at full price. Order of magnitude, per change:
 
 Net: **low hundreds of bytes, plausibly under a hundred**, and the sign is not
 certain because the branch collapse in `_settle` may pay for the fee plumbing.
-That is affordable against 527 bytes only if measured rather than assumed, and
-the measurement has to be taken against `5b86188` or later. If the margin does
-not hold, the order to drop in is: the `PoolPreInitialized` event first, since it
-is telemetry; then the fee widening, which costs the alternate path its
-robustness but leaves the blocker fixed; and never change 1, because change 1 is
-the finding. If dropping all of that is still not enough, decision 5's option B
-or splitting the curve stops being optional, which spec 2.1 has said since it was
-written.
+That is affordable against 527 bytes only if measured rather than assumed. If the
+margin does not hold, the order to drop in is: the `PoolPreInitialized` event
+first, since it is telemetry; then the fee widening, which costs the alternate
+path its robustness but leaves the blocker fixed; and never change 1, because
+change 1 is the finding. If dropping all of that is still not enough, decision
+5's option B or splitting the curve stops being optional, which spec 2.1 has said
+since it was written.
+
+**What the build said.** The sign was wrong and so was the reasoning behind the
+one line of this estimate that was hedged. "The branch collapse in `_settle` may
+pay for the fee plumbing" had it backwards: collapsing the branches **cost** 551
+bytes, because the two call sites each held a copy of the body with a different
+branch folded out, and merging the branches made both copies complete. Nothing in
+the component estimates was far off and the total came out 359 bytes to the good
+anyway, for a reason none of them could contain. The order-to-drop-in above was
+never needed and is left standing because the next change may need it.
 
 **What is not spent.** No curve ETH, in any case, on any path. No new admin
 power, no new privileged address, no oracle, no new trust in anything. The

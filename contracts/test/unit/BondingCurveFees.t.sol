@@ -373,12 +373,8 @@ contract BondingCurveFeesTest is PledrinTestBase {
         assertGt(creatorFees, 0, "and the creator had accrued fees to lose as well");
 
         (,, uint256 exitBefore) = curve.quoteSell(holding);
-        (,, uint256 exitWithoutTheBond) = CurveMath.sellQuote(
-            uint256(curve.virtualEthReserve()) + reserveBefore + creatorFees + protection,
-            PledrinConstants.VIRTUAL_TOKEN_RESERVE - curve.tokensSold(),
-            curve.totalFeeBps(),
-            holding
-        );
+        uint256 exitWithoutTheBond =
+            _exitPriceWithout(curve, bond, reserveBefore + creatorFees + protection, holding);
 
         vm.warp(curve.gradDeadline());
         vm.prank(OTHER);
@@ -414,6 +410,25 @@ contract BondingCurveFeesTest is PledrinTestBase {
         assertEq(received, exitAfter, "the holder exits at the raised price");
         assertEq(TRADER.balance - traderBefore, received, "and is paid it in full");
         assertGt(received, exitWithoutTheBond, "including the wei the creator forfeited");
+    }
+
+    /// @dev The net a holder would receive if everything expiry forfeits **except** the
+    /// bond had reached the reserve. A separate function because the stack frame of the
+    /// test above does not fit the four-argument library call on the legacy codegen, which
+    /// is what `forge coverage` compiles with.
+    function _exitPriceWithout(
+        BondingCurve curve,
+        uint256 excluded,
+        uint256 donated,
+        uint256 holding
+    ) private view returns (uint256 net) {
+        require(excluded != 0, "nothing was excluded");
+        (,, net) = CurveMath.sellQuote(
+            uint256(curve.virtualEthReserve()) + donated,
+            PledrinConstants.VIRTUAL_TOKEN_RESERVE - curve.tokensSold(),
+            curve.totalFeeBps(),
+            holding
+        );
     }
 
     /// @notice **Invariant 44.** The graduation bounty comes out of the protocol's own

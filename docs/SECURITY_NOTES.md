@@ -15,7 +15,7 @@ The configuration lives in `contracts/slither.config.json` rather than in CI
 arguments, so a reviewer running the command above analyses the same set of
 contracts with the same detectors as the pipeline.
 
-As of this revision Slither reports **27 findings across 8 detectors**,
+As of this revision Slither reports **28 findings across 9 detectors**,
 generates an intermediate representation for every function in `src`, and
 `--fail-high` exits **0**:
 
@@ -23,7 +23,7 @@ generates an intermediate representation for every function in `src`, and
 |---|---|---|
 | Medium | 13 | `unused-return` 9, `divide-before-multiply` 2, `incorrect-equality` 1, `locked-ether` 1 |
 | Low | 13 | `timestamp` 8, `reentrancy-benign` 4, `reentrancy-events` 1 |
-| Informational | 1 | `low-level-calls` |
+| Informational | 2 | `low-level-calls`, `cyclomatic-complexity` |
 
 None is a defect. One high-impact finding, `reentrancy-balance`, is carried by an
 inline directive at its single site rather than by a configuration change, so the
@@ -309,6 +309,32 @@ be a third party. No value moves on any of these paths after the write.
 curve does not exist before that statement, so nothing can re-enter to reorder or
 fabricate the log.
 
+### cyclomatic-complexity — informational — true, and accepted
+
+`BondingCurve`'s constructor measures 12 against Slither's threshold of 11. It
+was at 11 before decision 22 and the pre-initialised-pool branch put it over.
+
+The finding is accurate rather than noisy: that constructor validates a
+fourteen-field configuration, deploys the launch token, checks the supply
+landed, records the bond, and now tolerates a pool key a third party may already
+have opened. A reviewer does have to hold all of that at once.
+
+It is accepted rather than refactored, and the reason is the opposite of the one
+that keeps `reentrancy-balance` suppressed. There, restructuring would have made
+the code worse. Here, extracting the configuration checks into a private
+function would be harmless — the IR inliner folds it straight back, so the
+bytecode is identical — and that is exactly why it is not worth doing: the same
+logic would run, a reviewer would have to understand the same amount, and the
+only thing that would change is a number going under a threshold. A verdict that
+says the constructor is complex and why is more use to an auditor than a count
+that no longer trips.
+
+What a reviewer should check there, since this entry is the place to say it: that
+the `getSlot0` test is a test and not a caught revert, so every other failure
+mode of `initialize` still reverts the launch; and that the token's supply
+assertion is exact equality, so a token that is not the one the deployer made
+cannot pass.
+
 ### low-level-calls — informational — intended
 
 `BondingCurve._sendEth` uses `call` so that a recipient contract's failure to
@@ -329,3 +355,78 @@ Recorded so that a green pipeline is not read as more than it is.
   not prevent at all.
 - Whether the analyser is analysing the program at all. Section 1 is the standing
   evidence that this needs its own check, which is why CI has one.
+
+---
+
+## 4. The two branches the suite never takes
+
+The deterministic suite measures **99.84% of lines (613/614) and 98.51% of
+branches (132/134)** against the 95% the project requires. Two branches are never
+taken, and neither is a gap in the suite: no input reaches either, and in both
+cases that is established by proof over all inputs rather than by a search that
+happened to find nothing.
+
+That distinction is the whole reason this section exists. An unsearched branch
+and a proved-unreachable one are indistinguishable in a coverage report, so a
+reviewer who cannot tell them apart has to treat the second as the first. Both
+guards are kept, neither may be deleted as dead code or narrowed to an unchecked
+operation, and the reason is the same for both: unreachability holds because of
+specific rounding directions in library code this repository vendors and does not
+own. A dependency bump that changes one of those directions makes the guard live,
+which is the event each exists to survive.
+
+### `CurveMath.sol:58` — `InsufficientValue` inside `buyQuote`'s clipped branch
+
+`docs/SPEC.md` section 5.4 proves this unreachable for every input and records
+that keeping it is a decision. It was re-derived independently during this round
+and the two derivations agree; nothing here supersedes that proof. What is worth
+adding is where the margin comes from, because it is narrower than "the buyer
+sent enough":
+
+- entering the clipped branch requires
+  `floor(vT*netMax/(vE + netMax)) > remaining`, which forces
+  `netMax >= ceil(vE*remaining/(vT - remaining))` — exactly the clipped cost. So
+  the clipped net never exceeds the net the buyer already sent.
+- the fee on that clipped net is bounded by the fee already taken:
+  `netMax <= value*(D - f)/D` gives
+  `ceil(netMax*f/(D - f)) <= ceil(value*f/D)`.
+
+The two together give `required <= value` identically, with equality attainable —
+a clipped buy whose refund is zero. The guard therefore becomes live the moment
+either `mulDivRoundingUp` in that branch is changed to round the other way, and
+what it would then prevent is an underflow of the next line's `refund`: the one
+failure mode in that function that would not announce itself.
+
+### `BondingCurve.sol:923` — `_floorLiquidity`'s one-wei fallback
+
+Read from the vendored source during this round rather than carried over from the
+comment above it, and the result is **stronger than that comment claims**: the
+double rounding-up the fallback guards against cannot overshoot at all.
+
+With `a = sqrtLower`, `b = sqrtUpper`, `A = floorEth`:
+
+- `LiquidityAmounts.getLiquidityForAmount0` computes `I = floor(a*b/2^96)` and
+  then `L = floor(A*I/(b - a))`. Its `toUint128` reverts on overflow rather than
+  truncating, and truncation would only lower `L` in any case.
+- `SqrtPriceMath.getAmount0Delta(a, b, L, true)` computes
+  `ceil(ceil(L*2^96*(b - a)/b)/a)`.
+
+Nested ceiling division composes exactly: for positive integers,
+`ceil(ceil(x/b)/a) = ceil(x/(a*b))`, because each side is `<= k` exactly when
+`x <= k*a*b`. So the amount required is **one** rounding, not two. And the two
+floors give `L*(b - a) <= A*I <= A*a*b/2^96`, hence
+`L*2^96*(b - a)/(a*b) <= A`; `A` is an integer, so its ceiling is `<= A` as well.
+The test `> floorEth` is false for every `(a, b, A)` — not merely for every
+permitted one, so there is no crafted direct call either. The security review's
+50,000-run search found no counterexample because there is none to find.
+
+Three rounding choices over the same `(a, b)` hold this up: both floors in
+`getLiquidityForAmount0` and the round-up in `getAmount0Delta`. A v4-periphery
+bump that rounded `intermediate` up would make the fallback live, and graduation
+would revert without it.
+
+One consequence worth stating because it is not obvious from the code: the same
+bound applies on each side of `LiquidityLock`'s compounding batch, so that batch
+cannot require more than the credit it was given. `compound` therefore cannot
+revert for a rounding reason, and the only reverts it can produce are its two
+deliberate ones.

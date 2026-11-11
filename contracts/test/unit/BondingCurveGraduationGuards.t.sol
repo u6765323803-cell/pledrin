@@ -3,7 +3,10 @@ pragma solidity 0.8.38;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
@@ -19,6 +22,8 @@ import {PledrinConstants} from "src/libraries/PledrinConstants.sol";
 import {TickAlign} from "src/libraries/TickAlign.sol";
 
 import {PledrinTestBase} from "../base/PledrinTestBase.sol";
+import {AtomicRestorer} from "../helpers/AtomicRestorer.sol";
+import {PoolSwapHelper} from "../helpers/PoolSwapHelper.sol";
 
 /// @title Graduation's guards, the alternate pool key, and the de-minimis floor
 /// @notice Covers `docs/SPEC.md` sections 8.2, 8.4 and 10.1, and Invariants 37, 38, 39,
@@ -41,14 +46,14 @@ contract BondingCurveGraduationGuardsTest is PledrinTestBase {
         uint256 capReachedAt = curve.capReachedAt();
 
         vm.expectRevert(IBondingCurve.AltDelayNotElapsed.selector);
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
 
         vm.warp(capReachedAt + PledrinConstants.ALT_DELAY - 1);
         vm.expectRevert(IBondingCurve.AltDelayNotElapsed.selector);
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
 
         vm.warp(capReachedAt + PledrinConstants.ALT_DELAY);
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
         assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "Graduated");
     }
 
@@ -80,58 +85,92 @@ contract BondingCurveGraduationGuardsTest is PledrinTestBase {
         vm.expectRevert(
             abi.encodeWithSelector(IBondingCurve.WrongState.selector, IBondingCurve.State.Graduated)
         );
-        graduated.graduateAlt(100);
+        graduated.graduateAlt(PledrinConstants.POOL_FEE, 100);
 
         vm.expectRevert(IBondingCurve.AltDelayNotElapsed.selector);
-        graduating.graduateAlt(100);
+        graduating.graduateAlt(PledrinConstants.POOL_FEE, 100);
 
+        // **Invariant 67.** All three calldata refusals precede the state check, in both
+        // states.
         vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 201));
-        graduated.graduateAlt(201);
+        graduated.graduateAlt(PledrinConstants.POOL_FEE, 201);
         vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 201));
-        graduating.graduateAlt(201);
+        graduating.graduateAlt(PledrinConstants.POOL_FEE, 201);
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidPoolFee.selector, 2999));
+        graduated.graduateAlt(2999, 100);
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidPoolFee.selector, 2999));
+        graduating.graduateAlt(2999, 100);
+        vm.expectRevert(IBondingCurve.CanonicalKeyNotAllowed.selector);
+        graduated.graduateAlt(
+            PledrinConstants.POOL_FEE, uint24(int24(PledrinConstants.POOL_TICK_SPACING))
+        );
+        vm.expectRevert(IBondingCurve.CanonicalKeyNotAllowed.selector);
+        graduating.graduateAlt(
+            PledrinConstants.POOL_FEE, uint24(int24(PledrinConstants.POOL_TICK_SPACING))
+        );
 
         assertEq(uint8(graduated.state()), uint8(IBondingCurve.State.Graduated), "unmoved");
         assertEq(uint8(graduating.state()), uint8(IBondingCurve.State.Graduating), "and unmoved");
     }
 
-    /// @notice **Invariant 38's first half.** Only a tick spacing inside
-    /// `[ALT_TICK_SPACING_MIN, ALT_TICK_SPACING_MAX]` is accepted: one outside on each side
-    /// is rejected, and both bounds themselves graduate.
-    /// @dev `ALT_TICK_SPACING_MAX` is 199, one below `POOL_TICK_SPACING`, so the top of the
-    /// window is an ordinary alternate key: uninitialised, and graduation there is a
-    /// complete graduation rather than a revert. 200 is therefore *outside* the window and
-    /// the range check rejects it before the pool-state check is ever reached, which is why
-    /// the error here is `InvalidTickSpacing(200)` and not `AltPoolInitialized`. The
-    /// distinction is load-bearing: the range check is what guarantees the alternate key
-    /// can never be the canonical key, so a caller cannot reach `graduate`'s pool through
-    /// `graduateAlt` even on a launch whose canonical pool was never initialised.
-    /// `test_graduateAltRequiresAnUninitialisedPool` covers `AltPoolInitialized` itself.
-    function test_graduateAltAcceptsOnlyThePermittedTickSpacings() public {
+    /// @notice **Invariant 67.** `graduateAlt` accepts `fee` in `[3000, 10000]` and
+    /// `tickSpacing` in `[10, 200]`, narrowed through `SafeCast`, and refuses exactly one
+    /// pair out of the 1,337,190: the canonical `(POOL_FEE, POOL_TICK_SPACING)`.
+    /// @dev `ALT_TICK_SPACING_MAX` was 199 until decision 22, one below
+    /// `POOL_TICK_SPACING`, and the gap in the range was what kept the alternate key away
+    /// from the canonical one. It no longer is: the spacing range now *includes* 200, and
+    /// what keeps `graduate` the only path to the canonical key is the refusal of that one
+    /// pair. The distinction is the point of this test. A caller who wants the coarse
+    /// canonical spacing — and they will, because a fine spacing imposes a tick-bitmap walk
+    /// on the restoring swap — can have it at any other fee.
+    function test_graduateAltAcceptsOnlyThePermittedFeesAndTickSpacings() public {
         (BondingCurve curve,) = createLaunchAtCap();
         vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
 
+        // The spacing range, one outside on each side.
         vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 0));
-        curve.graduateAlt(0);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 0);
         vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 9));
-        curve.graduateAlt(9);
-        // One above the window, and the canonical spacing itself, which is the first value
-        // above it. Both fail on the range check.
-        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 200));
-        curve.graduateAlt(uint24(int24(PledrinConstants.POOL_TICK_SPACING)));
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 9);
         vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidTickSpacing.selector, 201));
-        curve.graduateAlt(201);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 201);
 
-        curve.graduateAlt(uint24(int24(PledrinConstants.ALT_TICK_SPACING_MIN)));
-        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "the lower bound");
+        // A spacing that does not fit in an `int24` is refused by the cast rather than by
+        // the range check, which is the narrowing Invariant 67 names.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SafeCast.SafeCastOverflowedIntDowncast.selector, 24, int256(8_388_608)
+            )
+        );
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 8_388_608);
+
+        // The fee range, one outside on each side.
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidPoolFee.selector, 2999));
+        curve.graduateAlt(2999, 100);
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.InvalidPoolFee.selector, 10_001));
+        curve.graduateAlt(10_001, 100);
+
+        // And the one refused pair, which is inside both ranges.
+        vm.expectRevert(IBondingCurve.CanonicalKeyNotAllowed.selector);
+        curve.graduateAlt(
+            PledrinConstants.POOL_FEE, uint24(int24(PledrinConstants.POOL_TICK_SPACING))
+        );
+        // Either field moved by one makes it another key, and both of those are accepted.
+        curve.graduateAlt(
+            PledrinConstants.POOL_FEE - 1, uint24(int24(PledrinConstants.POOL_TICK_SPACING))
+        );
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "9999 / 200");
 
         (BondingCurve other, IERC20 otherToken) = createLaunchAtCap();
         vm.warp(other.capReachedAt() + PledrinConstants.ALT_DELAY);
-        other.graduateAlt(uint24(int24(PledrinConstants.ALT_TICK_SPACING_MAX)));
-        assertEq(uint8(other.state()), uint8(IBondingCurve.State.Graduated), "the upper bound");
+        other.graduateAlt(
+            PledrinConstants.POOL_FEE, uint24(int24(PledrinConstants.POOL_TICK_SPACING)) - 1
+        );
+        assertEq(uint8(other.state()), uint8(IBondingCurve.State.Graduated), "10000 / 199");
 
-        // The upper bound graduated onto its own key, and left the canonical key, which the
-        // launch transaction initialised, untouched at the terminal price.
-        PoolKey memory altKey = _key(address(otherToken), PledrinConstants.ALT_TICK_SPACING_MAX);
+        // That launch graduated onto its own key and left the canonical key, which its own
+        // launch transaction opened, untouched at the terminal price.
+        PoolKey memory altKey = _key(address(otherToken), PledrinConstants.POOL_TICK_SPACING - 1);
         (uint160 altPrice,) = poolManager.slot0(altKey.toId());
         assertEq(altPrice, other.sqrtPriceTerminal(), "the 199 key opened at the terminal price");
         assertNotEq(
@@ -139,26 +178,102 @@ contract BondingCurveGraduationGuardsTest is PledrinTestBase {
             PoolId.unwrap(other.poolId()),
             "and it is not the canonical key"
         );
+        (uint160 canonicalPrice,) = poolManager.slot0(other.poolId());
+        assertEq(canonicalPrice, other.sqrtPriceTerminal(), "which is still at that price too");
+
+        // Every corner of the two ranges graduates. One launch each, because a launch
+        // graduates once.
+        _assertAltKeyGraduates(PledrinConstants.ALT_POOL_FEE_MIN, 10);
+        _assertAltKeyGraduates(PledrinConstants.ALT_POOL_FEE_MIN, 200);
+        _assertAltKeyGraduates(PledrinConstants.ALT_POOL_FEE_MAX, 10);
+        _assertAltKeyGraduates(PledrinConstants.ALT_POOL_FEE_MAX, 199);
     }
 
-    /// @notice **Invariant 38's second half.** `graduateAlt` requires the alternate pool to
-    /// be uninitialised, so it opens it itself at `sqrtPriceTerminal` with nothing to
-    /// restore. Section 8.4 explains why this must not be relaxed.
-    function test_graduateAltRequiresAnUninitialisedPool() public {
+    /// @dev One fresh launch graduated on one alternate key, asserting the key it landed on
+    /// is the key it was given — which is Invariant 69 read off the log.
+    function _assertAltKeyGraduates(uint24 fee, uint24 tickSpacing) private {
+        (BondingCurve curve, IERC20 token) = createLaunchAtCap();
+        vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
+
+        vm.recordLogs();
+        curve.graduateAlt(fee, tickSpacing);
+
+        GraduatedLog memory log = graduatedLog(address(curve));
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "graduated");
+        assertEq(log.fee, fee, "Invariant 69: the fee the key used");
+        assertEq(uint24(int24(log.tickSpacing)), tickSpacing, "Invariant 69: and the spacing");
+        assertEq(
+            log.poolId,
+            PoolId.unwrap(poolKeyFor(address(token), fee, int24(uint24(tickSpacing))).toId()),
+            "Invariant 69: the key is reconstructible from the log and token()"
+        );
+    }
+
+    /// @notice **Invariant 38.** `graduateAlt` accepts an alternate key somebody else has
+    /// already opened, at any price, and restores the price instead of refusing the key.
+    /// @dev **This test asserted the opposite until decision 22**, and the assertion was
+    /// the defect: `graduateAlt` required an uninitialised pool, and a bare `initialize`
+    /// costs about 47,000 gas with no capital and nothing at risk, so all of the then-190
+    /// alternate keys could be removed from the usable set for pennies. Finding 3 of
+    /// `docs/security/REVIEW-2026-11-11-phase1-contracts.md`. What replaces the refusal is
+    /// the machinery the canonical key already had: restore the price for free, assert it,
+    /// then mint. The price a stranger opened the key at reaches nothing.
+    function test_graduateAltAcceptsAnAlreadyOpenAlternateKey() public {
         (BondingCurve curve, IERC20 token) = createLaunchAtCap();
         vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
 
         // Somebody opens the alternate key first, at a price of their choosing.
         PoolKey memory altKey = _key(address(token), 100);
         poolManager.initialize(altKey, TickMath.getSqrtPriceAtTick(100_000));
+        assertEq(poolManager.initializedPoolCount(), 2, "the canonical key and the seized one");
 
-        vm.expectRevert(IBondingCurve.AltPoolInitialized.selector);
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
 
-        // Another spacing is still available, and the launch graduates there.
-        curve.graduateAlt(60);
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "it graduated there");
+        (uint160 price,) = poolManager.slot0(altKey.toId());
+        assertEq(price, curve.sqrtPriceTerminal(), "at the terminal price, restored not opened");
+        assertEq(poolManager.swapCalls(), 1, "by exactly one restoring swap");
+        assertEq(poolManager.initializedPoolCount(), 2, "and nothing was initialised a second time");
+    }
+
+    /// @notice An alternate key already open **at the terminal price** needs no swap at all.
+    /// @dev The cheapest case, and one a third party can arrange deliberately: moving a
+    /// zero-liquidity pool costs nothing, so anybody can set a key up for a graduation that
+    /// then performs no swap of its own.
+    function test_graduateAltOnAnOpenKeyAlreadyAtTheTerminalPriceSwapsNothing() public {
+        (BondingCurve curve, IERC20 token) = createLaunchAtCap();
+        vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
+
+        poolManager.initialize(_key(address(token), 100), curve.sqrtPriceTerminal());
+
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
+
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "graduated");
+        assertEq(poolManager.swapCalls(), 0, "nothing to restore");
+    }
+
+    /// @notice Liquidity in the restoring swap's path still blocks **that key**, and the
+    /// launch is not stuck: every other key in the set remains available.
+    /// @dev This is what the refusal has become. A griefer can raise the cost of one
+    /// particular key, by holding liquidity on it rather than by opening it, and the caller
+    /// picks another of the 1,337,190.
+    function test_liquidityInTheSwapPathBlocksOneAlternateKeyAndNotTheLaunch() public {
+        (BondingCurve curve, IERC20 token) = createLaunchAtCap();
+        vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
+
+        poolManager.initialize(_key(address(token), 100), TickMath.getSqrtPriceAtTick(100_000));
+        poolManager.setSwapDelta(-1, 0);
+
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.SwapNotFree.selector, -1, 0));
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduating), "state is frozen");
+
+        // Another key, which nobody has touched, and the graduation completes.
+        poolManager.setSwapDelta(0, 0);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 60);
         (uint160 price,) = poolManager.slot0(_key(address(token), 60).toId());
         assertEq(price, curve.sqrtPriceTerminal(), "the alt pool opened at the terminal price");
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "graduated");
     }
 
     /// @notice A graduation on the alternate key mints the same two positions, on the
@@ -168,7 +283,7 @@ contract BondingCurveGraduationGuardsTest is PledrinTestBase {
         vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
 
         uint256 coreId = positionManager.nextTokenId();
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
 
         (PoolKey memory coreKey, PositionInfo coreInfo) =
             positionManager.getPoolAndPositionInfo(coreId);
@@ -200,8 +315,61 @@ contract BondingCurveGraduationGuardsTest is PledrinTestBase {
         assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduating), "state is frozen");
 
         vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
         assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "the alt path worked");
+    }
+
+    /// @notice **The recovery path finding 3 identified.** A third party restores a griefed
+    /// price and graduates the launch in the same transaction, and the curve performs no
+    /// swap of its own.
+    /// @dev This is what saves a graduation the curve cannot complete by itself. The curve
+    /// refuses to pay for a restoring swap — Invariant 41, and the test below is the one
+    /// that asserts it — so when liquidity in the swap's path makes the restore cost
+    /// something, the curve's own attempt reverts `SwapNotFree` forever. Anybody may move
+    /// the price with their own funds instead, and then `graduate()` finds the price already
+    /// correct and skips `_restorePrice` entirely. One transaction, so a griefer cannot
+    /// re-grief in between: that is the whole value of the path.
+    ///
+    /// The stand-in's swap delta is a global knob rather than a per-caller cost, so the
+    /// third party's swap is free here and the refusal is shown first with the knob set.
+    /// `test/fork/V4Assumptions.t.sol`'s
+    /// `test_assumption1_restorationIsNotFreeOnceSomeoneAddsLiquidity` is where a real
+    /// third party pays a real restoring swap against the deployed PoolManager.
+    function test_aThirdPartyCanRestoreThePriceAndGraduateInOneTransaction() public {
+        (BondingCurve curve, IERC20 token) = createLaunchAtCap();
+        uint160 terminal = curve.sqrtPriceTerminal();
+
+        // Griefed below the terminal price, with liquidity in the way, so the curve's own
+        // restore is refused and stays refused.
+        poolManager.pokeSlot0(curve.poolId(), TickMath.getSqrtPriceAtTick(100_000), 100_000);
+        poolManager.setSwapDelta(-1, 0);
+        vm.expectRevert(abi.encodeWithSelector(IBondingCurve.SwapNotFree.selector, -1, 0));
+        curve.graduate();
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduating), "still frozen");
+
+        // A third party pays for the restore out of their own funds, which is the part the
+        // curve refuses to do, and graduates in the same call.
+        poolManager.setSwapDelta(0, 0);
+        AtomicRestorer restorer =
+            new AtomicRestorer(new PoolSwapHelper(IPoolManager(address(poolManager))));
+        uint256 swapsBefore = poolManager.swapCalls();
+        restorer.restoreAndGraduate(
+            IBondingCurve(address(curve)),
+            _key(address(token), PledrinConstants.POOL_TICK_SPACING),
+            false,
+            terminal
+        );
+
+        assertEq(uint8(curve.state()), uint8(IBondingCurve.State.Graduated), "it graduated");
+        assertEq(poolManager.swapCalls(), swapsBefore + 1, "exactly one swap, and it was theirs");
+        (uint160 price,) = poolManager.slot0(curve.poolId());
+        assertEq(price, terminal, "the price the mint saw was the terminal price");
+        assertEq(
+            curve.pendingBountyWei(address(restorer)),
+            curve.pendingBountyTotalWei(),
+            "the bounty went to the caller that did the work"
+        );
+        assertEq(curve.ethReserve(), 0, "Invariant 43");
     }
 
     // ------------------------------------------------------------------

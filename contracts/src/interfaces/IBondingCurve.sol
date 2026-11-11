@@ -127,10 +127,22 @@ interface IBondingCurve {
     /// @notice The curve sold its entire sale supply and froze for graduation.
     event CapReached(address indexed launch, uint256 ethReserve, uint256 timestamp);
 
+    /// @notice The launch found its canonical pool key already open and left it alone.
+    /// @dev Emitted in the launch transaction, and only then. Its absence is the normal
+    /// case; its presence means a third party opened the key first, at the price this log
+    /// carries, which no curve price, balance or bound depends on.
+    event PoolPreInitialized(address indexed launch, address indexed token, uint160 sqrtPriceX96);
+
     /// @notice The launch graduated into a permanently locked Uniswap v4 position pair.
+    /// @dev `fee` and `tickSpacing` are the key the graduation actually used, so the whole
+    /// pool key follows from this one log and `token()`: `currency0` and `hooks` are always
+    /// `address(0)`. After a `graduateAlt` neither field equals the constant that
+    /// `LaunchCreated.poolId` was built from.
     event Graduated(
         address indexed launch,
         PoolId indexed poolId,
+        uint24 fee,
+        int24 tickSpacing,
         uint256 positionIdCore,
         uint256 positionIdFloor,
         uint256 ethToCore,
@@ -215,14 +227,16 @@ interface IBondingCurve {
     error SwapNotFree(int128 amount0, int128 amount1);
     /// @notice The pool price is not the curve's terminal price.
     error PriceNotRestored(uint160 actual, uint160 expected);
-    /// @notice The alternate pool key has already been initialised.
-    error AltPoolInitialized();
     /// @notice `ALT_DELAY` has not elapsed since the cap was reached.
     error AltDelayNotElapsed();
     /// @notice `GRAD_GRACE` has not elapsed since the cap was reached.
     error GraceNotElapsed();
+    /// @notice The LP fee is outside the permitted alternate range.
+    error InvalidPoolFee(uint24 fee);
     /// @notice The tick spacing is outside the permitted alternate range.
     error InvalidTickSpacing(uint24 tickSpacing);
+    /// @notice `graduateAlt` was given the canonical pool key, which only `graduate` opens.
+    error CanonicalKeyNotAllowed();
     /// @notice The core mint left more than `LP_DUST_MAX` base units unconsumed.
     error LpDustTooHigh(uint256 remainder);
     /// @notice The floor range is not strictly above the current tick, or leaves the
@@ -269,12 +283,16 @@ interface IBondingCurve {
         payable
         returns (uint256 tokensOut);
 
-    /// @notice Graduates the launch on the primary pool key.
+    /// @notice Graduates the launch on the canonical pool key.
     function graduate() external;
 
-    /// @notice Graduates the launch on an uninitialised alternate pool key.
+    /// @notice Graduates the launch on a caller-chosen alternate pool key.
+    /// @dev Both fields of the key are free. The canonical pair is refused, and nothing
+    /// else about the pool is: an alternate key that is already open, at any price and
+    /// with any liquidity, is accepted on the same terms as the canonical one.
+    /// @param fee The alternate LP fee in pips, within the permitted range.
     /// @param tickSpacing The alternate tick spacing, within the permitted range.
-    function graduateAlt(uint24 tickSpacing) external;
+    function graduateAlt(uint24 fee, uint24 tickSpacing) external;
 
     /// @notice Moves a launch griefed out of graduation to `Stalled`.
     function abortGraduation() external;
@@ -340,6 +358,10 @@ interface IBondingCurve {
     /// @notice Block time after which the curve is closed to buyers forever.
     function gradDeadline() external view returns (uint64);
 
-    /// @notice The id of the primary pool key.
+    /// @notice The price the curve's last buyer paid, and the only price at which
+    /// graduation will mint liquidity on any key.
+    function sqrtPriceTerminal() external view returns (uint160);
+
+    /// @notice The id of the canonical pool key.
     function poolId() external view returns (PoolId);
 }

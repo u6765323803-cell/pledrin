@@ -417,13 +417,13 @@ contract BondingCurveGraduationTest is PledrinTestBase {
         vm.expectRevert(
             abi.encodeWithSelector(IBondingCurve.WrongState.selector, IBondingCurve.State.Graduated)
         );
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
 
         vm.warp(curve.capReachedAt() + PledrinConstants.ALT_DELAY);
         vm.expectRevert(
             abi.encodeWithSelector(IBondingCurve.WrongState.selector, IBondingCurve.State.Graduated)
         );
-        curve.graduateAlt(100);
+        curve.graduateAlt(PledrinConstants.POOL_FEE, 100);
     }
 
     /// @notice Graduation is only reachable from `Graduating`.
@@ -514,24 +514,29 @@ contract BondingCurveGraduationTest is PledrinTestBase {
         vm.prank(GRADUATOR);
         curve.graduate();
 
-        (
-            uint256 corePositionId,
-            uint256 floorPositionId,
-            uint256 ethToCore,
-            uint256 ethToFloor,
-            uint256 tokensToCore,
-            uint256 bounty
-        ) = _graduatedEvent(address(curve));
+        GraduatedLog memory log = graduatedLog(address(curve));
 
-        assertEq(corePositionId, coreId, "core id");
-        assertEq(floorPositionId, coreId + 1, "floor id");
-        assertEq(tokensToCore, tokensBefore - token.balanceOf(address(curve)), "token leg");
+        assertEq(log.positionIdCore, coreId, "core id");
+        assertEq(log.positionIdFloor, coreId + 1, "floor id");
+        assertEq(log.tokensToCore, tokensBefore - token.balanceOf(address(curve)), "token leg");
         assertEq(
-            ethToCore + ethToFloor,
+            log.ethToCore + log.ethToFloor,
             balanceBefore - address(curve).balance,
             "both ETH legs account for every wei that left"
         );
-        assertEq(bounty, curve.pendingBountyWei(GRADUATOR), "bounty");
+        assertEq(log.bounty, curve.pendingBountyWei(GRADUATOR), "bounty");
+
+        // **Invariant 69.** The whole pool key is reconstructible from this one log and
+        // `token()`, because `currency0` and `hooks` are always the zero address.
+        assertEq(log.fee, PledrinConstants.POOL_FEE, "the canonical fee");
+        assertEq(log.tickSpacing, PledrinConstants.POOL_TICK_SPACING, "the canonical spacing");
+        assertEq(
+            log.poolId,
+            PoolId.unwrap(poolKeyFor(address(token), log.fee, log.tickSpacing).toId()),
+            "Invariant 69: the key the graduation used, rebuilt from the log"
+        );
+        assertEq(log.poolId, PoolId.unwrap(curve.poolId()), "and it is the canonical key");
+        assertEq(log.caller, GRADUATOR, "the caller is indexed on the log");
     }
 
     // ------------------------------------------------------------------
@@ -548,30 +553,7 @@ contract BondingCurveGraduationTest is PledrinTestBase {
         return token.balanceOf(address(curve));
     }
 
-    function _graduatedEvent(address curve)
-        private
-        view
-        returns (
-            uint256 corePositionId,
-            uint256 floorPositionId,
-            uint256 ethToCore,
-            uint256 ethToFloor,
-            uint256 tokensToCore,
-            uint256 bounty
-        )
-    {
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-        bytes32 topic = keccak256(
-            "Graduated(address,bytes32,uint256,uint256,uint256,uint256,uint256,uint256,address)"
-        );
-        for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].topics[0] != topic || logs[i].emitter != curve) continue;
-            return abi.decode(logs[i].data, (uint256, uint256, uint256, uint256, uint256, uint256));
-        }
-        revert("no Graduated event");
-    }
-
     function _floorEthFromEvent(address curve) private view returns (uint256 ethToFloor) {
-        (,,, ethToFloor,,) = _graduatedEvent(curve);
+        return graduatedLog(curve).ethToFloor;
     }
 }

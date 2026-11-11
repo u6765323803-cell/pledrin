@@ -137,6 +137,32 @@ contract TokenPusher {
     }
 }
 
+/// @notice Records an address's native balance every time it is asked to, keeping the
+/// whole series.
+/// @dev Used as a `MockPositionManager` probe target to read PositionManager's own ETH
+/// balance from *inside* `modifyLiquidities`, once per batch. A graduation makes two such
+/// calls, and the pair of readings is what witnesses the three ordering clauses of
+/// Invariant 70 directly: the first carries whatever a third party parked there plus the
+/// core mint's `R_target`, and the second carries `floorEth` and nothing else, because the
+/// core mint's closing `SWEEP` took the whole balance away and no call between the two
+/// mints can give it another. `probeReturn` holds only the last call's data, so a watcher
+/// that accumulates is needed to see both.
+contract BalanceWatcher {
+    uint256[] private _readings;
+
+    function record(address subject) external {
+        _readings.push(subject.balance);
+    }
+
+    function count() external view returns (uint256) {
+        return _readings.length;
+    }
+
+    function reading(uint256 index) external view returns (uint256) {
+        return _readings[index];
+    }
+}
+
 /// @notice Records an ERC-20 allowance every time it is asked to, keeping the whole series.
 /// @dev Used as a `MockPositionManager` probe target to read `token.allowance(curve, PERMIT2)`
 /// from *inside* `modifyLiquidities`. A graduation makes two such calls — the core mint and

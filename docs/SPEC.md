@@ -24,17 +24,20 @@ that proves each unreachable and the record that keeping each is a decision
 (sections 5.4, 11.4 and 16.2). Where this document is silent,
 `docs/OPEN_DECISIONS.md` records the gap.
 
-**One part of this document is deliberately ahead of `contracts/src`, as of
-2026-11-11.** The security review of that date falsified the claim that a
-launch's pool key cannot be reached before its launch transaction, and the
-remedy is recorded as decision 22 of `docs/OPEN_DECISIONS.md` and specified
-here. Five things in this document therefore describe code that does not exist
-yet, and in each case the code is the side that is wrong: the conditional
-`initialize` of section 8.1 with Invariants 64 and 65; the single precondition of
-section 8.2 step 3 with Invariants 38, 40 and 66; the two-field `graduateAlt` and
-the withdrawn uninitialised requirement of section 8.4 with Invariant 67;
+**The security review of 2026-11-11 falsified the claim that a launch's pool key
+cannot be reached before its launch transaction.** The remedy is decision 22 of
+`docs/OPEN_DECISIONS.md` and is specified here: the conditional `initialize` of
+section 8.1 with Invariants 64 and 65; the single precondition of section 8.2
+step 3 with Invariants 38, 40 and 66; the two-field `graduateAlt` and the
+withdrawn uninitialised requirement of section 8.4 with Invariant 67;
 `GraduationHelper` in sections 2 and 8.6 with Invariant 68; and the
 `PoolPreInitialized` and `Graduated` log changes of section 16 with Invariant 69.
+All of that is implemented except `GraduationHelper`, which is specified and not
+written, so section 8.6 and Invariant 68 are the one part of this document still
+ahead of `contracts/src`. The implementation differs from the design in one
+recorded respect, the shared graduation body taking the pool key instead of a
+flag; section 8.2 states the equivalence it rests on and section 2.1 states what
+it is worth in bytes.
 `ALT_TICK_SPACING_MAX = 199`, recorded above as a correction that changed the
 contracts, is superseded by that decision and is now 200 with the canonical pair
 excluded instead.
@@ -176,27 +179,29 @@ build settings in `contracts/foundry.toml`:
 
 | Contract | Runtime | Creation code | Free of 24,576 |
 |---|---|---|---|
-| `CurveDeployer` | 24,049 bytes | 24,075 bytes | 527 bytes |
-| `BondingCurve` | 19,471 bytes | 23,196 bytes | 5,105 bytes |
+| `CurveDeployer` | 23,690 bytes | 23,716 bytes | 886 bytes |
+| `BondingCurve` | 18,824 bytes | 22,837 bytes | 5,752 bytes |
 | `LaunchFactory` | 7,232 bytes | 8,645 bytes | 17,344 bytes |
+| `LiquidityLock` | 2,902 bytes | 3,232 bytes | 21,674 bytes |
 | `TokenDeployer` | 2,979 bytes | 3,005 bytes | 21,597 bytes |
+| `CreatorVesting` | 2,505 bytes | 2,531 bytes | 22,071 bytes |
+| `Timelock` | 1,635 bytes | 1,827 bytes | 22,941 bytes |
 | `PledrinToken` | 1,488 bytes | 2,602 bytes | 23,088 bytes |
 
-Every figure is read from `contracts/out` on 2026-11-11, against the tree at
-commit `5b86188`. **It is a snapshot of a tree that is still moving**, so
-re-measure before relying on it rather than treating it as settled: section 8.1
-and section 8.4 both add to the curve and are not implemented yet. The two
-combinations EIP-170 rules out follow from those parts, because a contract that
+Every figure is read from `contracts/out` on 2026-11-11, with decision 22's
+changes 1, 2 and 4 in the tree. The six contracts other than `BondingCurve` and
+`CurveDeployer` are byte-identical to the tree before that change. The two
+combinations EIP-170 rules out follow from these parts, because a contract that
 embeds another contract's creation code cannot be smaller than the code it
 embeds:
 
 - **A factory carrying `BondingCurve`'s creation code.** The creation code alone
-  is 23,196 bytes, which leaves 1,380 bytes of the limit for the entire factory,
-  and the factory is 7,232 bytes. Carrying both is at least 30,428 bytes, 5,852
+  is 22,837 bytes, which leaves 1,739 bytes of the limit for the entire factory,
+  and the factory is 7,232 bytes. Carrying both is at least 30,069 bytes, 5,493
   over the limit. Nothing recoverable from dropping the external call into a
   deployer closes a gap of that size.
 - **One deployer carrying both `BondingCurve`'s and `PledrinToken`'s creation
-  code.** At least 23,196 + 2,602 = 25,798 bytes, 1,222 over the limit before any
+  code.** At least 22,837 + 2,602 = 25,439 bytes, 863 over the limit before any
   dispatch code of its own. This is why there are two deployers and not one.
 
 The limit is therefore the reason for two deployers rather than one, and for any
@@ -228,47 +233,101 @@ no clone, no immutable-args offset, no proxy, no initialiser and no
 `delegatecall`, so Invariant 54 is intact.
 
 The margin is a standing constraint on future work. `BondingCurve`'s creation
-code is 23,196 bytes of `CurveDeployer`'s 24,049 runtime bytes, leaving
-**527 bytes** — 2.1% of the limit — before the deployer itself becomes
+code is 22,837 bytes of `CurveDeployer`'s 23,690 runtime bytes, leaving
+**886 bytes** — 3.6% of the limit — before the deployer itself becomes
 undeployable. `CurveDeployer`'s own code above the creation code it carries is
 853 bytes and has not changed, so every byte added to the curve is a byte off
-that margin, and fewer than 527 bytes of new curve code exhausts it. Section 8.1
-and section 8.4 each add to the curve; `docs/OPEN_DECISIONS.md` decision 22
-estimates both and states the order to drop them in if the margin does not hold.
+that margin, and fewer than 886 bytes of new curve code exhausts it.
 
-The 97 bytes between the 624 this table carried and the 527 it carries now are
-three changes and not one, and the ledger is recorded because attributing all 97
-to the last of them was this document's own first guess:
+How the margin got here, recorded because this document twice attributed a
+figure to the wrong change — once by charging an interval of 97 bytes to the
+single change at the end of it, and once by predicting a rise where the build
+delivered a fall:
 
 | `CurveDeployer` runtime | Margin | Change | Delta |
 |---|---|---|---|
-| 23,952 | 624 | the figure this table carried | — |
+| 23,952 | 624 | the figure this table carried for most of 2026-11-11 | — |
 | 23,919 | 657 | `graduateAlt`'s delay check moved into `_settle` | -33 |
 | 23,980 | 596 | `claimBond` split into four refusals | +61 |
 | 24,049 | 527 | the core mint's ETH cost computed instead of read (`5b86188`) | +69 |
+| 23,690 | 886 | decision 22's changes 1, 2 and 4 | -359 |
 
-So **finding 1's fix cost 69 bytes**, and the 28 before it are the two
-revert-reason rounds of sections 11.3 and 16.2, both of which landed in the
-contracts before the security review existed. Computing the ETH cost from the
-position's parameters costs more code than reading two balances and is cheap at
-that price. An intermediate variant of that fix measured 448 bytes free and no
-longer exists; the landed one places the computation before the mint call rather
-than after it.
+The deltas sum to -262 and the margin rose by the same 262, which is the check
+that the ledger is complete: every byte between the first row and the last is
+attributed to a named change.
 
-**Why this table went stale, recorded because the cause is a process and not an
-arithmetic slip:** two contract changes that moved the margin were committed
-without this table being updated in the same commit, so the next person to
-compare against it measured a difference of 97 and had no way to see that only 69
-of it belonged to the change they were looking at. With 527 bytes left, that is
-no longer an affordable habit. **A commit that changes `BondingCurve` updates
-this table in the same commit, or the table is a measurement of a tree that
-nobody can identify.** The other changes in the same pass
-were free or better than free: overriding `transferOwnership` to revert made
+**Finding 1's fix cost 69 bytes**, and the 28 before it are the two revert-reason
+rounds of sections 11.3 and 16.2, both of which landed in the contracts before
+the security review existed. Computing the ETH cost from the position's
+parameters costs more code than reading two balances and is cheap at that price.
+An intermediate variant of that fix measured 448 bytes free and no longer exists;
+the landed one places the computation before the mint call rather than after it.
+
+Further back than the ledger reaches, the 421 bytes spent before it were the
+post-terminal fee redirect of section 6.3. The other changes in that pass were
+free or better than free: overriding `transferOwnership` to revert made
 `LaunchFactory` 92 bytes smaller, because the revert replaces `Ownable`'s body;
 adding `FeeAccrued`'s `reserveCut` field made the curve 29 bytes smaller; and the
 `SafeCast` binding change is byte-identical, verified by building the tree twice
 with only those directives differing and comparing the deployed bytecode of
 every affected contract.
+
+The last row of the ledger is the one to read twice. Decision 22 **adds** a
+conditional `initialize`, a two-field alternate key, two range checks, a pair
+check, a new event and two event fields, and the deployer came out **359 bytes
+smaller**. That is not a rounding surprise, it is the subject of the next
+subsection.
+
+**Why this table went stale, recorded because the cause is a process and not an
+arithmetic slip:** two contract changes that moved the margin were committed
+without this table being updated in the same commit, so the next person to
+compare against it measured a difference of 97 and had no way to see that only 69
+of it belonged to the change they were looking at. That is no longer an
+affordable habit. **A commit that changes `BondingCurve` updates this table in
+the same commit, or the table is a measurement of a tree that nobody can
+identify.**
+
+#### The inliner decides the size, and `_settle` must not take a literal argument
+
+This is the single most expensive thing to get wrong in this contract, it is
+invisible in the source, and it cost 1,761 bytes to discover.
+
+With `via_ir`, **`_settle` is not a function in the compiled output**. The
+inliner inlines it into both `graduate` and `graduateAlt`. While its signature
+was `_settle(int24 tickSpacing, bool alternate)`, both call sites passed literals
+for `alternate`, so the inliner propagated the constant through each copy and
+deleted a branch from each: the copy inside `graduate` had no `initialize` path
+and the copy inside `graduateAlt` had no `_restorePrice` path. Two partially dead
+copies of the graduation body were cheaper than one complete one, which is why
+nobody noticed there were two.
+
+Collapsing the branches of section 8.2 step 2 into one rule therefore did not
+remove a branch. It made both copies complete, and **duplicating the merged block
+cost 551 bytes on its own**. The whole of decision 22 with a
+`_settle(uint24, int24, bool)` signature measured 25,445 bytes, which is 869 over
+EIP-170 and would not deploy.
+
+What made it fit is that `_settle` now takes the `PoolKey` and derives the path
+from it, with **no literal-valued argument at any call site**. The inliner's
+heuristic keys on literal arguments, so it declines to inline, and the output
+holds one copy of the graduation body instead of two. That is worth **1,761
+bytes** against the flag form and is the entire reason a change set that adds
+functionality came out 359 bytes lighter.
+
+**Normative, and it belongs at the signature as well as here: `_settle` must
+never again be given an argument that is a literal at its call sites.** A future
+parameter is derived from the pool key or read from storage. Re-adding a `bool`,
+or passing the fee and spacing as constants instead of as the key, costs roughly
+1.7 KB, and 886 bytes do not cover it. Section 8.2 states the equivalence that
+lets the derivation replace the flag.
+
+**And the general point, because it is the second way a size figure misled this
+project in one day: these numbers are not additive.** The components of decision
+22 measured +218, +551 and more; the total was -359. An estimate built by adding
+components is not wrong about the components — it is wrong about the inliner,
+whose decisions are a function of the whole call graph and change when any call
+site changes. The only reliable estimate of a size change to `BondingCurve` is a
+build of the whole change set. Measure the set, never the parts.
 
 The levers for reclaiming margin are the two this section already names:
 decision 5 option B, which is a clone with immutable args, or splitting the
@@ -1068,6 +1127,32 @@ the contract, so a reentrant attempt fails the state check; and every remaining
 storage write is complete before the function's last external calls, which are
 the floor mint and the two protocol-internal notifications of steps 9 and 10,
 with only the event after them.
+
+**The shared body — `_settle` in the implementation — takes the pool key and
+derives the path from it. It takes no flag, and normatively it may never take an
+argument that is a literal at its call sites.** `graduate` passes the canonical key and `graduateAlt` passes the key it
+was asked for; the body decides whether `ALT_DELAY` applies by comparing the
+key's `fee` and `tickSpacing` against `POOL_FEE` and `POOL_TICK_SPACING` rather
+than by being told.
+
+The derivation is equivalent to the flag it replaces, and the equivalence is
+Invariant 67 rather than a coincidence of the current code. `graduate` can name
+nothing but the canonical pair, and `graduateAlt` refuses that pair with
+`CanonicalKeyNotAllowed` before the body runs, so a key that differs from the
+canonical one in either field arrived through the alternate path and a key that
+matches it in both arrived through `graduate`. The delay check therefore fires on
+exactly the set of calls a flag would have fired on. If either half of Invariant
+67 were ever relaxed the equivalence would break, so a change to the permitted
+alternate ranges is a change to this derivation.
+
+The reason it is normative is size rather than taste, and the margin does not
+cover getting it wrong: a literal argument lets the compiler's inliner duplicate
+this entire body once per call site with a branch constant-folded out of each
+copy, which is how the contract was built before decision 22 and is worth about
+1.7 KB. Section 2.1 records the measurement and states the rule where someone
+editing the signature will meet it. **The prohibition must also be carried as a
+comment at the signature itself**, because that is where the mistake would be
+made and neither this section nor section 2.1 is open at that moment.
 
 Step 2's restoring swap nominates a non-zero `amountSpecified`.
 `PoolManager.swap` rejects `amountSpecified == 0` with
@@ -2530,7 +2615,11 @@ the core of the invariant suite.
     `abortGraduation` reverts before `capReachedAt + GRAD_GRACE`. Both delay
     checks run after their function's state check, so a launch that is not
     `Graduating` answers `WrongState` and is never told to wait out a delay that
-    is not what refused it (section 16.2).
+    is not what refused it (section 16.2). Whether `ALT_DELAY` applies is derived
+    from the pool key — it applies exactly when `fee != POOL_FEE` or
+    `tickSpacing != POOL_TICK_SPACING` — and not from a flag passed by the
+    caller, and by Invariant 67 that set is exactly the set of calls that reached
+    the body through `graduateAlt` (section 8.2).
 38. No function of any Pledrin contract refuses a Uniswap v4 pool key because
     that key is already initialised, or because it holds liquidity, and no
     function reads a pool's liquidity. `BondingCurve`'s constructor,

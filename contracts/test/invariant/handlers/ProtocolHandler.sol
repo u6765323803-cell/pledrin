@@ -118,6 +118,18 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
     uint256 public claims;
     uint256 public newLaunches;
     uint256 public timeJumps;
+    /// @notice Times the run parked a native balance in PositionManager, and the total it
+    /// parked. Reported so that a green run cannot be one that never parked anything.
+    uint256 public strayParkings;
+    uint256 public strayParkedWei;
+    /// @notice Graduation attempts that reverted with an arithmetic panic. This is finding
+    /// 1 of `docs/security/REVIEW-2026-11-11-phase1-contracts.md` as a counter: the
+    /// pre-`5b86188` contract raised it on the first attempt that followed a parked balance
+    /// above the mint's cost, on both graduation paths. An invariant asserts it stays zero.
+    /// Every documented refusal is a custom error, so any `Panic` at all is a defect.
+    uint256 public graduationPanics;
+    /// @notice The code of the last panic a graduation attempt produced, for the message.
+    uint256 public lastGraduationPanicCode;
 
     constructor(LaunchFactory factory_, BondingCurve[] memory launches_, uint256 actors_) {
         factory = factory_;
@@ -267,8 +279,12 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
 
         uint256 protection = curve.protectionEth();
         _snapshotLiveness(curve);
-        (bool ok,) = actor.execute(address(curve), 0, abi.encodeCall(IBondingCurve.graduate, ()));
-        if (!ok) return;
+        (bool ok, bytes memory ret) =
+            actor.execute(address(curve), 0, abi.encodeCall(IBondingCurve.graduate, ()));
+        if (!ok) {
+            _recordRevert(ret);
+            return;
+        }
 
         protectionToFloor[address(curve)] += protection;
         graduations++;
@@ -277,12 +293,22 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         _observe(curve);
     }
 
-    function graduateAlt(uint256 launchSeed, uint256 actorSeed, uint24 spacing) external {
+    /// @notice `graduateAlt` on a fuzzed key out of the 1,337,190 the launch may use.
+    /// @dev Both fields are drawn and the one refused pair is stepped past rather than
+    /// drawn and discarded. Before decision 22 the spacing range stopped at 199 so that the
+    /// canonical key sat outside it; the range now reaches `POOL_TICK_SPACING` and the pair
+    /// `(POOL_FEE, POOL_TICK_SPACING)` is what `graduateAlt` refuses, so a run that drew it
+    /// would record a `CanonicalKeyNotAllowed` refusal as a graduation failure and quietly
+    /// spend part of its depth on a call that can never succeed.
+    function graduateAlt(uint256 launchSeed, uint256 actorSeed, uint24 fee, uint24 spacing)
+        external
+    {
         BondingCurve curve = _launch(launchSeed);
         Actor actor = _actor(actorSeed);
-        // The permitted window is `[10, 199]`: 200 is `POOL_TICK_SPACING`, which the range
-        // check rejects, so bounding to it would have made every such draw a silent refusal
-        // on the one function whose whole point is to reach a *different* pool key.
+
+        fee = uint24(
+            bound(fee, PledrinConstants.ALT_POOL_FEE_MIN, PledrinConstants.ALT_POOL_FEE_MAX)
+        );
         spacing = uint24(
             bound(
                 spacing,
@@ -290,12 +316,25 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
                 uint24(int24(PledrinConstants.ALT_TICK_SPACING_MAX))
             )
         );
+        if (
+            fee == PledrinConstants.POOL_FEE
+                && spacing == uint24(int24(PledrinConstants.POOL_TICK_SPACING))
+        ) {
+            // One step down the fee, which is still inside the permitted range and is a
+            // different key. Dropping the call instead would never exercise the canonical
+            // spacing, which is the spacing decision 22 added to the set.
+            fee -= 1;
+        }
 
         uint256 protection = curve.protectionEth();
         _snapshotLiveness(curve);
-        (bool ok,) =
-            actor.execute(address(curve), 0, abi.encodeCall(IBondingCurve.graduateAlt, (spacing)));
-        if (!ok) return;
+        (bool ok, bytes memory ret) = actor.execute(
+            address(curve), 0, abi.encodeCall(IBondingCurve.graduateAlt, (fee, spacing))
+        );
+        if (!ok) {
+            _recordRevert(ret);
+            return;
+        }
 
         protectionToFloor[address(curve)] += protection;
         graduations++;
@@ -414,6 +453,30 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
                 vm.deal(address(actors[i]), 20_000 ether);
             }
         }
+    }
+
+    /// @notice Parks a native balance in Uniswap's PositionManager, where the next
+    /// graduation's closing `SWEEP` will carry it into whichever launch graduates next.
+    /// @dev This is a thing any address can do and nothing can prevent: an ordinary v4
+    /// batch that forwards more value than it settles leaves the remainder there, and
+    /// `SELFDESTRUCT` bypasses the `receive()` sender check. `vm.deal` is the faithful
+    /// model of both, since neither runs any code of the recipient.
+    ///
+    /// It is an action rather than a fixture because the ordering is the whole point. The
+    /// pre-`5b86188` contract measured the core mint's ETH cost as a balance delta across
+    /// the call, so a balance parked here before *any* graduation attempt reverted that
+    /// attempt with an arithmetic panic once it exceeded the mint's cost, and no state the
+    /// handler could reach afterwards cleared it. The bound runs past the largest
+    /// `R_target` the suite's launches use, so the run spends part of its depth above the
+    /// old threshold and part below it, where the failure was a silently wrong
+    /// `ethToCore` and an inflated `floorEth` rather than a revert.
+    function parkStrayInPositionManager(uint256 seed) external {
+        address positionManager = address(factory.positionManager());
+        uint256 amount = bound(seed, 1, 1200 ether);
+        vm.deal(positionManager, positionManager.balance + amount);
+
+        strayParkings++;
+        strayParkedWei += amount;
     }
 
     /// @notice Warps to the earliest `gradDeadline` still ahead, which is what opens
@@ -665,6 +728,25 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
     }
 
     /// @dev Records what leaving `Live` looked like, for the reworded Invariant 31.
+    /// @dev Classifies a refused graduation. Every documented refusal is a custom error, so
+    /// a `Panic(uint256)` with code `0x11` means an arithmetic overflow or underflow got
+    /// out of `_settle`, which is never a legitimate outcome of a graduation attempt
+    /// whatever the state of the world around it.
+    function _recordRevert(bytes memory ret) private {
+        if (ret.length != 36) return;
+        bytes4 selector;
+        uint256 code;
+        // `abi.decode` cannot take a `bytes` with a selector in front of it, so the two
+        // words are read directly.
+        assembly ("memory-safe") {
+            selector := mload(add(ret, 0x20))
+            code := mload(add(ret, 0x24))
+        }
+        if (selector != bytes4(keccak256("Panic(uint256)"))) return;
+        graduationPanics++;
+        lastGraduationPanicCode = code;
+    }
+
     function _observe(BondingCurve curve) private {
         address launch = address(curve);
         IBondingCurve.State current = curve.state();

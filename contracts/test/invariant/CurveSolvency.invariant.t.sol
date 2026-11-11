@@ -137,10 +137,27 @@ contract CurveSolvencyInvariant is InvariantBase {
                 address(curve).balance,
                 uint256(curve.creatorFeeEth()) + curve.protocolFeeEth()
                     + curve.pendingBountyTotalWei() + curve.pendingBondWei()
-                    + PledrinConstants.MIN_FLOOR_WEI,
+                    + PledrinConstants.MIN_FLOOR_WEI + handler.strayParkedWei(),
                 "Invariant 43's bound on what is left behind"
             );
         }
+    }
+
+    /// @notice **Finding 1 as an invariant.** No graduation attempt in any interleaving
+    /// ever reverts with an arithmetic panic.
+    /// @dev Every refusal the specification documents is a custom error, so a `Panic` out
+    /// of `graduate()` or `graduateAlt()` is by construction a defect and not a state. This
+    /// is the invariant that the pre-`5b86188` contract fails: the handler parks native
+    /// balances in PositionManager, the mint batch's closing `SWEEP` carries the whole
+    /// balance into the curve, and a balance delta taken across that call underflows once
+    /// the stray exceeds the mint's cost. `fail_on_revert` is false in this suite, so a
+    /// reverting call is otherwise a legitimate outcome and nothing else would notice.
+    function invariant_noGraduationAttemptEverPanics() public view {
+        assertEq(
+            handler.graduationPanics(),
+            0,
+            "a graduation attempt reverted with a Panic, code in lastGraduationPanicCode"
+        );
     }
 
     /// @notice Reports what the run actually did.
@@ -193,5 +210,29 @@ contract CurveSolvencyInvariant is InvariantBase {
 
         handler.advanceTime(1 hours);
         assertGt(handler.timeJumps(), 0, "the clock moved");
+
+        // And the stray-parking action is real work too: it has to be, because the
+        // invariant above is vacuous on a run that never parks anything.
+        handler.parkStrayInPositionManager(5 ether);
+        assertEq(handler.strayParkings(), 1, "a stray was parked");
+        assertGt(handler.strayParkedWei(), 0, "and it is accounted for");
+        assertEq(address(positionManager).balance, handler.strayParkedWei(), "where it lands");
+
+        // The launch created a few lines above is the only one still Live, so it is the one
+        // both of these reach.
+        uint256 fresh = handler.launchCount() - 1;
+        assertEq(
+            uint8(handler.launchAt(fresh).state()), uint8(IBondingCurve.State.Live), "still Live"
+        );
+        handler.buyToCap(fresh, 1);
+        assertEq(
+            uint8(handler.launchAt(fresh).state()),
+            uint8(IBondingCurve.State.Graduating),
+            "and capped"
+        );
+        handler.graduate(fresh, 1);
+        assertEq(handler.graduations(), 2, "a graduation went through with the stray parked");
+        assertEq(handler.graduationPanics(), 0, "and nothing panicked");
+        assertEq(address(positionManager).balance, 0, "the mint's sweep took the stray");
     }
 }

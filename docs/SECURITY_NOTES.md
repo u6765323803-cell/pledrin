@@ -15,7 +15,7 @@ The configuration lives in `contracts/slither.config.json` rather than in CI
 arguments, so a reviewer running the command above analyses the same set of
 contracts with the same detectors as the pipeline.
 
-As of this revision Slither reports **27 findings across 8 detectors**,
+As of this revision Slither reports **28 findings across 9 detectors**,
 generates an intermediate representation for every function in `src`, and
 `--fail-high` exits **0**:
 
@@ -23,7 +23,7 @@ generates an intermediate representation for every function in `src`, and
 |---|---|---|
 | Medium | 13 | `unused-return` 9, `divide-before-multiply` 2, `incorrect-equality` 1, `locked-ether` 1 |
 | Low | 13 | `timestamp` 8, `reentrancy-benign` 4, `reentrancy-events` 1 |
-| Informational | 1 | `low-level-calls` |
+| Informational | 2 | `low-level-calls`, `cyclomatic-complexity` |
 
 None is a defect. One high-impact finding, `reentrancy-balance`, is carried by an
 inline directive at its single site rather than by a configuration change, so the
@@ -308,6 +308,32 @@ be a third party. No value moves on any of these paths after the write.
 `CurveDeployer.deploy` emits after `new BondingCurve{value: msg.value}(...)`. The
 curve does not exist before that statement, so nothing can re-enter to reorder or
 fabricate the log.
+
+### cyclomatic-complexity — informational — true, and accepted
+
+`BondingCurve`'s constructor measures 12 against Slither's threshold of 11. It
+was at 11 before decision 22 and the pre-initialised-pool branch put it over.
+
+The finding is accurate rather than noisy: that constructor validates a
+fourteen-field configuration, deploys the launch token, checks the supply
+landed, records the bond, and now tolerates a pool key a third party may already
+have opened. A reviewer does have to hold all of that at once.
+
+It is accepted rather than refactored, and the reason is the opposite of the one
+that keeps `reentrancy-balance` suppressed. There, restructuring would have made
+the code worse. Here, extracting the configuration checks into a private
+function would be harmless — the IR inliner folds it straight back, so the
+bytecode is identical — and that is exactly why it is not worth doing: the same
+logic would run, a reviewer would have to understand the same amount, and the
+only thing that would change is a number going under a threshold. A verdict that
+says the constructor is complex and why is more use to an auditor than a count
+that no longer trips.
+
+What a reviewer should check there, since this entry is the place to say it: that
+the `getSlot0` test is a test and not a caught revert, so every other failure
+mode of `initialize` still reverts the launch; and that the token's supply
+assertion is exact equality, so a token that is not the one the deployer made
+cannot pass.
 
 ### low-level-calls — informational — intended
 

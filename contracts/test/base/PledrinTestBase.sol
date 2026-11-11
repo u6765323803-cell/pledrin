@@ -2,11 +2,15 @@
 pragma solidity 0.8.38;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
+import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 
 import {BondingCurve} from "src/BondingCurve.sol";
@@ -263,5 +267,105 @@ abstract contract PledrinTestBase is Test {
     /// @notice Casts a launch's lifecycle state to its enum for an assertion message.
     function stateOf(BondingCurve curve) internal view returns (IBondingCurve.State) {
         return curve.state();
+    }
+
+    // ------------------------------------------------------------------
+    // The `Graduated` log
+    // ------------------------------------------------------------------
+
+    /// @notice Every field of one `Graduated` log, indexed topics included.
+    /// @dev One struct and one decoder for the whole suite. There were four copies of this
+    /// decode before decision 22 added `fee` and `tickSpacing` to the event, and the
+    /// addition broke all four at once — a new `topic0` and two more data words — which is
+    /// the argument for there being one.
+    struct GraduatedLog {
+        bytes32 poolId;
+        address caller;
+        uint24 fee;
+        int24 tickSpacing;
+        uint256 positionIdCore;
+        uint256 positionIdFloor;
+        uint256 ethToCore;
+        uint256 ethToFloor;
+        uint256 tokensToCore;
+        uint256 bounty;
+    }
+
+    /// @notice The eight non-indexed fields of `Graduated`, in ABI order.
+    /// @dev A struct rather than a tuple destructuring because `forge coverage` compiles
+    /// with the optimizer and the IR pipeline off, and an eight-element tuple assignment
+    /// does not fit on the legacy codegen's stack. `abi.decode` takes a struct of static
+    /// fields and decodes it as the tuple it is encoded as.
+    struct GraduatedData {
+        uint24 fee;
+        int24 tickSpacing;
+        uint256 positionIdCore;
+        uint256 positionIdFloor;
+        uint256 ethToCore;
+        uint256 ethToFloor;
+        uint256 tokensToCore;
+        uint256 bounty;
+    }
+
+    /// @notice `topic0` of the current `Graduated` event.
+    /// @dev Written out rather than taken from the interface so that a change to the event
+    /// is a change to a literal here, which is what makes the four call sites fail loudly
+    /// instead of silently finding no log. `caller` is indexed, so the data carries eight
+    /// words: `fee`, `tickSpacing` and the six amounts.
+    function graduatedTopic() internal pure returns (bytes32) {
+        return keccak256(
+            "Graduated(address,bytes32,uint24,int24,uint256,uint256,uint256,uint256,uint256,uint256,address)"
+        );
+    }
+
+    /// @notice The first `Graduated` log this launch emitted in the recording, decoded.
+    /// @dev Requires `vm.recordLogs()` beforehand. `vm.getRecordedLogs()` is a `view`
+    /// cheatcode in forge-std 1.9.0 and does not clear the buffer, so a test that records
+    /// twice reads the logs of both recordings. A launch emits this at most once
+    /// (Invariant 36), so "the first" is "the only" for one launch.
+    function graduatedLog(address curve) internal view returns (GraduatedLog memory log) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != graduatedTopic() || logs[i].emitter != curve) continue;
+            return _decodeGraduated(logs[i]);
+        }
+        revert("no Graduated event");
+    }
+
+    /// @dev One log entry to one struct. Split from the search above for the stack reason
+    /// `GraduatedData` carries.
+    function _decodeGraduated(Vm.Log memory entry) private pure returns (GraduatedLog memory log) {
+        GraduatedData memory data = abi.decode(entry.data, (GraduatedData));
+        log.poolId = entry.topics[2];
+        log.caller = address(uint160(uint256(entry.topics[3])));
+        log.fee = data.fee;
+        log.tickSpacing = data.tickSpacing;
+        log.positionIdCore = data.positionIdCore;
+        log.positionIdFloor = data.positionIdFloor;
+        log.ethToCore = data.ethToCore;
+        log.ethToFloor = data.ethToFloor;
+        log.tokensToCore = data.tokensToCore;
+        log.bounty = data.bounty;
+    }
+
+    /// @notice The canonical pool key of a launch token, which is the key `graduate` uses.
+    function canonicalKey(address token) internal pure returns (PoolKey memory) {
+        return poolKeyFor(token, PledrinConstants.POOL_FEE, PledrinConstants.POOL_TICK_SPACING);
+    }
+
+    /// @notice A pool key for a launch token at any fee and spacing. Native ETH sorts below
+    /// every token address, so the token is always `currency1`, and `hooks` is always zero.
+    function poolKeyFor(address token, uint24 fee, int24 tickSpacing)
+        internal
+        pure
+        returns (PoolKey memory)
+    {
+        return PoolKey({
+            currency0: CurrencyLibrary.ADDRESS_ZERO,
+            currency1: Currency.wrap(token),
+            fee: fee,
+            tickSpacing: tickSpacing,
+            hooks: IHooks(address(0))
+        });
     }
 }

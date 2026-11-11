@@ -285,7 +285,7 @@ contract BondingCurveDonationNeutralityTest is PledrinTestBase {
         vm.prank(GRADUATOR);
         vm.recordLogs();
         curve.graduate();
-        (,,,, uint256 tokensToCore,) = _graduatedEvent(address(curve));
+        uint256 tokensToCore = graduatedLog(address(curve)).tokensToCore;
         assertLe(tokensToCore, PledrinConstants.LP_SUPPLY, "tokensUsed <= LP_SUPPLY");
         assertGe(
             tokensToCore,
@@ -338,22 +338,24 @@ contract BondingCurveDonationNeutralityTest is PledrinTestBase {
         (out.success, out.returnData) = address(curve)
             .call(
                 alt
-                    ? abi.encodeCall(IBondingCurve.graduateAlt, (100))
+                    ? abi.encodeCall(IBondingCurve.graduateAlt, (PledrinConstants.POOL_FEE, 100))
                     : abi.encodeCall(IBondingCurve.graduate, ())
             );
         if (!out.success) {
-            // Drain the buffer so the next recording starts clean.
-            vm.getRecordedLogs();
+            // Nothing to decode. The next `vm.recordLogs()` is what resets the buffer:
+            // `vm.getRecordedLogs()` is a `view` in forge-std 1.9.0 and clears nothing.
             return out;
         }
 
-        (
-            out.corePositionId,
-            out.floorPositionId,
-            out.ethToCore,
-            out.ethToFloor,
-            out.tokensToCore,
-        ) = _graduatedEvent(address(curve));
+        GraduatedLog memory log = graduatedLog(address(curve));
+        (out.corePositionId, out.floorPositionId, out.ethToCore, out.ethToFloor, out.tokensToCore) =
+            (
+                log.positionIdCore,
+                log.positionIdFloor,
+                log.ethToCore,
+                log.ethToFloor,
+                log.tokensToCore
+            );
         out.coreLiquidity = positionManager.getPositionLiquidity(out.corePositionId);
         out.dust = PledrinConstants.LP_SUPPLY - out.tokensToCore;
         out.curveTokenBalance = token.balanceOf(address(curve));
@@ -388,27 +390,5 @@ contract BondingCurveDonationNeutralityTest is PledrinTestBase {
             );
         }
     }
-
-    function _graduatedEvent(address curve)
-        private
-        view
-        returns (
-            uint256 corePositionId,
-            uint256 floorPositionId,
-            uint256 ethToCore,
-            uint256 ethToFloor,
-            uint256 tokensToCore,
-            uint256 bounty
-        )
-    {
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-        bytes32 topic = keccak256(
-            "Graduated(address,bytes32,uint256,uint256,uint256,uint256,uint256,uint256,address)"
-        );
-        for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].topics[0] != topic || logs[i].emitter != curve) continue;
-            return abi.decode(logs[i].data, (uint256, uint256, uint256, uint256, uint256, uint256));
-        }
-        revert("no Graduated event");
-    }
 }
+

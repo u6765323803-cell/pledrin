@@ -169,7 +169,9 @@ contract CallDisciplineTest is PledrinTestBase {
         _assertReentryIsRefused(abi.encodeCall(IBondingCurve.graduate, ()));
         _assertReentryIsRefused(abi.encodeCall(IBondingCurve.donate, ()));
         _assertReentryIsRefused(abi.encodeCall(IBondingCurve.claimProtocolFees, ()));
-        _assertReentryIsRefused(abi.encodeCall(IBondingCurve.graduateAlt, (100)));
+        _assertReentryIsRefused(
+            abi.encodeCall(IBondingCurve.graduateAlt, (PledrinConstants.POOL_FEE, 100))
+        );
         _assertReentryIsRefused(abi.encodeCall(IBondingCurve.abortGraduation, ()));
         _assertReentryIsRefused(abi.encodeCall(IBondingCurve.expire, ()));
     }

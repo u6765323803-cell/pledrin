@@ -132,13 +132,16 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
     bool private transient _unlocking;
 
     /// @notice Fixes every launch parameter, takes delivery of the launch token's entire
-    /// supply and initialises the Uniswap v4 pool at the curve's terminal price.
-    /// @dev Initialising the pool here rather than at graduation is the primary anti-grief
-    /// measure: the token address does not exist before this transaction, so the pool key
-    /// is not computable before it and no attacker can ever choose the pool's initial
-    /// price. The token is minted by the deployer directly to this contract and the whole
-    /// supply is checked to have arrived. The bond is funded by the ETH sent with this
-    /// call.
+    /// supply and opens the Uniswap v4 pool at the curve's terminal price if nobody has
+    /// opened it already.
+    /// @dev The canonical pool key is computable before this transaction runs, because the
+    /// token's `CREATE` address follows from the deployer's nonce, so the key may already
+    /// be open at any price. That is tolerated rather than refused: no Pledrin contract may
+    /// require a pool key to be uninitialised or empty (Invariants 38, 64, 65), and what
+    /// protects the opening price is the assertion in `_settle` that the price equals
+    /// `sqrtPriceTerminal` before any liquidity is minted. The token is minted by the
+    /// deployer directly to this contract and the whole supply is checked to have arrived.
+    /// The bond is funded by the ETH sent with this call.
     /// @param factory_ The factory this launch reports its outcome to.
     /// @param config Everything this launch fixes for its lifetime.
     constructor(address factory_, CurveConfig memory config) payable {
@@ -221,12 +224,23 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
         ) revert InvalidToken();
         token = launchToken;
 
-        // The returned tick is the tick of `sqrtPriceTerminal` and is not needed here.
-        // forge-lint: disable-next-item(unused-return)
-        config.poolManager
-            .initialize(
-                _poolKeyFor(launchToken, PledrinConstants.POOL_TICK_SPACING), sqrtPriceTerminal
-            );
+        // The condition below is a test on `slot0` and not a caught revert, and the
+        // distinction is normative. `initialize` also fails on an out-of-range tick
+        // spacing, a fee above `MAX_LP_FEE`, currencies out of order and a hook address v4
+        // refuses, each of which is a function of this protocol's own constants rather than
+        // of anything a third party can arrange. None can fire at any permitted parameter
+        // set, which is exactly why none may be suppressed: swallowing them would hide a
+        // misconfiguration behind a branch that reads as a griefed pool.
+        PoolKey memory key =
+            _poolKeyFor(launchToken, PledrinConstants.POOL_FEE, PledrinConstants.POOL_TICK_SPACING);
+        (uint160 opened,,,) = config.poolManager.getSlot0(key.toId());
+        if (opened == 0) {
+            // The returned tick is the tick of `sqrtPriceTerminal` and is not needed here.
+            // forge-lint: disable-next-item(unused-return)
+            config.poolManager.initialize(key, sqrtPriceTerminal);
+        } else {
+            emit PoolPreInitialized(address(this), address(launchToken), opened);
+        }
     }
 
     /// @notice Accepts the unspent ETH Uniswap v4 returns from a graduation mint.
@@ -321,17 +335,30 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
 
     /// @inheritdoc IBondingCurve
     function graduate() external nonReentrant {
-        _settle(PledrinConstants.POOL_TICK_SPACING, false);
+        _settle(_poolKeyFor(token, PledrinConstants.POOL_FEE, PledrinConstants.POOL_TICK_SPACING));
     }
 
     /// @inheritdoc IBondingCurve
-    function graduateAlt(uint24 tickSpacing) external nonReentrant {
+    /// @dev All three refusals here are verdicts about calldata alone and are true in
+    /// every state, so they precede `_settle`'s state check: a caller naming the canonical
+    /// pair is told so, rather than being given a pool-state error that fires because that
+    /// pool exists (section 16.2, Invariant 67). The usable set is 1,337,190 keys per
+    /// launch and the launch needs one of them.
+    function graduateAlt(uint24 fee, uint24 tickSpacing) external nonReentrant {
+        if (fee < PledrinConstants.ALT_POOL_FEE_MIN || fee > PledrinConstants.ALT_POOL_FEE_MAX) {
+            revert InvalidPoolFee(fee);
+        }
+        // Narrowed through `SafeCast`, so a spacing above `int24`'s maximum reverts in the
+        // cast and everything else is decided by the range check below.
         int24 spacing = uint256(tickSpacing).toInt256().toInt24();
         if (
             spacing < PledrinConstants.ALT_TICK_SPACING_MIN
                 || spacing > PledrinConstants.ALT_TICK_SPACING_MAX
         ) revert InvalidTickSpacing(tickSpacing);
-        _settle(spacing, true);
+        if (fee == PledrinConstants.POOL_FEE && spacing == PledrinConstants.POOL_TICK_SPACING) {
+            revert CanonicalKeyNotAllowed();
+        }
+        _settle(_poolKeyFor(token, fee, spacing));
     }
 
     /// @inheritdoc IBondingCurve
@@ -513,7 +540,8 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
 
     /// @inheritdoc IBondingCurve
     function poolId() external view returns (PoolId) {
-        return _poolKeyFor(token, PledrinConstants.POOL_TICK_SPACING).toId();
+        return
+            _poolKeyFor(token, PledrinConstants.POOL_FEE, PledrinConstants.POOL_TICK_SPACING).toId();
     }
 
     /// @dev The shared body of `buy` and `creatorFirstBuy`. Writes every storage change
@@ -607,16 +635,38 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
     }
 
     /// @dev The graduation procedure of `docs/SPEC.md` section 8.2, shared by `graduate`
-    /// and `graduateAlt`. `state` is written before any external call, so a reentrant
-    /// attempt fails the state check and the two together succeed at most once
-    /// (Invariant 36). Nothing here sends ETH to an address the caller controls: the bond
-    /// and the bounty are credited, not pushed (Invariant 45).
-    function _settle(int24 tickSpacing, bool alternate) private {
+    /// and `graduateAlt`, which differ only in the key they hand it. `state` is written
+    /// before any external call, so a reentrant attempt fails the state check and the two
+    /// together succeed at most once (Invariant 36). Nothing here sends ETH to an address
+    /// the caller controls: the bond and the bounty are credited, not pushed
+    /// (Invariant 45).
+    ///
+    /// **No parameter of this function may be a literal at its call sites, and that is a
+    /// size constraint rather than a style one.** This function does not exist in the
+    /// compiled output: `via_ir` inlines it into both `graduate` and `graduateAlt`. Under
+    /// the earlier `bool alternate` signature both call sites passed a literal, so the
+    /// inliner propagated it and deleted a branch from each copy — the `graduate` copy had
+    /// no `initialize` path and the `graduateAlt` copy no `_restorePrice` path — which is
+    /// why two partially dead copies went unnoticed. Taking the key instead makes the
+    /// inliner decline and leaves one copy, worth **1,761 bytes** against the
+    /// `(PoolKey, bool)` form and the whole reason decision 22 came out 359 bytes lighter
+    /// instead of 869 over EIP-170. So a future parameter is derived from the key or read
+    /// from storage; re-adding a `bool`, or passing the fee and spacing as constants, costs
+    /// about 1.7 KB against 886 bytes of margin. `docs/SPEC.md` section 2.1 has the ledger.
+    /// @param key The pool key this graduation uses, canonical or alternate.
+    function _settle(PoolKey memory key) private {
         if (state != State.Graduating) revert WrongState(state);
-        // The alternate path's delay is checked here rather than in `graduateAlt`, so that
-        // the state check runs first: a launch that has already graduated answers
-        // `WrongState` instead of telling the caller to wait out a delay that is not what
-        // stands in their way.
+
+        int24 tickSpacing = key.tickSpacing;
+        // Which path this is follows from the key rather than from a flag the caller
+        // passes alongside it. `graduateAlt` refuses the canonical pair and `graduate` can
+        // name nothing else (Invariant 67), so a key that differs from the canonical one
+        // in either field arrived through the alternate path and owes `ALT_DELAY`. The
+        // delay is checked here rather than in `graduateAlt` so that the state check runs
+        // first: a launch that has already graduated answers `WrongState` instead of being
+        // told to wait out a delay that is not what stands in its way.
+        bool alternate = key.fee != PledrinConstants.POOL_FEE
+            || tickSpacing != PledrinConstants.POOL_TICK_SPACING;
         if (alternate && block.timestamp < uint256(capReachedAt) + PledrinConstants.ALT_DELAY) {
             revert AltDelayNotElapsed();
         }
@@ -624,17 +674,19 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
         state = State.Graduated;
         graduatedAt = block.timestamp.toUint64();
 
-        PoolKey memory key = _poolKeyFor(token, tickSpacing);
         PoolId id = key.toId();
 
-        if (alternate) {
-            (uint160 existing,,,) = poolManager.getSlot0(id);
-            if (existing != 0) revert AltPoolInitialized();
+        // One rule for every key, canonical or alternate: open it if nobody has, otherwise
+        // try to restore a wrong price for free. Neither path may refuse a key for being
+        // initialised or for holding liquidity (Invariant 38), and neither needs to: a
+        // mint's amounts are a function of the price and of the position's own range, so
+        // third-party liquidity cannot change what graduation deposits (Invariant 66).
+        (uint160 current,,,) = poolManager.getSlot0(id);
+        if (current == 0) {
             // forge-lint: disable-next-line(unused-return)
             poolManager.initialize(key, sqrtPriceTerminal);
-        } else {
-            (uint160 current,,,) = poolManager.getSlot0(id);
-            if (current != sqrtPriceTerminal) _restorePrice(key, current > sqrtPriceTerminal);
+        } else if (current != sqrtPriceTerminal) {
+            _restorePrice(key, current > sqrtPriceTerminal);
         }
 
         (uint160 price,,,) = poolManager.getSlot0(id);
@@ -663,6 +715,8 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
         emit Graduated(
             address(this),
             id,
+            key.fee,
+            tickSpacing,
             corePositionId,
             floorPositionId,
             coreEth,
@@ -677,6 +731,12 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
     /// nominates one unit of exact input because `PoolManager.swap` rejects an
     /// `amountSpecified` of zero, and the caller only reaches this path when the price
     /// differs, because a limit equal to the current price reverts.
+    ///
+    /// This is the protocol's attempt and not the only one available. Liquidity in the
+    /// swap's path makes the restore cost something, which the callback refuses to pay, and
+    /// that refusal is the end of this function rather than the end of graduation: anybody
+    /// may move the price with their own ETH or tokens and call `graduate` or `graduateAlt`
+    /// in the same transaction, at which point this function is skipped entirely.
     function _restorePrice(PoolKey memory key, bool zeroForOne) private {
         _unlocking = true;
         // The callback asserts the swap settled for nothing and returns no value.
@@ -689,11 +749,12 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
     /// `MINT_POSITION` takes a liquidity value and the `currency1` it owes is a step
     /// function of that, so no liquidity lands on `LP_SUPPLY` exactly: this takes the
     /// largest value that fits and asserts the remainder is dust (Invariant 39).
-    /// `amount0Max` is exactly `R_target` and must not be tightened; the ETH headroom is
-    /// not monotone in `virtualEthReserve`, and anything unspent flows into the floor
-    /// position rather than being stranded. The ETH cost is computed from the position's
-    /// parameters and the token cost is a delta across the call: both choices are forced,
-    /// and by opposite considerations, which the body states at each site.
+    /// `amount0Max` is exactly `R_target` and must not be tightened: the ETH headroom is
+    /// 171 wei at the bottom of the permitted `virtualEthReserve` range, so no tightening
+    /// is safe, and anything unspent flows into the floor position rather than being
+    /// stranded. The ETH cost is computed from the position's parameters and the token cost
+    /// is a delta across the call: both choices are forced, and by opposite considerations,
+    /// which the body states at each site.
     function _mintCore(PoolKey memory key, int24 tickSpacing)
         private
         returns (uint256 positionId, uint256 ethUsed, uint256 tokensUsed)
@@ -897,8 +958,10 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
     }
 
     /// @dev Native ETH sorts below every token address, so ETH is always `currency0` and
-    /// the launch token always `currency1`. There is no ordering branch anywhere.
-    function _poolKeyFor(IERC20 launchToken, int24 tickSpacing)
+    /// the launch token always `currency1`. There is no ordering branch anywhere. `fee` and
+    /// `tickSpacing` are the key's only free fields: `hooks` is always the zero address, so
+    /// a graduated Pledrin pool is an ordinary, unowned, hookless v4 pool.
+    function _poolKeyFor(IERC20 launchToken, uint24 fee, int24 tickSpacing)
         private
         pure
         returns (PoolKey memory)
@@ -906,7 +969,7 @@ contract BondingCurve is IBondingCurve, IUnlockCallback, ReentrancyGuardTransien
         return PoolKey({
             currency0: CurrencyLibrary.ADDRESS_ZERO,
             currency1: Currency.wrap(address(launchToken)),
-            fee: PledrinConstants.POOL_FEE,
+            fee: fee,
             tickSpacing: tickSpacing,
             hooks: IHooks(address(0))
         });

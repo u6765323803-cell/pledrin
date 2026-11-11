@@ -1,0 +1,36 @@
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/coverage/
+lcov.info
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# Ponder
+indexer/.ponder/
+indexer/generated/
+
+# Playwright
+web/test-results/
+web/playwright-report/
+web/blob-report/
+
+# Environment and secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+keystore/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
